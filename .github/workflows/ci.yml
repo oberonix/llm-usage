@@ -35,15 +35,15 @@ jobs:
             libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
             libwebkit2gtk-4.1-dev libsoup-3.0-dev \
             pkg-config libssl-dev
-      - run: cargo build --release -p llm-usage -p llm-usage-dashboard -p llm-usage-setup -p llm-usage-status
+      - run: cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
       - uses: actions/upload-artifact@v4
         with:
           name: llm-usage-linux-x86_64
           path: |
-            target/release/llm-usage
+            target/release/llm-usage-tray
             target/release/llm-usage-dashboard
             target/release/llm-usage-setup
-            target/release/llm-usage-status
+            target/release/llm-usage
 
   build-macos:
     name: build (macos)
@@ -53,8 +53,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-bundle --locked || true
-      - run: cargo build --release -p llm-usage -p llm-usage-dashboard -p llm-usage-setup -p llm-usage-status
-      - run: cargo bundle --release -p llm-usage
+      - run: cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
+      - run: cargo bundle --release -p llm-usage-tray
       - uses: actions/upload-artifact@v4
         with:
           name: llm-usage-macos

@@ -6,7 +6,7 @@
     <string>dev.buffbit.llm-usage</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/llm-usage.app/Contents/MacOS/llm-usage</string>
+        <string>/Applications/llm-usage.app/Contents/MacOS/llm-usage-tray</string>
     </array>
     <key>RunAtLoad</key>
     <true/>

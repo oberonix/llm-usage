@@ -1,4 +1,4 @@
-//! `llm-usage-status` — terminal/CLI usage view.
+//! `llm-usage` — terminal/CLI usage view.
 //!
 //! Default: live mode. The CLI watches the tray's shared `snapshots.json`
 //! and redraws the per-provider quota bars whenever the tray writes a
@@ -12,7 +12,7 @@
 //!                away. Works in both live and one-shot mode.
 //!
 //! Intended use: open a small terminal window on the side of your
-//! screen, run `llm-usage-status`, and leave it. Press Ctrl+C to exit.
+//! screen, run `llm-usage`, and leave it. Press Ctrl+C to exit.
 
 use anyhow::Result;
 use llm_usage_core::config::Config;
@@ -217,6 +217,18 @@ fn build_screen(
 
     if !any_rendered {
         s.push_str("waiting for first snapshot…\n");
+    }
+
+    // Footer: when this frame was rendered. Intentionally has no
+    // trailing newline — the cursor parks at the end of this line in
+    // live mode, which gives the window a calm "ready / idle" look
+    // until the next frame.
+    s.push('\n');
+    let now = chrono::Local::now().format("%H:%M:%S").to_string();
+    if use_color {
+        s.push_str(&format!("\x1b[90mlast refreshed {}\x1b[0m", now));
+    } else {
+        s.push_str(&format!("last refreshed {}", now));
     }
     s
 }

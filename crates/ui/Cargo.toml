@@ -1,5 +1,5 @@
 [package]
-name = "llm-usage"
+name = "llm-usage-tray"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "llm-usage"
+name = "llm-usage-tray"
 path = "src/main.rs"
 
 [dependencies]

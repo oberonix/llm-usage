@@ -3070,20 +3070,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "directories",
- "gtk",
- "image",
  "llm-usage-core",
  "notify",
- "notify-rust",
- "serde",
- "serde_json",
- "tao",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
- "tray-icon",
 ]
 
 [[package]]
@@ -3147,16 +3138,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "llm-usage-status"
+name = "llm-usage-tray"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "directories",
+ "gtk",
+ "image",
  "llm-usage-core",
  "notify",
+ "notify-rust",
+ "serde",
+ "serde_json",
+ "tao",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "tray-icon",
 ]
 
 [[package]]

@@ -54,23 +54,23 @@ paste the `Cookie:` header yourself.
 ```bash
 sudo apt install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
     libwebkit2gtk-4.1-dev pkg-config libssl-dev
-cargo build --release -p llm-usage -p llm-usage-dashboard -p llm-usage-setup -p llm-usage-status
+cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
 ```
 
 The four binaries land at:
 
-- `target/release/llm-usage` — the tray app (always-running)
+- `target/release/llm-usage-tray` — the tray app (always-running)
 - `target/release/llm-usage-dashboard` — opened on demand from the tray menu
 - `target/release/llm-usage-setup` — one-shot login window for Ollama Cloud,
   spawned by the dashboard's "Set up login…" button
-- `target/release/llm-usage-status` — terminal/CLI usage view. By
-  default it watches the tray's shared snapshot file and redraws the
-  quota bars whenever a new poll lands, so a small terminal window on
-  the side of your screen mirrors the tray. Pass `--once` to render a
-  single frame and exit (useful for scripts or `watch -n N`), or
-  `--refresh` to ask the tray to poll right away.
+- `target/release/llm-usage` — terminal/CLI usage view. By default it
+  watches the tray's shared snapshot file and redraws the quota bars
+  whenever a new poll lands, so a small terminal window on the side of
+  your screen mirrors the tray. Pass `--once` to render a single frame
+  and exit (useful for scripts or `watch -n N`), or `--refresh` to ask
+  the tray to poll right away.
 
-### Putting `llm-usage-status` on `PATH`
+### Putting `llm-usage` on `PATH`
 
 Pick whichever you prefer. The first option doesn't need sudo and is
 the most idiomatic for Rust toolchains:
@@ -81,24 +81,24 @@ cargo install --path crates/cli
 
 # Or symlink the release build into a user-local bin dir
 mkdir -p ~/.local/bin
-ln -sf "$(pwd)/target/release/llm-usage-status" ~/.local/bin/
+ln -sf "$(pwd)/target/release/llm-usage" ~/.local/bin/
 
 # If ~/.local/bin isn't on PATH yet:
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
 source ~/.bashrc
 
 # Or system-wide (needs sudo)
-sudo ln -sf "$(pwd)/target/release/llm-usage-status" /usr/local/bin/
+sudo ln -sf "$(pwd)/target/release/llm-usage" /usr/local/bin/
 ```
 
-Then anywhere in a terminal: `llm-usage-status`.
+Then anywhere in a terminal: `llm-usage`.
 
 ### macOS
 
 ```bash
-cargo build --release -p llm-usage -p llm-usage-dashboard -p llm-usage-setup -p llm-usage-status
+cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
 cargo install cargo-bundle
-cargo bundle --release -p llm-usage
+cargo bundle --release -p llm-usage-tray
 open target/release/bundle/osx/llm-usage.app
 ```
 
