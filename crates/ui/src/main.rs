@@ -242,13 +242,13 @@ fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&MenuItem::with_id(
         MenuId::new(DASHBOARD_ID),
-        "Open dashboard…",
+        "Open dashboard",
         true,
         None,
     ));
     let _ = menu.append(&MenuItem::with_id(
         MenuId::new(SETTINGS_ID),
-        "Settings…",
+        "Settings",
         true,
         None,
     ));

@@ -289,44 +289,10 @@ impl eframe::App for DashboardApp {
             return;
         }
 
-        // Title bar — app name on its own line so it doesn't compete
-        // with the tabs.
-        egui::TopBottomPanel::top("title_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(ctx.style().visuals.window_fill)
-                    .inner_margin(egui::Margin::symmetric(20.0, 14.0)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("LLM Usage")
-                            .strong()
-                            .size(20.0),
-                    );
-                    if let Some((at, outcome)) = &self.save_status {
-                        if at.elapsed().as_secs() < 6 {
-                            let (text, color) = match outcome {
-                                SaveOutcome::Saved(path) => (
-                                    format!("Saved → {}", path.display()),
-                                    Color32::from_rgb(0x4C, 0xAF, 0x50),
-                                ),
-                                SaveOutcome::Error(e) => (
-                                    format!("Save failed: {}", e),
-                                    Color32::from_rgb(0xC6, 0x28, 0x28),
-                                ),
-                            };
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| ui.colored_label(color, text),
-                            );
-                        }
-                    }
-                });
-            });
-
-        // Tab strip — wider, bolder labels with an underline accent on
-        // the active tab. Standard top-tab pattern.
+        // Tab strip is now the top of the window — the app name is
+        // already in the OS title bar, so a duplicate heading inside
+        // the window just steals vertical space. Save toast moves
+        // inline with the Save/Reset buttons further down.
         egui::TopBottomPanel::top("tab_strip")
             .frame(
                 egui::Frame::none()
@@ -334,7 +300,7 @@ impl eframe::App for DashboardApp {
                     .inner_margin(egui::Margin {
                         left: 20.0,
                         right: 20.0,
-                        top: 0.0,
+                        top: 10.0,
                         bottom: 0.0,
                     }),
             )
@@ -598,6 +564,22 @@ impl DashboardApp {
             }
             ui.add_space(12.0);
             ui.weak("Tray and dashboard auto-reload when config.toml changes.");
+            if let Some((at, outcome)) = &self.save_status {
+                if at.elapsed().as_secs() < 6 {
+                    let (text, color) = match outcome {
+                        SaveOutcome::Saved(path) => (
+                            format!("→ Saved to {}", path.display()),
+                            Color32::from_rgb(0x4C, 0xAF, 0x50),
+                        ),
+                        SaveOutcome::Error(e) => (
+                            format!("→ Save failed: {}", e),
+                            Color32::from_rgb(0xC6, 0x28, 0x28),
+                        ),
+                    };
+                    ui.add_space(8.0);
+                    ui.colored_label(color, text);
+                }
+            }
         });
     }
 }
@@ -749,17 +731,12 @@ fn render_loading_card(ui: &mut egui::Ui, id: ProviderId) {
     let tint_rgb = id.tint_rgb();
     let tint = Color32::from_rgb(tint_rgb.0, tint_rgb.1, tint_rgb.2);
     card_frame(ui, tint, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(id.human())
-                    .strong()
-                    .size(15.0)
-                    .color(Color32::from_gray(180)),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("waiting for first poll…");
-            });
-        });
+        ui.label(
+            RichText::new(format!("{} — waiting for first poll…", id.human()))
+                .strong()
+                .size(15.0)
+                .color(Color32::from_gray(180)),
+        );
     });
 }
 
@@ -806,42 +783,18 @@ fn header_row(
     ui: &mut egui::Ui,
     provider: ProviderId,
     plan_label: Option<&str>,
-    status: ProviderStatus,
+    _status: ProviderStatus,
     _tint: Color32,
 ) {
     // Provider name and plan tag share one bold label so the dash sits
-    // mid-line in the same style — no separate weight or colour for
-    // the plan portion. The left-edge accent stripe on the card already
-    // identifies the provider by colour.
+    // mid-line in the same style. The left-edge accent stripe on the
+    // card already identifies the provider by colour. No status chip —
+    // the error line below (if any) is the only indicator of a problem.
     let title = match plan_label {
         Some(plan) => format!("{} · {}", provider.human(), plan),
         None => provider.human().to_string(),
     };
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(title).strong().size(15.5));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            status_chip(ui, status);
-        });
-    });
-}
-
-fn status_chip(ui: &mut egui::Ui, status: ProviderStatus) {
-    let (text, base) = match status {
-        ProviderStatus::Ok => ("OK", Color32::from_rgb(0x4C, 0xAF, 0x50)),
-        ProviderStatus::Degraded => ("DEGRADED", Color32::from_rgb(0xFF, 0xB3, 0x00)),
-        ProviderStatus::Unavailable => ("UNAVAILABLE", Color32::from_gray(140)),
-    };
-    let bg = base.gamma_multiply(0.18);
-    ui.add(
-        egui::Label::new(
-            RichText::new(text)
-                .color(base)
-                .size(10.5)
-                .strong()
-                .background_color(bg),
-        )
-        .selectable(false),
-    );
+    ui.label(RichText::new(title).strong().size(15.5));
 }
 
 fn render_daily_history_card(ui: &mut egui::Ui, history: &[(chrono::NaiveDate, f64)]) {
