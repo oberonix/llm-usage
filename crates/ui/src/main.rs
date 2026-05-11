@@ -205,7 +205,14 @@ fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
         let mut quota_windows: Vec<(&String, &WindowUsage)> = snap
             .windows
             .iter()
-            .filter(|(_, w)| w.fraction_used.is_some())
+            .filter(|(label, w)| {
+                // Keep this filter aligned with `menu_window_order`. The
+                // per-model weekly buckets (Sonnet, Opus) live in the
+                // full dashboard; the tray menu shows just the
+                // all-models 5h and weekly rows so the menu stays narrow.
+                w.fraction_used.is_some()
+                    && !label.as_str().starts_with("week (")
+            })
             .collect();
         if quota_windows.is_empty() {
             continue;
@@ -274,7 +281,9 @@ fn menu_window_order(label: &str) -> u32 {
 
 fn format_quota_row(label: &str, w: &WindowUsage) -> String {
     let frac = w.fraction_used.unwrap_or(0.0);
-    let bar = unicode_bar(frac, 8);
+    // 6-cell bar (instead of 8) trims four characters off the longest
+    // menu row and the percentage column still keeps full precision.
+    let bar = unicode_bar(frac, 6);
     let pct = format!("{:>3.0}%", frac * 100.0);
     let reset = w
         .ends_at
@@ -286,11 +295,9 @@ fn format_quota_row(label: &str, w: &WindowUsage) -> String {
                 None
             }
         })
-        .map(|s| format!(" ({})", s))
+        .map(|s| format!(" · {}", s))
         .unwrap_or_default();
-    // Two-space gap between the bar+pct and the window label — no `│`
-    // separator. Keeps each line shorter and visually less boxed.
-    format!("{} {}  {}{}", bar, pct, label, reset)
+    format!("{} {} {}{}", bar, pct, label, reset)
 }
 
 fn unicode_bar(fraction: f64, cells: usize) -> String {
@@ -307,11 +314,11 @@ fn unicode_bar(fraction: f64, cells: usize) -> String {
 
 fn format_reset(secs: i64) -> String {
     if secs < 3600 {
-        format!("resets {}m", secs / 60)
+        format!("{}m", secs / 60)
     } else if secs < 86_400 {
-        format!("resets {}h", secs / 3600)
+        format!("{}h", secs / 3600)
     } else {
-        format!("resets {}d", secs / 86_400)
+        format!("{}d", secs / 86_400)
     }
 }
 
