@@ -281,9 +281,9 @@ fn menu_window_order(label: &str) -> u32 {
 
 fn format_quota_row(label: &str, w: &WindowUsage) -> String {
     let frac = w.fraction_used.unwrap_or(0.0);
-    // 6-cell bar (instead of 8) trims four characters off the longest
-    // menu row and the percentage column still keeps full precision.
-    let bar = unicode_bar(frac, 6);
+    // 10-cell bar — each cell = 10% so the visual count maps directly
+    // onto the percentage next to it (▰▰▰▱▱▱▱▱▱▱ → 30%).
+    let bar = unicode_bar(frac, 10);
     let pct = format!("{:>3.0}%", frac * 100.0);
     let reset = w
         .ends_at
