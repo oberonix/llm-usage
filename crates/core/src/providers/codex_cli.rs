@@ -24,6 +24,29 @@
 //! as a subset, so for billing we use `(input - cached)` at the regular
 //! rate plus `cached` at the cached rate.
 //!
+//! ## Quota / rate-limit snapshot
+//!
+//! Same `event_msg{token_count}` payload also carries the live rate-limit
+//! state straight from OpenAI's API response:
+//!
+//! ```json
+//! {"payload": {"type":"token_count", "info": null,
+//!   "rate_limits": {
+//!     "limit_id":"codex","limit_name":null,
+//!     "primary":   {"used_percent":1.0,  "window_minutes":300,   "resets_at":1778387659},
+//!     "secondary": {"used_percent":17.0, "window_minutes":10080, "resets_at":1778649999},
+//!     "credits":null, "plan_type":"plus", "rate_limit_reached_type":null
+//!   }}}
+//! ```
+//!
+//! `primary.window_minutes == 300` is the 5-hour rolling window;
+//! `secondary.window_minutes == 10080` is the 7-day one. We take the
+//! single newest snapshot across all rollouts as authoritative and feed
+//! `used_percent` into each window's `fraction_used`. If `resets_at` is
+//! already in the past relative to *now*, the window has rolled over
+//! since that snapshot was written and we clamp fraction to 0 — the
+//! user must run Codex again for a fresh number.
+//!
 //! Schema reverse-engineered against Codex CLI ~0.40.x. Confirmed by
 //! cross-reading [soulduse/ai-token-monitor]'s `codex.rs` parser.
 
@@ -32,7 +55,7 @@ use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind};
 use crate::provider::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -49,10 +72,10 @@ impl CodexCliProvider {
         Self { cfg, codex_dir }
     }
 
-    fn collect_events(&self) -> Result<Vec<TokenEvent>> {
-        let mut events = Vec::new();
+    fn collect_events(&self) -> Result<Collected> {
+        let mut out = Collected::default();
         if !self.codex_dir.exists() {
-            return Ok(events);
+            return Ok(out);
         }
         // Only the active sessions dir matters for rolling windows up to 7d;
         // we walk archived_sessions too in case ours is configured oddly.
@@ -66,13 +89,41 @@ impl CodexCliProvider {
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
             {
-                if let Err(e) = parse_session_file(entry.path(), &mut events) {
+                if let Err(e) = parse_session_file(entry.path(), &mut out) {
                     tracing::warn!(path = %entry.path().display(), error = %e, "codex parse failed");
                 }
             }
         }
-        Ok(events)
+        Ok(out)
     }
+}
+
+#[derive(Debug, Default)]
+struct Collected {
+    events: Vec<TokenEvent>,
+    /// Newest `rate_limits` snapshot seen across every rollout, keyed on
+    /// the timestamp of the carrying `event_msg`. Used to set
+    /// fraction_used + ends_at on the two windows.
+    latest_rate_limits: Option<RateLimitsRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct RateLimitsRecord {
+    /// When the rollout line that carried this snapshot was written.
+    /// Used both to pick the newest record and to decide whether
+    /// `resets_at` has lapsed since.
+    record_at: DateTime<Utc>,
+    primary: Option<RateLimitsBucket>,
+    secondary: Option<RateLimitsBucket>,
+    plan_type: Option<String>,
+    rate_limit_reached_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RateLimitsBucket {
+    used_percent: f64,
+    window_minutes: u32,
+    resets_at: Option<DateTime<Utc>>,
 }
 
 #[async_trait]
@@ -92,8 +143,8 @@ impl Provider for CodexCliProvider {
             ));
         }
 
-        let events = self.collect_events()?;
-        if events.is_empty() {
+        let collected = self.collect_events()?;
+        if collected.events.is_empty() && collected.latest_rate_limits.is_none() {
             return Ok(UsageSnapshot::unavailable(
                 ProviderId::CodexCli,
                 "no codex sessions found",
@@ -105,7 +156,7 @@ impl Provider for CodexCliProvider {
 
         let mut bucket_5h = Bucket::default();
         let mut bucket_7d = Bucket::default();
-        for e in &events {
+        for e in &collected.events {
             if e.timestamp > five_hour_cutoff {
                 bucket_5h.add(e);
             }
@@ -135,25 +186,115 @@ impl Provider for CodexCliProvider {
         ww.request_count = bucket_7d.turns;
         ww.spend_usd = Some(bucket_7d.cost_usd);
 
-        // Codex CLI plan limits aren't exposed in any local file we know of,
-        // so we can't compute fraction_used vs a true plan quota. We surface
-        // the activity counts and let the user eyeball them; a future config
-        // option could supply a manual quota for the alert engine to use.
-        snap.headline = Some(if self.cfg.show_spend {
-            format!(
-                "{} turns / 5h · {} / 7d · ${:.2}",
-                bucket_5h.turns, bucket_7d.turns, bucket_7d.cost_usd
-            )
-        } else {
-            format!(
-                "{} turns / 5h · {} / 7d",
-                bucket_5h.turns, bucket_7d.turns
-            )
-        });
+        // Apply the most recent rate-limit snapshot we observed. Codex
+        // emits these on every API turn; if the snapshot's window has
+        // already rolled over (resets_at < now), we clamp fraction to
+        // 0 — the user hasn't run Codex since the window reset, so
+        // there's no fresher number to fold in.
+        let mut plan_label: Option<String> = None;
+        if let Some(rl) = &collected.latest_rate_limits {
+            plan_label = rl.plan_type.clone();
+            if let Some(primary) = rl.primary {
+                apply_rate_limits(
+                    snap.window_mut(WindowKind::FiveHourRolling),
+                    primary,
+                    now,
+                );
+            }
+            if let Some(secondary) = rl.secondary {
+                apply_rate_limits(snap.window_mut(WindowKind::ThisWeek), secondary, now);
+            }
+            if rl.rate_limit_reached_type.is_some() {
+                snap.status = ProviderStatus::Degraded;
+                snap.error = Some(format!(
+                    "rate limit hit: {}",
+                    rl.rate_limit_reached_type.as_deref().unwrap_or("?")
+                ));
+            }
+        }
+
+        snap.headline = Some(build_headline(
+            plan_label.as_deref(),
+            snap.window(WindowKind::FiveHourRolling),
+            snap.window(WindowKind::ThisWeek),
+            bucket_5h.turns,
+            bucket_7d.turns,
+            self.cfg.show_spend.then_some(bucket_7d.cost_usd),
+        ));
         if !self.cfg.show_spend {
             snap.strip_spend();
         }
         Ok(snap)
+    }
+}
+
+fn apply_rate_limits(
+    w: &mut crate::model::WindowUsage,
+    bucket: RateLimitsBucket,
+    now: DateTime<Utc>,
+) {
+    let raw_frac = bucket.used_percent / 100.0;
+    // If the snapshot's window has already rolled, the percentage is
+    // stale — clamp to 0 rather than showing a phantom utilization.
+    let still_in_window = bucket.resets_at.is_some_and(|t| t > now);
+    w.fraction_used = Some(if still_in_window { raw_frac } else { 0.0 });
+    w.ends_at = bucket.resets_at;
+    w.started_at = Some(now);
+    let _ = bucket.window_minutes; // kept for future labelling
+}
+
+fn build_headline(
+    plan: Option<&str>,
+    w5: Option<&crate::model::WindowUsage>,
+    w7: Option<&crate::model::WindowUsage>,
+    turns_5h: u64,
+    turns_7d: u64,
+    spend_7d: Option<f64>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(p) = plan {
+        parts.push(p.to_string());
+    }
+    if let Some(w) = w5 {
+        if let Some(frac) = w.fraction_used {
+            parts.push(format!(
+                "5h {:.0}%{}",
+                frac * 100.0,
+                reset_suffix(w.ends_at)
+            ));
+        } else {
+            parts.push(format!("{} turns / 5h", turns_5h));
+        }
+    }
+    if let Some(w) = w7 {
+        if let Some(frac) = w.fraction_used {
+            parts.push(format!(
+                "7d {:.0}%{}",
+                frac * 100.0,
+                reset_suffix(w.ends_at)
+            ));
+        } else {
+            parts.push(format!("{} turns / 7d", turns_7d));
+        }
+    }
+    if let Some(spend) = spend_7d {
+        parts.push(format!("${:.2}", spend));
+    }
+    parts.join(" · ")
+}
+
+fn reset_suffix(ends_at: Option<DateTime<Utc>>) -> String {
+    let Some(t) = ends_at else { return String::new() };
+    let now = Utc::now();
+    let secs = (t - now).num_seconds();
+    if secs <= 0 {
+        String::new()
+    } else if secs < 3600 {
+        format!(" R:{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!(" R:{}h", secs / 3600)
+    } else {
+        format!(" R:{}d", secs / 86_400)
     }
 }
 
@@ -202,7 +343,7 @@ struct OuterEntry {
     payload: Option<Value>,
 }
 
-fn parse_session_file(path: &std::path::Path, events: &mut Vec<TokenEvent>) -> Result<()> {
+fn parse_session_file(path: &std::path::Path, out: &mut Collected) -> Result<()> {
     let content = std::fs::read_to_string(path)?;
     let mut current_model = String::new();
     let mut prev_snapshot: Option<(u64, u64, u64)> = None;
@@ -218,6 +359,11 @@ fn parse_session_file(path: &std::path::Path, events: &mut Vec<TokenEvent>) -> R
             Some(p) => p,
             None => continue,
         };
+        let record_ts = entry
+            .timestamp
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc)));
+
         match entry.entry_type.as_deref() {
             Some("turn_context") => {
                 if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
@@ -228,13 +374,28 @@ fn parse_session_file(path: &std::path::Path, events: &mut Vec<TokenEvent>) -> R
                 if payload.get("type").and_then(|v| v.as_str()) != Some("token_count") {
                     continue;
                 }
-                let Some(info) = payload.get("info") else {
-                    continue;
-                };
-                if info.is_null() {
-                    continue;
+
+                // Rate-limit snapshot, if present. Lives on the
+                // event_msg payload itself, not under `info`.
+                if let Some(rl) = payload.get("rate_limits") {
+                    if let (Some(ts), Some(record)) =
+                        (record_ts, parse_rate_limits(rl, record_ts))
+                    {
+                        let take = match &out.latest_rate_limits {
+                            None => true,
+                            Some(prev) => ts > prev.record_at,
+                        };
+                        if take {
+                            let _ = ts; // satisfy clippy's unused warning when feature gating
+                            out.latest_rate_limits = Some(record);
+                        }
+                    }
                 }
-                let usage = info.get("last_token_usage").or_else(|| info.get("total_token_usage"));
+
+                let info = payload.get("info");
+                let usage = info
+                    .filter(|v| !v.is_null())
+                    .and_then(|i| i.get("last_token_usage").or_else(|| i.get("total_token_usage")));
                 let Some(u) = usage else { continue };
                 let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -251,13 +412,9 @@ fn parse_session_file(path: &std::path::Path, events: &mut Vec<TokenEvent>) -> R
                 }
                 prev_snapshot = Some(snap);
 
-                let timestamp = entry
-                    .timestamp
-                    .as_deref()
-                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc)));
-                let Some(ts) = timestamp else { continue };
+                let Some(ts) = record_ts else { continue };
 
-                events.push(TokenEvent {
+                out.events.push(TokenEvent {
                     timestamp: ts,
                     model: if current_model.is_empty() {
                         "gpt-5-codex".into()
@@ -273,6 +430,42 @@ fn parse_session_file(path: &std::path::Path, events: &mut Vec<TokenEvent>) -> R
         }
     }
     Ok(())
+}
+
+fn parse_rate_limits(v: &Value, record_at: Option<DateTime<Utc>>) -> Option<RateLimitsRecord> {
+    let record_at = record_at?;
+    let primary = v.get("primary").and_then(parse_rate_limits_bucket);
+    let secondary = v.get("secondary").and_then(parse_rate_limits_bucket);
+    if primary.is_none() && secondary.is_none() {
+        return None;
+    }
+    Some(RateLimitsRecord {
+        record_at,
+        primary,
+        secondary,
+        plan_type: v
+            .get("plan_type")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        rate_limit_reached_type: v
+            .get("rate_limit_reached_type")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+    })
+}
+
+fn parse_rate_limits_bucket(v: &Value) -> Option<RateLimitsBucket> {
+    let used_percent = v.get("used_percent")?.as_f64()?;
+    let window_minutes = v.get("window_minutes")?.as_u64()? as u32;
+    let resets_at = v
+        .get("resets_at")
+        .and_then(|x| x.as_i64())
+        .and_then(|secs| Utc.timestamp_opt(secs, 0).single());
+    Some(RateLimitsBucket {
+        used_percent,
+        window_minutes,
+        resets_at,
+    })
 }
 
 /// Conservative pricing defaults (USD per 1M tokens). User can override
@@ -320,10 +513,58 @@ mod tests {
         let mut cfg = CodexCliConfig::default();
         cfg.codex_dir = Some(dir.path().to_path_buf());
         let p = CodexCliProvider::new(cfg);
-        let events = p.collect_events().unwrap();
-        assert_eq!(events.len(), 2, "should dedupe consecutive identical snapshots");
-        assert_eq!(events[0].input_tokens, 1000);
-        assert_eq!(events[0].cached_tokens, 100);
-        assert_eq!(events[1].input_tokens, 50);
+        let collected = p.collect_events().unwrap();
+        assert_eq!(
+            collected.events.len(),
+            2,
+            "should dedupe consecutive identical snapshots"
+        );
+        assert_eq!(collected.events[0].input_tokens, 1000);
+        assert_eq!(collected.events[0].cached_tokens, 100);
+        assert_eq!(collected.events[1].input_tokens, 50);
+    }
+
+    #[test]
+    fn parses_real_rate_limits_schema() {
+        let dir = TempDir::new().unwrap();
+        let day = dir.path().join("sessions/2026/05/09");
+        std::fs::create_dir_all(&day).unwrap();
+        let f = day.join("rollout-rl.jsonl");
+        let mut out = std::fs::File::create(&f).unwrap();
+        // Real shape from a live ollama.com user's rollout: rate_limits
+        // sits on the event_msg payload alongside `info`, NOT inside it.
+        writeln!(
+            out,
+            r#"{{"timestamp":"2026-05-09T23:34:19.205Z","type":"event_msg","payload":{{"type":"token_count","info":null,"rate_limits":{{"limit_id":"codex","limit_name":null,"primary":{{"used_percent":1.0,"window_minutes":300,"resets_at":1778387659}},"secondary":{{"used_percent":17.0,"window_minutes":10080,"resets_at":1778649999}},"credits":null,"plan_type":"plus","rate_limit_reached_type":null}}}}}}"#
+        )
+        .unwrap();
+        // Older rollout with a *smaller* used_percent — must NOT override
+        // the newer record above.
+        writeln!(
+            out,
+            r#"{{"timestamp":"2026-05-09T20:00:00.000Z","type":"event_msg","payload":{{"type":"token_count","info":null,"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":50.0,"window_minutes":300,"resets_at":1778000000}},"plan_type":"plus"}}}}}}"#
+        )
+        .unwrap();
+        drop(out);
+
+        let mut cfg = CodexCliConfig::default();
+        cfg.codex_dir = Some(dir.path().to_path_buf());
+        let p = CodexCliProvider::new(cfg);
+        let collected = p.collect_events().unwrap();
+        let rl = collected
+            .latest_rate_limits
+            .expect("rate_limits should be captured");
+        assert_eq!(rl.plan_type.as_deref(), Some("plus"));
+        // Newest record (23:34Z) wins, not the older 50% one.
+        let primary = rl.primary.expect("primary present");
+        assert!((primary.used_percent - 1.0).abs() < 1e-6);
+        assert_eq!(primary.window_minutes, 300);
+        assert_eq!(
+            primary.resets_at,
+            Utc.timestamp_opt(1778387659, 0).single()
+        );
+        let secondary = rl.secondary.expect("secondary present");
+        assert!((secondary.used_percent - 17.0).abs() < 1e-6);
+        assert_eq!(secondary.window_minutes, 10080);
     }
 }
