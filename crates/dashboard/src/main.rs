@@ -402,11 +402,110 @@ fn render_provider_card(ui: &mut egui::Ui, snap: &UsageSnapshot) {
             let mut entries: Vec<(&String, &llm_usage_core::model::WindowUsage)> =
                 snap.windows.iter().collect();
             entries.sort_by_key(|(label, _)| (window_order(label.as_str()), label.as_str()));
-            for (label, w) in entries {
-                window_row(ui, label, w);
-            }
+            render_windows_table(ui, snap.provider, &entries);
         }
     });
+}
+
+/// Two-column grid: left column holds the window label, monospaced
+/// and left-aligned so labels stack neatly even when their widths
+/// vary (e.g. `5h` vs `week (Sonnet)`). The right column carries the
+/// progress bar, token totals, reset countdown, and any spend amount
+/// for that row.
+fn render_windows_table(
+    ui: &mut egui::Ui,
+    provider: ProviderId,
+    entries: &[(&String, &llm_usage_core::model::WindowUsage)],
+) {
+    egui::Grid::new(format!("windows-{:?}", provider))
+        .num_columns(2)
+        .spacing([16.0, 6.0])
+        .show(ui, |ui| {
+            for (label, w) in entries {
+                ui.label(
+                    RichText::new(*label)
+                        .monospace()
+                        .size(12.5)
+                        .color(Color32::from_gray(210)),
+                );
+                ui.horizontal(|ui| {
+                    render_window_usage(ui, w);
+                });
+                ui.end_row();
+            }
+        });
+}
+
+fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage) {
+    match w.fraction_used {
+        Some(frac) => {
+            let bar = egui::ProgressBar::new(frac.min(1.0) as f32)
+                .desired_width(220.0)
+                .fill(fraction_color(frac))
+                .text(
+                    RichText::new(format!("{:.0}%", frac * 100.0))
+                        .size(11.0)
+                        .strong(),
+                );
+            ui.add(bar);
+            if let Some(ends) = w.ends_at {
+                let secs = (ends - chrono::Utc::now()).num_seconds();
+                if secs > 0 {
+                    ui.weak(reset_label(secs));
+                }
+            }
+            if let Some(spend) = w.spend_usd {
+                ui.label(
+                    RichText::new(format!("${:.2}", spend))
+                        .color(Color32::from_gray(220))
+                        .strong(),
+                );
+            }
+            if let Some(limit) = w.limit_usd {
+                ui.weak(format!("of ${:.0}", limit));
+            }
+        }
+        None => {
+            // Explicit `in` / `out` / `reqs` labels with `|` separators —
+            // arrow glyphs read as "tokens up/down" if you know the
+            // convention but were hard to scan otherwise.
+            let mut parts: Vec<String> = Vec::new();
+            if w.tokens_in > 0 {
+                parts.push(format!("in {}", fmt_tokens(w.tokens_in)));
+            }
+            if w.tokens_out > 0 {
+                parts.push(format!("out {}", fmt_tokens(w.tokens_out)));
+            }
+            if w.request_count > 0 {
+                parts.push(format!("{} reqs", w.request_count));
+            }
+            if let Some(spend) = w.spend_usd {
+                parts.push(format!("${:.2}", spend));
+            }
+            if parts.is_empty() {
+                ui.weak("no activity");
+            } else {
+                for (i, p) in parts.iter().enumerate() {
+                    if i > 0 {
+                        ui.weak(
+                            RichText::new("|").color(Color32::from_gray(90)),
+                        );
+                    }
+                    ui.weak(p);
+                }
+            }
+        }
+    }
+}
+
+fn reset_label(secs: i64) -> String {
+    if secs < 3600 {
+        format!("resets {}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("resets {}h", secs / 3600)
+    } else {
+        format!("resets {}d", secs / 86_400)
+    }
 }
 
 fn window_order(label: &str) -> u32 {
@@ -512,82 +611,6 @@ fn status_chip(ui: &mut egui::Ui, status: ProviderStatus) {
         )
         .selectable(false),
     );
-}
-
-fn window_row(ui: &mut egui::Ui, label: &str, w: &llm_usage_core::model::WindowUsage) {
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [56.0, 18.0],
-            egui::Label::new(
-                RichText::new(label)
-                    .monospace()
-                    .color(Color32::from_gray(200))
-                    .size(12.5),
-            ),
-        );
-
-        match w.fraction_used {
-            Some(frac) => {
-                let f32_frac = frac.min(1.0) as f32;
-                let bar = egui::ProgressBar::new(f32_frac)
-                    .desired_width(220.0)
-                    .fill(fraction_color(frac))
-                    .text(
-                        RichText::new(format!("{:.0}%", frac * 100.0))
-                            .size(11.0)
-                            .strong(),
-                    );
-                ui.add(bar);
-                if let Some(limit) = w.limit_usd {
-                    ui.weak(format!("of ${:.0}", limit));
-                }
-            }
-            None => {
-                let mut shown = false;
-                if w.tokens_in + w.tokens_out > 0 {
-                    ui.weak(format!(
-                        "↑ {}  ↓ {}",
-                        fmt_tokens(w.tokens_in),
-                        fmt_tokens(w.tokens_out)
-                    ));
-                    shown = true;
-                }
-                if w.request_count > 0 {
-                    if shown {
-                        ui.weak("·");
-                    }
-                    ui.weak(format!("{} reqs", w.request_count));
-                    shown = true;
-                }
-                if !shown {
-                    ui.weak("no activity");
-                }
-            }
-        }
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some(ends) = w.ends_at {
-                let secs = (ends - chrono::Utc::now()).num_seconds();
-                if secs > 0 {
-                    let txt = if secs < 3600 {
-                        format!("resets {}m", secs / 60)
-                    } else if secs < 86_400 {
-                        format!("resets {}h", secs / 3600)
-                    } else {
-                        format!("resets {}d", secs / 86_400)
-                    };
-                    ui.weak(txt);
-                }
-            }
-            if let Some(spend) = w.spend_usd {
-                ui.label(
-                    RichText::new(format!("${:.2}", spend))
-                        .color(Color32::from_gray(220))
-                        .strong(),
-                );
-            }
-        });
-    });
 }
 
 fn render_daily_history_card(ui: &mut egui::Ui, history: &[(chrono::NaiveDate, f64)]) {
