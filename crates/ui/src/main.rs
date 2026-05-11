@@ -22,12 +22,9 @@ use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 use crate::runtime::{render_label, RuntimeHandle, RuntimeMessage};
 
 /// Order providers iterate in when the icon rotates. Matches the menu order.
-const PROVIDER_ORDER: [ProviderId; 6] = [
+const PROVIDER_ORDER: [ProviderId; 3] = [
     ProviderId::Anthropic,
-    ProviderId::OpenAi,
     ProviderId::CodexCli,
-    ProviderId::GeminiCli,
-    ProviderId::OllamaLocal,
     ProviderId::OllamaCloud,
 ];
 
@@ -39,6 +36,7 @@ fn rotation_interval_from(cfg: &Config) -> Duration {
 }
 
 const DASHBOARD_ID: &str = "dashboard";
+const SETTINGS_ID: &str = "settings";
 const REFRESH_ID: &str = "refresh";
 const QUIT_ID: &str = "quit";
 
@@ -163,7 +161,8 @@ fn main() -> Result<()> {
             match menu_event.id.0.as_str() {
                 QUIT_ID => *control_flow = ControlFlow::Exit,
                 REFRESH_ID => refresh.notify_one(),
-                DASHBOARD_ID => spawn_dashboard(),
+                DASHBOARD_ID => spawn_dashboard(&[]),
+                SETTINGS_ID => spawn_dashboard(&["--tab=settings"]),
                 _ => {}
             }
         }
@@ -181,14 +180,7 @@ fn main() -> Result<()> {
 fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
     let menu = Menu::new();
     let mut visible_count = 0usize;
-    for id in [
-        ProviderId::Anthropic,
-        ProviderId::OpenAi,
-        ProviderId::CodexCli,
-        ProviderId::GeminiCli,
-        ProviderId::OllamaLocal,
-        ProviderId::OllamaCloud,
-    ] {
+    for id in PROVIDER_ORDER {
         let Some(snap) = snapshots.get(&id) else {
             continue;
         };
@@ -207,6 +199,12 @@ fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
     let _ = menu.append(&MenuItem::with_id(
         MenuId::new(DASHBOARD_ID),
         "Open dashboard…",
+        true,
+        None,
+    ));
+    let _ = menu.append(&MenuItem::with_id(
+        MenuId::new(SETTINGS_ID),
+        "Settings…",
         true,
         None,
     ));
@@ -339,7 +337,7 @@ fn spawn_refresh_trigger_watcher(refresh: Arc<Notify>) -> Option<RecommendedWatc
     Some(watcher)
 }
 
-fn spawn_dashboard() {
+fn spawn_dashboard(args: &[&str]) {
     let candidate = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("llm-usage-dashboard")));
@@ -347,7 +345,7 @@ fn spawn_dashboard() {
         .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "llm-usage-dashboard".to_string());
-    let _ = std::process::Command::new(&cmd).spawn();
+    let _ = std::process::Command::new(&cmd).args(args).spawn();
 }
 
 /// Repaint the tray icon and update its tooltip for whichever

@@ -7,10 +7,7 @@ use std::fmt;
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Anthropic,
-    OpenAi,
     CodexCli,
-    GeminiCli,
-    OllamaLocal,
     OllamaCloud,
 }
 
@@ -18,10 +15,7 @@ impl fmt::Display for ProviderId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             ProviderId::Anthropic => "anthropic",
-            ProviderId::OpenAi => "openai",
             ProviderId::CodexCli => "codex_cli",
-            ProviderId::GeminiCli => "gemini_cli",
-            ProviderId::OllamaLocal => "ollama_local",
             ProviderId::OllamaCloud => "ollama_cloud",
         };
         f.write_str(s)
@@ -32,10 +26,7 @@ impl ProviderId {
     pub fn human(&self) -> &'static str {
         match self {
             ProviderId::Anthropic => "Anthropic",
-            ProviderId::OpenAi => "OpenAI API",
             ProviderId::CodexCli => "Codex CLI",
-            ProviderId::GeminiCli => "Gemini CLI",
-            ProviderId::OllamaLocal => "Ollama (local)",
             ProviderId::OllamaCloud => "Ollama Cloud",
         }
     }
@@ -47,11 +38,8 @@ impl ProviderId {
     pub fn tint_rgb(&self) -> (u8, u8, u8) {
         match self {
             ProviderId::Anthropic => (0xCC, 0x78, 0x5C),
-            ProviderId::OllamaCloud => (0x3B, 0x82, 0xF6),
-            ProviderId::OpenAi => (0x10, 0xA3, 0x7F),
             ProviderId::CodexCli => (0x9C, 0x6B, 0xFF),
-            ProviderId::GeminiCli => (0x42, 0x85, 0xF4),
-            ProviderId::OllamaLocal => (0x60, 0x60, 0x60),
+            ProviderId::OllamaCloud => (0x3B, 0x82, 0xF6),
         }
     }
 }

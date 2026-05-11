@@ -15,10 +15,7 @@ pub struct Config {
     /// hand-edited config can't make the icon flicker.
     pub icon_rotation_secs: u64,
     pub anthropic: AnthropicConfig,
-    pub openai: OpenAiConfig,
     pub codex_cli: CodexCliConfig,
-    pub gemini_cli: GeminiCliConfig,
-    pub ollama_local: OllamaLocalConfig,
     pub ollama_cloud: OllamaCloudConfig,
     pub alerts: AlertsConfig,
 }
@@ -27,16 +24,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             // 15 minutes by default. Local file readers (Anthropic JSONL,
-            // Codex, Gemini) and the Ollama ping are cheap, but Anthropic's
-            // OAuth /usage endpoint rate-limits aggressive polling, so we
-            // bias the whole loop towards "informative, not chatty".
+            // Codex) are cheap, but Anthropic's OAuth /usage endpoint
+            // rate-limits aggressive polling, so we bias the whole loop
+            // towards "informative, not chatty".
             poll_interval_secs: 900,
             icon_rotation_secs: 15,
             anthropic: AnthropicConfig::default(),
-            openai: OpenAiConfig::default(),
             codex_cli: CodexCliConfig::default(),
-            gemini_cli: GeminiCliConfig::default(),
-            ollama_local: OllamaLocalConfig::default(),
             ollama_cloud: OllamaCloudConfig::default(),
             alerts: AlertsConfig::default(),
         }
@@ -76,41 +70,15 @@ impl Default for AnthropicConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct OpenAiConfig {
-    pub enabled: bool,
-    /// Pulled from env OPENAI_API_KEY if not set here.
-    pub api_key: Option<String>,
-    pub organization: Option<String>,
-    pub monthly_budget_usd: Option<f64>,
-    pub warn_at: Vec<f64>,
-    /// OpenAI exposes no non-spend quota, so when this is false (default)
-    /// the provider reports "spend tracking hidden" and is skipped in the
-    /// tray menu.
-    pub show_spend: bool,
-}
-
-impl Default for OpenAiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: None,
-            organization: None,
-            monthly_budget_usd: Some(30.0),
-            warn_at: vec![0.75, 0.9],
-            show_spend: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct CodexCliConfig {
     pub enabled: bool,
     /// Override path; defaults to ~/.codex.
     pub codex_dir: Option<PathBuf>,
-    /// Fraction (0..1) of the rolling 5h window after which to alert.
-    pub five_hour_warn: f64,
-    pub weekly_warn: f64,
+    /// Fractions (0..1) at which to fire a quota alert for any window
+    /// with a known utilization. Mirrors the same field on the other
+    /// providers — kept here as a single unified list so the dashboard
+    /// can show one threshold dropdown per provider.
+    pub warn_at: Vec<f64>,
     /// When false (default) the UI shows turn counts and tokens but hides
     /// the reverse-engineered dollar estimate.
     pub show_spend: bool,
@@ -121,32 +89,6 @@ impl Default for CodexCliConfig {
         Self {
             enabled: true,
             codex_dir: None,
-            five_hour_warn: 0.8,
-            weekly_warn: 0.85,
-            show_spend: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GeminiCliConfig {
-    pub enabled: bool,
-    /// Override path; defaults to ~/.gemini.
-    pub gemini_dir: Option<PathBuf>,
-    pub monthly_budget_usd: Option<f64>,
-    pub warn_at: Vec<f64>,
-    /// When false (default) the UI shows turn counts and tokens but hides
-    /// the dollar estimate.
-    pub show_spend: bool,
-}
-
-impl Default for GeminiCliConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            gemini_dir: None,
-            monthly_budget_usd: None,
             warn_at: vec![0.75, 0.9],
             show_spend: false,
         }
@@ -155,41 +97,24 @@ impl Default for GeminiCliConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct OllamaLocalConfig {
-    pub enabled: bool,
-    pub base_url: String,
-}
-
-impl Default for OllamaLocalConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            base_url: "http://localhost:11434".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct OllamaCloudConfig {
     pub enabled: bool,
-    /// API key (currently unused — kept for the day Ollama publishes a usage API).
-    pub api_key: Option<String>,
-    /// Browser session cookie copied out of devtools — required for the
-    /// settings/billing page scrape. Format: the full Cookie header value
-    /// (e.g. `session=abc123; csrf=xyz`). Whatever Ollama's auth cookie is
-    /// called, paste the raw header.
+    /// Browser session cookie — required for the settings/billing page
+    /// scrape. The dashboard's setup buttons populate this for you; the
+    /// raw `Cookie:` request header value is the expected format
+    /// (e.g. `session=abc123; csrf=xyz`).
     pub session_cookie: Option<String>,
     pub base_url: String,
+    pub warn_at: Vec<f64>,
 }
 
 impl Default for OllamaCloudConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            api_key: None,
             session_cookie: None,
             base_url: "https://ollama.com".to_string(),
+            warn_at: vec![0.75, 0.9],
         }
     }
 }

@@ -126,10 +126,7 @@ const GLYPH_SPACING: usize = 1;
 fn provider_label(id: ProviderId) -> &'static str {
     match id {
         ProviderId::Anthropic => "ANT",
-        ProviderId::OpenAi => "OAI",
         ProviderId::CodexCli => "COD",
-        ProviderId::GeminiCli => "GEM",
-        ProviderId::OllamaLocal => "OLM",
         ProviderId::OllamaCloud => "OLC",
     }
 }

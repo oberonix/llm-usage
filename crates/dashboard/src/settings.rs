@@ -1,11 +1,10 @@
 //! Editable form state for the Settings tab. The form mirrors the
-//! save-to-disk fields of `Config` — fields like per-model pricing overrides
-//! that are only meaningful to power users stay edit-via-TOML for now.
+//! save-to-disk fields of `Config` — per-model pricing overrides and
+//! similar power-user knobs stay edit-via-TOML.
 
 use eframe::egui::{self, Color32, RichText};
 use llm_usage_core::config::{
-    self, AnthropicConfig, CodexCliConfig, Config, GeminiCliConfig, OllamaCloudConfig,
-    OllamaLocalConfig, OpenAiConfig,
+    self, AnthropicConfig, CodexCliConfig, Config, OllamaCloudConfig,
 };
 use llm_usage_core::model::ProviderId;
 use std::path::PathBuf;
@@ -16,9 +15,6 @@ pub enum SaveOutcome {
     Error(String),
 }
 
-/// Editable mirror of the user-facing parts of `Config`. Strings stay strings
-/// (text fields); numbers stay numbers (DragValue widgets); thresholds stay
-/// as a comma-separated string for ergonomic editing.
 /// Pre-baked dropdown options for the poll interval.
 /// Anthropic's OAuth endpoint rate-limits aggressive polling, so we
 /// start at 1 min and don't expose anything shorter. 1 hour is the
@@ -43,6 +39,17 @@ const ROTATION_OPTIONS: &[(u64, &str)] = &[
     (300, "5 minutes"),
 ];
 
+/// Alert threshold presets — one dropdown per provider. The "Custom"
+/// case isn't enumerated here; any vec that doesn't match a preset is
+/// surfaced as a `Custom (…)` entry at runtime so hand-edited TOML
+/// round-trips cleanly.
+const ALERT_PRESETS: &[(&str, &[f64])] = &[
+    ("Off", &[]),
+    ("At 75%", &[0.75]),
+    ("At 90%", &[0.90]),
+    ("Aggressive (50%, 75%, 90%)", &[0.50, 0.75, 0.90]),
+];
+
 pub struct ConfigDraft {
     pub poll_interval_secs: u64,
     pub icon_rotation_secs: u64,
@@ -51,34 +58,16 @@ pub struct ConfigDraft {
     pub anthropic_show_spend: bool,
     pub anthropic_weekly_budget_usd: f64,
     pub anthropic_weekly_budget_enabled: bool,
-    pub anthropic_warn_at: String,
-
-    pub openai_enabled: bool,
-    pub openai_show_spend: bool,
-    pub openai_api_key: String,
-    pub openai_organization: String,
-    pub openai_monthly_budget_usd: f64,
-    pub openai_monthly_budget_enabled: bool,
-    pub openai_warn_at: String,
+    pub anthropic_warn_at: Vec<f64>,
 
     pub codex_enabled: bool,
     pub codex_show_spend: bool,
-    pub codex_five_hour_warn: f64,
-    pub codex_weekly_warn: f64,
-
-    pub gemini_enabled: bool,
-    pub gemini_show_spend: bool,
-    pub gemini_monthly_budget_usd: f64,
-    pub gemini_monthly_budget_enabled: bool,
-    pub gemini_warn_at: String,
-
-    pub ollama_local_enabled: bool,
-    pub ollama_local_base_url: String,
+    pub codex_warn_at: Vec<f64>,
 
     pub ollama_cloud_enabled: bool,
-    pub ollama_cloud_api_key: String,
     pub ollama_cloud_session_cookie: String,
     pub ollama_cloud_base_url: String,
+    pub ollama_cloud_warn_at: Vec<f64>,
 
     // UI-only state for the setup-login flow. Not persisted.
     pub ollama_cloud_setup_status: Option<String>,
@@ -101,38 +90,20 @@ impl ConfigDraft {
             anthropic_show_spend: c.anthropic.show_spend,
             anthropic_weekly_budget_usd: c.anthropic.weekly_budget_usd.unwrap_or(50.0),
             anthropic_weekly_budget_enabled: c.anthropic.weekly_budget_usd.is_some(),
-            anthropic_warn_at: format_thresholds(&c.anthropic.warn_at),
-
-            openai_enabled: c.openai.enabled,
-            openai_show_spend: c.openai.show_spend,
-            openai_api_key: c.openai.api_key.clone().unwrap_or_default(),
-            openai_organization: c.openai.organization.clone().unwrap_or_default(),
-            openai_monthly_budget_usd: c.openai.monthly_budget_usd.unwrap_or(30.0),
-            openai_monthly_budget_enabled: c.openai.monthly_budget_usd.is_some(),
-            openai_warn_at: format_thresholds(&c.openai.warn_at),
+            anthropic_warn_at: c.anthropic.warn_at.clone(),
 
             codex_enabled: c.codex_cli.enabled,
             codex_show_spend: c.codex_cli.show_spend,
-            codex_five_hour_warn: c.codex_cli.five_hour_warn,
-            codex_weekly_warn: c.codex_cli.weekly_warn,
-
-            gemini_enabled: c.gemini_cli.enabled,
-            gemini_show_spend: c.gemini_cli.show_spend,
-            gemini_monthly_budget_usd: c.gemini_cli.monthly_budget_usd.unwrap_or(20.0),
-            gemini_monthly_budget_enabled: c.gemini_cli.monthly_budget_usd.is_some(),
-            gemini_warn_at: format_thresholds(&c.gemini_cli.warn_at),
-
-            ollama_local_enabled: c.ollama_local.enabled,
-            ollama_local_base_url: c.ollama_local.base_url.clone(),
+            codex_warn_at: c.codex_cli.warn_at.clone(),
 
             ollama_cloud_enabled: c.ollama_cloud.enabled,
-            ollama_cloud_api_key: c.ollama_cloud.api_key.clone().unwrap_or_default(),
             ollama_cloud_session_cookie: c
                 .ollama_cloud
                 .session_cookie
                 .clone()
                 .unwrap_or_default(),
             ollama_cloud_base_url: c.ollama_cloud.base_url.clone(),
+            ollama_cloud_warn_at: c.ollama_cloud.warn_at.clone(),
 
             ollama_cloud_setup_status: None,
             ollama_cloud_setup_rx: None,
@@ -140,8 +111,8 @@ impl ConfigDraft {
     }
 
     /// Apply the draft fields onto a fresh Config (keeping the source's
-    /// non-editable fields like `model_rates` untouched by reading them from
-    /// the existing on-disk config).
+    /// non-editable fields like `model_rates` untouched by reading them
+    /// from the existing on-disk config).
     pub fn to_config(&self) -> Config {
         let mut c = Config::load_or_default().unwrap_or_default();
         c.poll_interval_secs = self.poll_interval_secs.max(60);
@@ -155,53 +126,22 @@ impl ConfigDraft {
             } else {
                 None
             },
-            warn_at: parse_thresholds(&self.anthropic_warn_at),
+            warn_at: self.anthropic_warn_at.clone(),
             ..c.anthropic
-        };
-
-        c.openai = OpenAiConfig {
-            enabled: self.openai_enabled,
-            show_spend: self.openai_show_spend,
-            api_key: empty_to_none(&self.openai_api_key),
-            organization: empty_to_none(&self.openai_organization),
-            monthly_budget_usd: if self.openai_monthly_budget_enabled {
-                Some(self.openai_monthly_budget_usd)
-            } else {
-                None
-            },
-            warn_at: parse_thresholds(&self.openai_warn_at),
         };
 
         c.codex_cli = CodexCliConfig {
             enabled: self.codex_enabled,
             show_spend: self.codex_show_spend,
-            five_hour_warn: self.codex_five_hour_warn.clamp(0.0, 1.0),
-            weekly_warn: self.codex_weekly_warn.clamp(0.0, 1.0),
+            warn_at: self.codex_warn_at.clone(),
             ..c.codex_cli
-        };
-
-        c.gemini_cli = GeminiCliConfig {
-            enabled: self.gemini_enabled,
-            show_spend: self.gemini_show_spend,
-            monthly_budget_usd: if self.gemini_monthly_budget_enabled {
-                Some(self.gemini_monthly_budget_usd)
-            } else {
-                None
-            },
-            warn_at: parse_thresholds(&self.gemini_warn_at),
-            ..c.gemini_cli
-        };
-
-        c.ollama_local = OllamaLocalConfig {
-            enabled: self.ollama_local_enabled,
-            base_url: self.ollama_local_base_url.trim().to_string(),
         };
 
         c.ollama_cloud = OllamaCloudConfig {
             enabled: self.ollama_cloud_enabled,
-            api_key: empty_to_none(&self.ollama_cloud_api_key),
             session_cookie: empty_to_none(&self.ollama_cloud_session_cookie),
             base_url: self.ollama_cloud_base_url.trim().to_string(),
+            warn_at: self.ollama_cloud_warn_at.clone(),
         };
 
         c
@@ -304,10 +244,6 @@ impl ConfigDraft {
         };
         match result {
             SetupResult::Captured => {
-                // Setup tool wrote directly to config.toml — re-read it
-                // so the form reflects the new cookie. We don't clobber
-                // the rest of the draft because the user may have
-                // unsaved edits in other sections.
                 if let Ok(cfg) = config::Config::load_or_default() {
                     self.ollama_cloud_session_cookie = cfg
                         .ollama_cloud
@@ -375,10 +311,7 @@ impl ConfigDraft {
         section_header(ui, "Providers");
 
         self.render_anthropic(ui);
-        self.render_openai(ui);
         self.render_codex(ui);
-        self.render_gemini(ui);
-        self.render_ollama_local(ui);
         self.render_ollama_cloud(ui);
     }
 
@@ -391,7 +324,9 @@ impl ConfigDraft {
                 Some(&mut self.anthropic_show_spend),
                 "Show $ spend",
             );
-            thresholds_row(ui, "Alert at", &mut self.anthropic_warn_at);
+            field_row(ui, "Alert at", |ui| {
+                alert_preset_combo(ui, "anthropic_alert", &mut self.anthropic_warn_at);
+            });
             if self.anthropic_show_spend {
                 field_row(ui, "Weekly budget", |ui| {
                     ui.checkbox(&mut self.anthropic_weekly_budget_enabled, "set");
@@ -412,53 +347,6 @@ impl ConfigDraft {
         });
     }
 
-    fn render_openai(&mut self, ui: &mut egui::Ui) {
-        provider_card(ui, tint(ProviderId::OpenAi), |ui| {
-            section_header_row(ui, "OpenAI API", Some(ProviderId::OpenAi));
-            enabled_row(
-                ui,
-                &mut self.openai_enabled,
-                Some(&mut self.openai_show_spend),
-                "Show $ spend",
-            );
-            if !self.openai_show_spend {
-                help(
-                    ui,
-                    "OpenAI exposes no non-spend quota — enable \"Show $ spend\" \
-                     for this provider to do anything.",
-                );
-            }
-            field_row(ui, "API key", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.openai_api_key)
-                        .password(true)
-                        .desired_width(360.0)
-                        .hint_text("sk-… (or leave empty to read $OPENAI_API_KEY)"),
-                );
-            });
-            field_row(ui, "Organization", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.openai_organization)
-                        .desired_width(280.0)
-                        .hint_text("optional (org-…)"),
-                );
-            });
-            if self.openai_show_spend {
-                field_row(ui, "Monthly budget", |ui| {
-                    ui.checkbox(&mut self.openai_monthly_budget_enabled, "set");
-                    ui.add_enabled(
-                        self.openai_monthly_budget_enabled,
-                        egui::DragValue::new(&mut self.openai_monthly_budget_usd)
-                            .speed(1.0)
-                            .range(0.0..=100_000.0)
-                            .prefix("$"),
-                    );
-                });
-            }
-            thresholds_row(ui, "Alert at", &mut self.openai_warn_at);
-        });
-    }
-
     fn render_codex(&mut self, ui: &mut egui::Ui) {
         provider_card(ui, tint(ProviderId::CodexCli), |ui| {
             section_header_row(ui, "Codex CLI", Some(ProviderId::CodexCli));
@@ -468,67 +356,14 @@ impl ConfigDraft {
                 Some(&mut self.codex_show_spend),
                 "Show $ spend (estimate)",
             );
-            field_row(ui, "5h warn", |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut self.codex_five_hour_warn)
-                        .speed(0.05)
-                        .range(0.0..=1.0)
-                        .fixed_decimals(2),
-                );
-                ui.add_space(12.0);
-                ui.label("Weekly warn");
-                ui.add(
-                    egui::DragValue::new(&mut self.codex_weekly_warn)
-                        .speed(0.05)
-                        .range(0.0..=1.0)
-                        .fixed_decimals(2),
-                );
-                ui.weak("(0.00–1.00 fraction)");
+            field_row(ui, "Alert at", |ui| {
+                alert_preset_combo(ui, "codex_alert", &mut self.codex_warn_at);
             });
             help(
                 ui,
-                "Codex plan limits aren't exposed locally — these thresholds fire on \
-                 the rolling 5h and 7d turn-count windows we estimate from session logs.",
+                "Quota (5h, 7d) comes from OpenAI's rate-limit headers, which the \
+                 Codex CLI writes into your local rollouts on every turn.",
             );
-        });
-    }
-
-    fn render_gemini(&mut self, ui: &mut egui::Ui) {
-        provider_card(ui, tint(ProviderId::GeminiCli), |ui| {
-            section_header_row(ui, "Gemini CLI", Some(ProviderId::GeminiCli));
-            enabled_row(
-                ui,
-                &mut self.gemini_enabled,
-                Some(&mut self.gemini_show_spend),
-                "Show $ spend (estimate)",
-            );
-            if self.gemini_show_spend {
-                field_row(ui, "Monthly budget", |ui| {
-                    ui.checkbox(&mut self.gemini_monthly_budget_enabled, "set");
-                    ui.add_enabled(
-                        self.gemini_monthly_budget_enabled,
-                        egui::DragValue::new(&mut self.gemini_monthly_budget_usd)
-                            .speed(1.0)
-                            .range(0.0..=100_000.0)
-                            .prefix("$"),
-                    );
-                });
-            }
-            thresholds_row(ui, "Alert at", &mut self.gemini_warn_at);
-        });
-    }
-
-    fn render_ollama_local(&mut self, ui: &mut egui::Ui) {
-        provider_card(ui, tint(ProviderId::OllamaLocal), |ui| {
-            section_header_row(ui, "Ollama (local)", Some(ProviderId::OllamaLocal));
-            enabled_row(ui, &mut self.ollama_local_enabled, None, "");
-            field_row(ui, "Base URL", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.ollama_local_base_url)
-                        .desired_width(360.0)
-                        .hint_text("http://localhost:11434"),
-                );
-            });
         });
     }
 
@@ -543,8 +378,11 @@ impl ConfigDraft {
                         .hint_text("https://ollama.com"),
                 );
             });
+            field_row(ui, "Alert at", |ui| {
+                alert_preset_combo(ui, "ollama_cloud_alert", &mut self.ollama_cloud_warn_at);
+            });
 
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.label(
                 RichText::new("Sign in")
                     .strong()
@@ -555,43 +393,67 @@ impl ConfigDraft {
             let in_flight = self.ollama_cloud_setup_rx.is_some();
             let mut launch_now = false;
             let mut import_now = false;
+
+            // Cookie capture (rookie) is the recommended path — it's
+            // zero-click for anyone already logged in to ollama.com in
+            // a desktop browser. Rendered first and emphasised.
             ui.horizontal(|ui| {
-                let popup_label = if in_flight {
-                    "Setup window open…"
-                } else if captured {
-                    "Re-run popup sign-in"
+                let label = if captured {
+                    "Re-import from browser"
                 } else {
-                    "Sign in via popup window…"
+                    "Import from browser — recommended"
                 };
+                let button = egui::Button::new(
+                    RichText::new(label)
+                        .strong()
+                        .color(Color32::WHITE)
+                        .size(13.0),
+                )
+                .fill(Color32::from_rgb(0x4C, 0xAF, 0x50))
+                .min_size(egui::vec2(240.0, 28.0));
                 if ui
-                    .add_enabled(!in_flight, egui::Button::new(popup_label))
+                    .add_enabled(!in_flight, button)
                     .on_hover_text(
-                        "Opens an embedded browser at ollama.com/signin and \
-                         captures the cookie automatically.",
-                    )
-                    .clicked()
-                {
-                    launch_now = true;
-                }
-                if ui
-                    .add_enabled(!in_flight, egui::Button::new("Import from browser…"))
-                    .on_hover_text(
-                        "Reads the ollama.com cookie from any already-logged-in \
-                         desktop browser. Zero clicks beyond this button.",
+                        "Reads the ollama.com cookie from any already-logged-in desktop \
+                         browser (Chrome / Firefox / Edge / Brave / Safari / Vivaldi). \
+                         Zero clicks beyond this button.",
                     )
                     .clicked()
                 {
                     import_now = true;
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if captured {
-                        ui.colored_label(
-                            Color32::from_rgb(0x4C, 0xAF, 0x50),
-                            "✓ cookie captured",
-                        );
-                    }
-                });
+                if captured && !in_flight {
+                    ui.colored_label(
+                        Color32::from_rgb(0x4C, 0xAF, 0x50),
+                        "✓ captured",
+                    );
+                }
             });
+            ui.add_space(4.0);
+
+            // Fallback: spawn a webview if the user isn't logged in to
+            // ollama.com in any local browser, or the browser path
+            // hits a keyring/permission snag.
+            ui.horizontal(|ui| {
+                let popup_label = if in_flight {
+                    "Setup window open…"
+                } else if captured {
+                    "Re-run popup sign-in (backup)"
+                } else {
+                    "Sign in via popup window (backup)"
+                };
+                if ui
+                    .add_enabled(!in_flight, egui::Button::new(popup_label))
+                    .on_hover_text(
+                        "Backup: opens an embedded browser at ollama.com/signin and \
+                         captures the cookie automatically once you reach /settings.",
+                    )
+                    .clicked()
+                {
+                    launch_now = true;
+                }
+            });
+
             if launch_now {
                 self.start_setup_tool();
             }
@@ -605,7 +467,7 @@ impl ConfigDraft {
 
             ui.add_space(4.0);
             ui.collapsing(
-                RichText::new("Manual cookie / API key (advanced)").size(11.5),
+                RichText::new("Manual cookie (advanced)").size(11.5),
                 |ui| {
                     field_row(ui, "Session cookie", |ui| {
                         ui.add(
@@ -615,20 +477,12 @@ impl ConfigDraft {
                                 .hint_text("paste browser Cookie header"),
                         );
                     });
-                    field_row(ui, "API key", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.ollama_cloud_api_key)
-                                .password(true)
-                                .desired_width(360.0)
-                                .hint_text("(reserved for when Ollama ships a usage API)"),
-                        );
-                    });
                 },
             );
             help(
                 ui,
-                "Usage is scraped from /settings using your session cookie. Re-run \
-                 sign-in if you log out or rotate.",
+                "Usage is scraped from /settings using your session cookie. Re-import \
+                 after logging out or rotating.",
             );
         });
     }
@@ -707,9 +561,8 @@ fn field_row(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// A dropdown over a fixed set of `(seconds, human label)` options.
-/// If the current value isn't in the list (e.g. someone hand-edited
-/// the TOML to 173 seconds), we still show it as a "Custom (Ns)"
-/// row at the top so the form round-trips without silently losing it.
+/// Hand-edited TOML values not in the list survive as a "Custom (Ns)"
+/// entry at the top so round-tripping never silently overwrites.
 fn interval_combo(
     ui: &mut egui::Ui,
     id: &str,
@@ -741,6 +594,50 @@ fn interval_combo(
         });
 }
 
+/// Unified dropdown for alert thresholds. Maps the current Vec<f64> to
+/// the nearest preset; non-matching values appear as `Custom (...)` so
+/// hand-edited TOML round-trips without loss.
+fn alert_preset_combo(ui: &mut egui::Ui, id: &str, value: &mut Vec<f64>) {
+    // Precompute everything we need to know about each preset before
+    // entering the closure — egui's ComboBox::show_ui takes a `FnOnce`
+    // and we can't borrow `value` again inside it for the match check.
+    let preset_states: Vec<(&'static str, &'static [f64], bool)> = ALERT_PRESETS
+        .iter()
+        .map(|(label, preset)| {
+            let is_match = preset.len() == value.len()
+                && preset
+                    .iter()
+                    .zip(value.iter())
+                    .all(|(a, b)| (a - b).abs() < 1e-6);
+            (*label, *preset, is_match)
+        })
+        .collect();
+    let matched_label = preset_states
+        .iter()
+        .find(|(_, _, m)| *m)
+        .map(|(l, _, _)| (*l).to_string());
+    let custom_label = format!("Custom ({})", format_thresholds(value));
+    let selected_label = matched_label.clone().unwrap_or_else(|| custom_label.clone());
+
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_label)
+        .width(240.0)
+        .show_ui(ui, |ui| {
+            if matched_label.is_none() {
+                // Render an inert custom row so the user can see what
+                // they currently have (and selecting it leaves the
+                // values untouched).
+                let _ = ui.selectable_label(true, &custom_label);
+                ui.separator();
+            }
+            for (label, preset, is_selected) in &preset_states {
+                if ui.selectable_label(*is_selected, *label).clicked() {
+                    *value = preset.to_vec();
+                }
+            }
+        });
+}
+
 fn help(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
     ui.label(
@@ -749,17 +646,6 @@ fn help(ui: &mut egui::Ui, text: &str) {
             .color(Color32::from_gray(150))
             .italics(),
     );
-}
-
-fn thresholds_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
-    field_row(ui, label, |ui| {
-        ui.add(
-            egui::TextEdit::singleline(value)
-                .desired_width(220.0)
-                .hint_text("0.5, 0.75, 0.9"),
-        );
-        ui.weak("(comma-separated, 0–1)");
-    });
 }
 
 /// Find the `llm-usage-setup` binary next to the dashboard's own
@@ -791,25 +677,14 @@ fn empty_to_none(s: &str) -> Option<String> {
 }
 
 fn format_thresholds(thresholds: &[f64]) -> String {
+    if thresholds.is_empty() {
+        return "off".to_string();
+    }
     thresholds
         .iter()
-        .map(|t| format!("{:.2}", t))
+        .map(|t| format!("{:.0}%", t * 100.0))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn parse_thresholds(s: &str) -> Vec<f64> {
-    s.split(',')
-        .filter_map(|p| {
-            let t = p.trim();
-            if t.is_empty() {
-                None
-            } else {
-                t.parse::<f64>().ok()
-            }
-        })
-        .filter(|v| (0.0..=1.0).contains(v))
-        .collect()
 }
 
 #[cfg(test)]
@@ -817,14 +692,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_thresholds() {
-        let parsed = parse_thresholds("0.5, 0.75, 0.9");
-        assert_eq!(parsed, vec![0.5, 0.75, 0.9]);
-        assert_eq!(format_thresholds(&parsed), "0.50, 0.75, 0.90");
+    fn format_thresholds_basic() {
+        assert_eq!(format_thresholds(&[]), "off");
+        assert_eq!(format_thresholds(&[0.75, 0.9]), "75%, 90%");
     }
 
     #[test]
-    fn rejects_out_of_range() {
-        assert_eq!(parse_thresholds("0.5, 1.5, -0.1, 0.9"), vec![0.5, 0.9]);
+    fn alert_presets_have_expected_shape() {
+        // Sanity check: "Off" is empty, others have descending utility.
+        assert!(ALERT_PRESETS[0].1.is_empty(), "first preset must be Off");
+        for (_, preset) in ALERT_PRESETS.iter().skip(1) {
+            for w in preset.windows(2) {
+                assert!(w[0] < w[1], "preset thresholds should be ascending");
+            }
+        }
     }
 }

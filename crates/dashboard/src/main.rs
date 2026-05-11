@@ -33,10 +33,11 @@ fn main() -> Result<()> {
         .init();
 
     let config = Config::load_or_default()?;
+    let initial_tab = parse_initial_tab();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 580.0])
+            .with_inner_size([800.0, 620.0])
             .with_title("LLM Usage"),
         ..Default::default()
     };
@@ -48,11 +49,30 @@ fn main() -> Result<()> {
             // The egui Context is owned by eframe — we hold a clone in
             // the watcher so it can `request_repaint` from a background
             // thread when the snapshot file changes.
-            Ok(Box::new(DashboardApp::new(config, cc.egui_ctx.clone())))
+            Ok(Box::new(DashboardApp::new(
+                config,
+                cc.egui_ctx.clone(),
+                initial_tab,
+            )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {}", e))?;
     Ok(())
+}
+
+/// Look for `--tab=status` / `--tab=settings` so the tray can launch
+/// us directly on the Settings tab from its "Settings…" menu item.
+fn parse_initial_tab() -> Tab {
+    for arg in std::env::args().skip(1) {
+        if let Some(value) = arg.strip_prefix("--tab=") {
+            match value {
+                "settings" => return Tab::Settings,
+                "status" => return Tab::Status,
+                _ => {}
+            }
+        }
+    }
+    Tab::Status
 }
 
 struct DashboardApp {
@@ -73,7 +93,7 @@ struct DashboardApp {
 }
 
 impl DashboardApp {
-    fn new(config: Config, ctx: egui::Context) -> Self {
+    fn new(config: Config, ctx: egui::Context, initial_tab: Tab) -> Self {
         let snapshots = Arc::new(Mutex::new(BTreeMap::new()));
         let last_updated = Arc::new(Mutex::new(None));
         let daily_history = Arc::new(Mutex::new(Vec::new()));
@@ -104,7 +124,7 @@ impl DashboardApp {
             last_updated,
             daily_history,
             refresh_pending,
-            tab: Tab::Status,
+            tab: initial_tab,
             draft,
             save_status: None,
             _snapshots_watcher: watcher,
@@ -116,54 +136,135 @@ impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_secs(2));
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("LLM Usage");
-                ui.add_space(20.0);
-                ui.selectable_value(&mut self.tab, Tab::Status, "Status");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
-                ui.add_space(20.0);
-                if self.tab == Tab::Status {
-                    if ui.button("Refresh").clicked() {
-                        self.request_refresh();
+        // Title bar — app name on its own line so it doesn't compete
+        // with the tabs.
+        egui::TopBottomPanel::top("title_bar")
+            .frame(
+                egui::Frame::none()
+                    .fill(ctx.style().visuals.window_fill)
+                    .inner_margin(egui::Margin::symmetric(20.0, 14.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("LLM Usage")
+                            .strong()
+                            .size(20.0),
+                    );
+                    if let Some((at, outcome)) = &self.save_status {
+                        if at.elapsed().as_secs() < 6 {
+                            let (text, color) = match outcome {
+                                SaveOutcome::Saved(path) => (
+                                    format!("Saved → {}", path.display()),
+                                    Color32::from_rgb(0x4C, 0xAF, 0x50),
+                                ),
+                                SaveOutcome::Error(e) => (
+                                    format!("Save failed: {}", e),
+                                    Color32::from_rgb(0xC6, 0x28, 0x28),
+                                ),
+                            };
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| ui.colored_label(color, text),
+                            );
+                        }
                     }
-                    if self.refresh_pending.lock().unwrap().is_some() {
-                        ui.spinner();
-                        ui.label("polling…");
-                    } else if let Some(at) = *self.last_updated.lock().unwrap() {
-                        let age = chrono::Utc::now() - at;
-                        let label = fmt_age(age);
-                        ui.weak(format!("updated {}", label));
-                    }
-                }
-                if let Some((at, outcome)) = &self.save_status {
-                    if at.elapsed().as_secs() < 6 {
-                        let (text, color) = match outcome {
-                            SaveOutcome::Saved(path) => (
-                                format!("Saved → {}", path.display()),
-                                Color32::from_rgb(0x4C, 0xAF, 0x50),
-                            ),
-                            SaveOutcome::Error(e) => {
-                                (format!("Save failed: {}", e), Color32::from_rgb(0xC6, 0x28, 0x28))
-                            }
-                        };
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.colored_label(color, text);
-                            },
-                        );
-                    }
-                }
+                });
             });
-        });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.tab {
+        // Tab strip — wider, bolder labels with an underline accent on
+        // the active tab. Standard top-tab pattern.
+        egui::TopBottomPanel::top("tab_strip")
+            .frame(
+                egui::Frame::none()
+                    .fill(ctx.style().visuals.window_fill)
+                    .inner_margin(egui::Margin {
+                        left: 20.0,
+                        right: 20.0,
+                        top: 0.0,
+                        bottom: 0.0,
+                    }),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    self.tab_button(ui, Tab::Status, "Status");
+                    ui.add_space(8.0);
+                    self.tab_button(ui, Tab::Settings, "Settings");
+                });
+                ui.add_space(2.0);
+                ui.separator();
+            });
+
+        // Per-tab subheader (Refresh + last-updated indicator) keeps the
+        // tab strip uncluttered. Only the Status tab needs it for now.
+        if self.tab == Tab::Status {
+            egui::TopBottomPanel::top("status_subheader")
+                .frame(
+                    egui::Frame::none()
+                        .fill(ctx.style().visuals.window_fill)
+                        .inner_margin(egui::Margin::symmetric(20.0, 10.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            self.request_refresh();
+                        }
+                        if self.refresh_pending.lock().unwrap().is_some() {
+                            ui.spinner();
+                            ui.label("polling…");
+                        } else if let Some(at) = *self.last_updated.lock().unwrap() {
+                            let age = chrono::Utc::now() - at;
+                            ui.weak(format!("updated {}", fmt_age(age)));
+                        }
+                    });
+                });
+        }
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(ctx.style().visuals.window_fill)
+                    .inner_margin(egui::Margin::symmetric(20.0, 10.0)),
+            )
+            .show(ctx, |ui| match self.tab {
                 Tab::Status => self.render_status(ui),
                 Tab::Settings => self.render_settings(ui),
-            }
-        });
+            });
+    }
+}
+
+impl DashboardApp {
+    /// One tab button. Uses a larger font and paints a 3 px coloured
+    /// underline beneath the active label so the active tab is obvious
+    /// without needing the OS theme to draw a selection state.
+    fn tab_button(&mut self, ui: &mut egui::Ui, tab: Tab, label: &str) {
+        let active = self.tab == tab;
+        let text = RichText::new(label)
+            .size(15.0)
+            .strong()
+            .color(if active {
+                ui.visuals().strong_text_color()
+            } else {
+                Color32::from_gray(160)
+            });
+        let resp = ui.add(
+            egui::Button::new(text)
+                .frame(false)
+                .min_size(egui::vec2(80.0, 28.0)),
+        );
+        if resp.clicked() {
+            self.tab = tab;
+        }
+        if active {
+            let rect = resp.rect;
+            let underline_color = Color32::from_rgb(0x4C, 0xAF, 0x50);
+            let y = rect.bottom() + 2.0;
+            let stroke = egui::Stroke::new(3.0, underline_color);
+            ui.painter().line_segment(
+                [egui::pos2(rect.left() + 8.0, y), egui::pos2(rect.right() - 8.0, y)],
+                stroke,
+            );
+        }
     }
 }
 
@@ -173,14 +274,19 @@ impl DashboardApp {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 let snaps = self.snapshots.lock().unwrap().clone();
-                for id in [
-                    ProviderId::Anthropic,
-                    ProviderId::OllamaCloud,
-                    ProviderId::OpenAi,
-                    ProviderId::CodexCli,
-                    ProviderId::GeminiCli,
-                    ProviderId::OllamaLocal,
-                ] {
+                let provider_iter = [
+                    (ProviderId::Anthropic, self.config.anthropic.enabled),
+                    (ProviderId::CodexCli, self.config.codex_cli.enabled),
+                    (ProviderId::OllamaCloud, self.config.ollama_cloud.enabled),
+                ];
+                let mut shown = 0usize;
+                for (id, enabled) in provider_iter {
+                    // Task #7: only render providers the user has enabled
+                    // in config. Disabled providers vanish entirely.
+                    if !enabled {
+                        continue;
+                    }
+                    shown += 1;
                     if let Some(snap) = snaps.get(&id) {
                         render_provider_card(ui, snap);
                         if id == ProviderId::Anthropic && self.config.anthropic.show_spend {
@@ -193,6 +299,21 @@ impl DashboardApp {
                         render_loading_card(ui, id);
                     }
                     ui.add_space(10.0);
+                }
+                if shown == 0 {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("No providers enabled.")
+                                .size(15.0)
+                                .color(egui::Color32::from_gray(180)),
+                        );
+                        ui.add_space(4.0);
+                        ui.weak(
+                            "Switch to the Settings tab to enable Anthropic, \
+                             Codex CLI, or Ollama Cloud.",
+                        );
+                    });
                 }
             });
     }

@@ -10,10 +10,7 @@
 
 use llm_usage_core::config::Config;
 use llm_usage_core::provider::Provider;
-use llm_usage_core::providers::{
-    AnthropicProvider, CodexCliProvider, GeminiCliProvider, OllamaCloudProvider,
-    OllamaLocalProvider, OpenAiProvider,
-};
+use llm_usage_core::providers::{AnthropicProvider, CodexCliProvider, OllamaCloudProvider};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,10 +28,7 @@ async fn main() -> anyhow::Result<()> {
 
     let providers: Vec<Box<dyn Provider>> = vec![
         Box::new(AnthropicProvider::new(config.anthropic.clone())),
-        Box::new(OpenAiProvider::new(config.openai.clone())),
         Box::new(CodexCliProvider::new(config.codex_cli.clone())),
-        Box::new(GeminiCliProvider::new(config.gemini_cli.clone())),
-        Box::new(OllamaLocalProvider::new(config.ollama_local.clone())),
         Box::new(OllamaCloudProvider::new(config.ollama_cloud.clone())),
     ];
 
