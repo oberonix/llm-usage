@@ -1,12 +1,20 @@
 # llm-usage
 
-Lightweight menu-bar widget showing your LLM account usage and spend across
-**Anthropic / OpenAI / Codex CLI / Ollama**, with hourly/weekly quota alerts.
+Lightweight menu-bar widget showing your LLM account usage across
+**Anthropic / Codex / Ollama Cloud**, with quota alerts and a terminal
+companion view.
 
 - **Tray-only**: no Dock icon on macOS, no taskbar entry on Linux.
-- **Single binary**: ~10MB stripped, ~20–30MB resident.
-- **Self-contained**: no network listeners, no external services.
-- **Configurable**: thresholds, budgets, model pricing — all in one TOML file.
+- **Self-contained**: no network listeners, no telemetry, no auto-update.
+- **Configurable**: thresholds, budgets, polling cadence — all in one
+  TOML file, edited via a dashboard.
+
+> ⚠️ **Best-effort by design.** Anthropic's `/api/oauth/usage`,
+> Codex CLI's local rate-limit snapshots, and Ollama Cloud's `/settings`
+> page are all unofficial sources we reverse-engineer. They can change
+> shape without notice. When they do, expect the corresponding provider
+> to show "parse failed" until we update the parser — open an issue with
+> the new payload shape and we'll iterate.
 
 ## Status
 
@@ -104,6 +112,12 @@ open target/release/bundle/osx/llm-usage.app
 
 The bundle's `Info.plist` sets `LSUIElement=true`, so the app runs tray-only with
 no Dock icon.
+
+> Pre-built release archives are unsigned. After unpacking the
+> `macos-*.zip` and moving the `.app` to `/Applications`, run
+> `xattr -d com.apple.quarantine /Applications/llm-usage.app` once
+> so Gatekeeper will let it launch. Build from source if you'd
+> rather avoid that step.
 
 ## Test the providers without the tray UI
 

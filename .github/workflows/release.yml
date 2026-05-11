@@ -1,0 +1,196 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: build (linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GUI deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            pkg-config libssl-dev
+
+      - name: Build
+        run: |
+          cargo build --release \
+            -p llm-usage-tray \
+            -p llm-usage-dashboard \
+            -p llm-usage-setup \
+            -p llm-usage
+
+      - name: Stage tarball
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="${{ inputs.tag }}"
+            VERSION="${VERSION#v}"
+          fi
+          STAGE="llm-usage-${VERSION}-linux-x86_64"
+          mkdir -p "dist/${STAGE}"
+          cp target/release/llm-usage-tray "dist/${STAGE}/"
+          cp target/release/llm-usage-dashboard "dist/${STAGE}/"
+          cp target/release/llm-usage-setup "dist/${STAGE}/"
+          cp target/release/llm-usage "dist/${STAGE}/"
+          cp LICENSE README.md config.example.toml "dist/${STAGE}/"
+          cp -r packaging/linux "dist/${STAGE}/packaging-linux"
+          tar -C dist -cJf "dist/${STAGE}.tar.xz" "${STAGE}"
+          (cd dist && sha256sum "${STAGE}.tar.xz" > "${STAGE}.tar.xz.sha256")
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            dist/*.tar.xz
+            dist/*.sha256
+
+  build-macos:
+    name: build (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            label: macos-x86_64
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            label: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo install cargo-bundle --locked || true
+
+      - name: Build binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p llm-usage-tray \
+            -p llm-usage-dashboard \
+            -p llm-usage-setup \
+            -p llm-usage
+
+      - name: Bundle the tray app
+        run: |
+          cargo bundle --release --target ${{ matrix.target }} -p llm-usage-tray
+          # cargo-bundle only knows about the tray binary; copy the
+          # sibling binaries into the same MacOS/ dir so the tray's
+          # `spawn_dashboard` / `--popup` / setup paths work when users
+          # run from /Applications.
+          APP="target/${{ matrix.target }}/release/bundle/osx/llm-usage.app"
+          cp target/${{ matrix.target }}/release/llm-usage-dashboard "$APP/Contents/MacOS/"
+          cp target/${{ matrix.target }}/release/llm-usage-setup     "$APP/Contents/MacOS/"
+          cp target/${{ matrix.target }}/release/llm-usage           "$APP/Contents/MacOS/"
+
+      - name: Package
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="${{ inputs.tag }}"
+            VERSION="${VERSION#v}"
+          fi
+          STAGE="llm-usage-${VERSION}-${{ matrix.label }}"
+          mkdir -p "dist/${STAGE}"
+          cp -R "target/${{ matrix.target }}/release/bundle/osx/llm-usage.app" "dist/${STAGE}/"
+          cp LICENSE README.md config.example.toml "dist/${STAGE}/"
+          cp packaging/macos/dev.buffbit.llm-usage.plist "dist/${STAGE}/"
+          (cd dist && zip -r "${STAGE}.zip" "${STAGE}")
+          (cd dist && shasum -a 256 "${STAGE}.zip" > "${STAGE}.zip.sha256")
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+  publish:
+    name: publish release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.xz
+            artifacts/*.zip
+            artifacts/*.sha256
+          body: |
+            ## Install
+
+            **Linux (x86_64)**
+
+            ```bash
+            tar xf llm-usage-*-linux-x86_64.tar.xz
+            cd llm-usage-*-linux-x86_64
+            sudo cp llm-usage{,-tray,-dashboard,-setup} /usr/local/bin/   # or ~/.local/bin/
+            cp packaging-linux/llm-usage.desktop ~/.config/autostart/      # optional autostart
+            ```
+
+            **macOS (Intel: `x86_64`; Apple Silicon: `aarch64`)**
+
+            ```bash
+            unzip llm-usage-*-macos-*.zip
+            mv llm-usage-*-macos-*/llm-usage.app /Applications/
+            xattr -d com.apple.quarantine /Applications/llm-usage.app   # builds are unsigned
+            open /Applications/llm-usage.app
+            ```
+
+            ## Notes
+
+            Builds are **unsigned**. macOS Gatekeeper will refuse to launch
+            them on first open; the `xattr` line above tells it the user
+            has reviewed the binary. If you'd rather not run unsigned
+            binaries, build from source — see the README.
+
+            Reverse-engineered endpoints (Anthropic OAuth, Codex CLI rate
+            limits, Ollama Cloud `/settings`) may break across upstream
+            versions; this is a best-effort tool.

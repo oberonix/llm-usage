@@ -7,6 +7,11 @@
 //!
 //! The session cookie is read from your normal config (or
 //! LLM_USAGE_CONFIG=/path/to/config.toml).
+//!
+//! ⚠️  Treat the output as sensitive. The HTML embeds session-bound
+//! CSRF tokens, your account email, and other identifiers from your
+//! logged-in ollama.com session. Don't paste the file into a public
+//! issue or share it without first stripping those fields.
 
 use llm_usage_core::config::Config;
 use llm_usage_core::providers::OllamaCloudProvider;
@@ -32,6 +37,11 @@ async fn main() -> anyhow::Result<()> {
         );
         std::process::exit(2);
     }
+    eprintln!(
+        "WARNING: output contains your logged-in ollama.com session HTML \
+         (CSRF tokens, account email, etc.). Don't share it publicly without \
+         redacting first."
+    );
 
     let provider = OllamaCloudProvider::new(cfg.ollama_cloud);
     let html = provider.fetch_settings_html().await?;
