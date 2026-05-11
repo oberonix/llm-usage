@@ -562,9 +562,11 @@ impl DashboardApp {
     fn render_settings_body(&mut self, ui: &mut egui::Ui) {
         self.draft.render(ui);
         ui.add_space(16.0);
-        let reset = ui.add(
-            egui::Button::new(RichText::new("Reset to defaults").size(13.0))
-                .min_size(egui::vec2(140.0, 26.0)),
+        // `add_sized` centers the button's contents inside the fixed
+        // bounds; using `min_size` left-aligns instead.
+        let reset = ui.add_sized(
+            [140.0, 26.0],
+            egui::Button::new(RichText::new("Reset to defaults").size(13.0)),
         );
         if reset.clicked() {
             self.draft = ConfigDraft::from_config(&Config::default());

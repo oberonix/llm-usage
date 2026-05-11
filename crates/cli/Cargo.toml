@@ -1,0 +1,19 @@
+[package]
+name = "llm-usage-status"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "llm-usage-status"
+path = "src/main.rs"
+
+[dependencies]
+llm-usage-core = { path = "../core" }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true

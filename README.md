@@ -54,20 +54,23 @@ paste the `Cookie:` header yourself.
 ```bash
 sudo apt install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
     libwebkit2gtk-4.1-dev pkg-config libssl-dev
-cargo build --release -p llm-usage -p llm-usage-dashboard -p llm-usage-setup
+cargo build --release -p llm-usage -p llm-usage-dashboard -p llm-usage-setup -p llm-usage-status
 ```
 
-The three binaries land at:
+The four binaries land at:
 
 - `target/release/llm-usage` — the tray app (always-running)
 - `target/release/llm-usage-dashboard` — opened on demand from the tray menu
 - `target/release/llm-usage-setup` — one-shot login window for Ollama Cloud,
   spawned by the dashboard's "Set up login…" button
+- `target/release/llm-usage-status` — terminal/CLI usage view. Reads the
+  shared snapshot file when available, falls back to a fresh poll. Pass
+  `--refresh` to force a fresh poll.
 
 ### macOS
 
 ```bash
-cargo build --release -p llm-usage -p llm-usage-dashboard -p llm-usage-setup
+cargo build --release -p llm-usage -p llm-usage-dashboard -p llm-usage-setup -p llm-usage-status
 cargo install cargo-bundle
 cargo bundle --release -p llm-usage
 open target/release/bundle/osx/llm-usage.app
