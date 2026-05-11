@@ -44,6 +44,7 @@ use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use std::time::Duration;
 
+const BASE_URL: &str = "https://ollama.com";
 const SETTINGS_PATH: &str = "/settings";
 
 pub struct OllamaCloudProvider {
@@ -73,7 +74,7 @@ impl OllamaCloudProvider {
             .session_cookie
             .as_deref()
             .ok_or_else(|| anyhow!("no session_cookie set"))?;
-        let url = format!("{}{}", self.cfg.base_url.trim_end_matches('/'), SETTINGS_PATH);
+        let url = format!("{}{}", BASE_URL, SETTINGS_PATH);
         let resp = self
             .http
             .get(&url)

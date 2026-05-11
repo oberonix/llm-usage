@@ -39,9 +39,8 @@ warn_at = [0.75, 0.9]
 [ollama_cloud]
 enabled = false
 # The dashboard's "Import from browser…" or "Sign in via popup window…"
-# buttons populate this for you. Re-paste only if you log out / rotate.
+# buttons populate this for you. The URL is hardcoded to ollama.com.
 # session_cookie = "session=…; csrf=…"
-base_url = "https://ollama.com"
 warn_at = [0.75, 0.9]
 
 [alerts]

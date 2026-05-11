@@ -109,7 +109,6 @@ pub struct OllamaCloudConfig {
     /// raw `Cookie:` request header value is the expected format
     /// (e.g. `session=abc123; csrf=xyz`).
     pub session_cookie: Option<String>,
-    pub base_url: String,
     pub warn_at: Vec<f64>,
 }
 
@@ -118,7 +117,6 @@ impl Default for OllamaCloudConfig {
         Self {
             enabled: false,
             session_cookie: None,
-            base_url: "https://ollama.com".to_string(),
             warn_at: vec![0.75, 0.9],
         }
     }

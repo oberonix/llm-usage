@@ -61,7 +61,6 @@ pub struct ConfigDraft {
 
     pub ollama_cloud_enabled: bool,
     pub ollama_cloud_session_cookie: String,
-    pub ollama_cloud_base_url: String,
     pub ollama_cloud_warn_at: Vec<f64>,
 
     // UI-only state for the setup-login flow. Not persisted.
@@ -98,7 +97,6 @@ impl ConfigDraft {
                 .session_cookie
                 .clone()
                 .unwrap_or_default(),
-            ollama_cloud_base_url: c.ollama_cloud.base_url.clone(),
             ollama_cloud_warn_at: c.ollama_cloud.warn_at.clone(),
 
             ollama_cloud_setup_status: None,
@@ -137,7 +135,6 @@ impl ConfigDraft {
         c.ollama_cloud = OllamaCloudConfig {
             enabled: self.ollama_cloud_enabled,
             session_cookie: empty_to_none(&self.ollama_cloud_session_cookie),
-            base_url: self.ollama_cloud_base_url.trim().to_string(),
             warn_at: self.ollama_cloud_warn_at.clone(),
         };
 
@@ -363,13 +360,6 @@ impl ConfigDraft {
         provider_card(ui, tint(ProviderId::OllamaCloud), |ui| {
             section_header_row(ui, "Ollama Cloud", Some(ProviderId::OllamaCloud));
             enabled_row(ui, &mut self.ollama_cloud_enabled, None, "");
-            field_row(ui, "Base URL", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.ollama_cloud_base_url)
-                        .desired_width(360.0)
-                        .hint_text("https://ollama.com"),
-                );
-            });
             field_row(ui, "Alert at", |ui| {
                 alert_preset_combo(ui, "ollama_cloud_alert", &mut self.ollama_cloud_warn_at);
             });
@@ -457,24 +447,11 @@ impl ConfigDraft {
                 ui.weak(msg);
             }
 
-            ui.add_space(4.0);
-            ui.collapsing(
-                RichText::new("Manual cookie (advanced)").size(11.5),
-                |ui| {
-                    field_row(ui, "Session cookie", |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.ollama_cloud_session_cookie)
-                                .password(true)
-                                .desired_width(360.0)
-                                .hint_text("paste browser Cookie header"),
-                        );
-                    });
-                },
-            );
+            ui.add_space(2.0);
             help(
                 ui,
-                "Usage is scraped from /settings using your session cookie. Re-import \
-                 after logging out or rotating.",
+                "Usage is scraped from ollama.com/settings using your session cookie. \
+                 Re-import after logging out or rotating.",
             );
         });
     }
