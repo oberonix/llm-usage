@@ -3153,6 +3153,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "llm-usage-core",
+ "notify",
  "tokio",
  "tracing",
  "tracing-subscriber",

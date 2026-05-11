@@ -63,9 +63,35 @@ The four binaries land at:
 - `target/release/llm-usage-dashboard` — opened on demand from the tray menu
 - `target/release/llm-usage-setup` — one-shot login window for Ollama Cloud,
   spawned by the dashboard's "Set up login…" button
-- `target/release/llm-usage-status` — terminal/CLI usage view. Reads the
-  shared snapshot file when available, falls back to a fresh poll. Pass
-  `--refresh` to force a fresh poll.
+- `target/release/llm-usage-status` — terminal/CLI usage view. By
+  default it watches the tray's shared snapshot file and redraws the
+  quota bars whenever a new poll lands, so a small terminal window on
+  the side of your screen mirrors the tray. Pass `--once` to render a
+  single frame and exit (useful for scripts or `watch -n N`), or
+  `--refresh` to ask the tray to poll right away.
+
+### Putting `llm-usage-status` on `PATH`
+
+Pick whichever you prefer. The first option doesn't need sudo and is
+the most idiomatic for Rust toolchains:
+
+```bash
+# Recommended: cargo's own bin dir (already on PATH for rustup users)
+cargo install --path crates/cli
+
+# Or symlink the release build into a user-local bin dir
+mkdir -p ~/.local/bin
+ln -sf "$(pwd)/target/release/llm-usage-status" ~/.local/bin/
+
+# If ~/.local/bin isn't on PATH yet:
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
+source ~/.bashrc
+
+# Or system-wide (needs sudo)
+sudo ln -sf "$(pwd)/target/release/llm-usage-status" /usr/local/bin/
+```
+
+Then anywhere in a terminal: `llm-usage-status`.
 
 ### macOS
 
