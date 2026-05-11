@@ -95,9 +95,10 @@ enum SingletonOutcome {
     Forwarded,
 }
 
-/// If a PID file for `name` exists and the recorded process is alive,
-/// touch the focus-trigger so the running instance brings itself to
-/// the front, and return `Forwarded`. Otherwise claim the slot.
+/// If a PID file for `name` exists and the recorded process is alive
+/// AND is one of our own dashboard binaries, touch the focus-trigger
+/// so the running instance brings itself to the front, and return
+/// `Forwarded`. Otherwise claim the slot.
 fn try_acquire_singleton(name: &str) -> SingletonOutcome {
     let pid_path = match llm_usage_core::config::singleton_pid_path(name) {
         Ok(p) => p,
@@ -111,7 +112,7 @@ fn try_acquire_singleton(name: &str) -> SingletonOutcome {
 
     if let Ok(s) = std::fs::read_to_string(&pid_path) {
         if let Ok(pid) = s.trim().parse::<u32>() {
-            if is_process_alive(pid) {
+            if is_our_process(pid) {
                 let _ = std::fs::write(&focus_path, chrono::Utc::now().to_rfc3339());
                 return SingletonOutcome::Forwarded;
             }
@@ -121,16 +122,37 @@ fn try_acquire_singleton(name: &str) -> SingletonOutcome {
     SingletonOutcome::Acquired(pid_path)
 }
 
-fn is_process_alive(pid: u32) -> bool {
-    // `kill -0 <pid>` returns 0 if the process exists and we have
-    // permission to signal it. No actual signal is sent.
-    std::process::Command::new("kill")
+/// Return true only when `pid` names a live process whose command line
+/// is one of our dashboard binaries. The cmdline check defends against
+/// PID reuse — when a previous dashboard dies without cleanup, the
+/// kernel can later hand its PID to an unrelated process and a naive
+/// "is the PID alive?" check would incorrectly forward to it.
+fn is_our_process(pid: u32) -> bool {
+    let alive = std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !alive {
+        return false;
+    }
+    // Linux: /proc/<pid>/cmdline holds the full argv joined by NULs.
+    if let Ok(bytes) = std::fs::read(format!("/proc/{}/cmdline", pid)) {
+        let s = String::from_utf8_lossy(&bytes);
+        return s.contains("llm-usage-dashboard");
+    }
+    // macOS / fallback: ask `ps` for the binary name. `comm` is
+    // truncated to ~16 chars on Linux but full on macOS, and "ps -p"
+    // exits non-zero if the PID doesn't exist.
+    let comm = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    comm.contains("llm-usage-dashb")
 }
 
 /// Removes the PID file on drop so the next instance can claim the
