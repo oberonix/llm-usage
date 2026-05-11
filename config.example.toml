@@ -11,6 +11,10 @@ poll_interval_secs = 900
 # Default 15 s; clamps to a minimum of 5 s.
 icon_rotation_secs = 15
 
+# Draw a 1 px red line across each tray-icon bar at the elapsed fraction of
+# the corresponding time window. Off keeps the icon as just the fill bars.
+show_pace_marker = true
+
 [anthropic]
 enabled = true
 # When false (default), only quota usage is shown. Flip to true to display

@@ -14,6 +14,10 @@ pub struct Config {
     /// Stored in seconds; clamped to a minimum of 5 at read time so a
     /// hand-edited config can't make the icon flicker.
     pub icon_rotation_secs: u64,
+    /// Draw the 1 px red "pace" line across each tray-icon bar at the
+    /// elapsed-fraction of the corresponding window. Off keeps the
+    /// icon as just the fill bars.
+    pub show_pace_marker: bool,
     pub anthropic: AnthropicConfig,
     pub codex_cli: CodexCliConfig,
     pub ollama_cloud: OllamaCloudConfig,
@@ -29,6 +33,7 @@ impl Default for Config {
             // towards "informative, not chatty".
             poll_interval_secs: 900,
             icon_rotation_secs: 15,
+            show_pace_marker: true,
             anthropic: AnthropicConfig::default(),
             codex_cli: CodexCliConfig::default(),
             ollama_cloud: OllamaCloudConfig::default(),

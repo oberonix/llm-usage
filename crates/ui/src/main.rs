@@ -105,6 +105,7 @@ fn main() -> Result<()> {
     let mut active_idx: usize = 0;
     let mut last_rotation = Instant::now();
     let mut rotation_interval = rotation_interval_from(&config);
+    let mut show_pace_marker = config.show_pace_marker;
 
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(
@@ -118,7 +119,7 @@ fn main() -> Result<()> {
         if last_rotation.elapsed() >= rotation_interval {
             active_idx = active_idx.wrapping_add(1);
             last_rotation = Instant::now();
-            refresh_icon(&tray, &current_snapshots, &mut active_idx);
+            refresh_icon(&tray, &current_snapshots, &mut active_idx, show_pace_marker);
         }
 
         // Drain runtime messages.
@@ -128,7 +129,7 @@ fn main() -> Result<()> {
                     current_snapshots = snaps;
                     let new_menu = build_menu(&current_snapshots);
                     tray.set_menu(Some(Box::new(new_menu)));
-                    refresh_icon(&tray, &current_snapshots, &mut active_idx);
+                    refresh_icon(&tray, &current_snapshots, &mut active_idx, show_pace_marker);
                 }
                 RuntimeMessage::Alert(message) => {
                     let _ = notify_rust::Notification::new()
@@ -138,12 +139,15 @@ fn main() -> Result<()> {
                         .show();
                 }
                 RuntimeMessage::ConfigReloaded => {
-                    // Pick up the rotation interval the user may have
-                    // changed in Settings. Falls back to the in-flight
-                    // value if the file can't be re-read.
+                    // Pick up the rotation interval / pace marker
+                    // toggle the user may have changed in Settings.
+                    // Falls back to the in-flight values if the file
+                    // can't be re-read.
                     if let Ok(new_cfg) = Config::load_or_default() {
                         rotation_interval = rotation_interval_from(&new_cfg);
+                        show_pace_marker = new_cfg.show_pace_marker;
                     }
+                    refresh_icon(&tray, &current_snapshots, &mut active_idx, show_pace_marker);
                     let _ = notify_rust::Notification::new()
                         .summary("llm-usage")
                         .body("Config reloaded")
@@ -455,6 +459,7 @@ fn refresh_icon(
     tray: &TrayIcon,
     snapshots: &BTreeMap<ProviderId, UsageSnapshot>,
     active_idx: &mut usize,
+    show_pace_marker: bool,
 ) {
     let eligible: Vec<ProviderId> = PROVIDER_ORDER
         .iter()
@@ -482,7 +487,11 @@ fn refresh_icon(
     let Some(snap) = snapshots.get(&id) else {
         return;
     };
-    let (session, weekly) = icon::pick_bars(snap);
+    let (mut session, mut weekly) = icon::pick_bars(snap);
+    if !show_pace_marker {
+        session.pace = None;
+        weekly.pace = None;
+    }
     let _ = tray.set_icon(Some(icon::render(id, session, weekly)));
     let headline = snap.headline.as_deref().unwrap_or("");
     let tooltip = if headline.is_empty() {

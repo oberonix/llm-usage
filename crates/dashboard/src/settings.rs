@@ -47,6 +47,7 @@ const ALERT_PRESETS: &[(&str, &[f64])] = &[
 pub struct ConfigDraft {
     pub poll_interval_secs: u64,
     pub icon_rotation_secs: u64,
+    pub show_pace_marker: bool,
 
     pub anthropic_enabled: bool,
     pub anthropic_show_spend: bool,
@@ -79,6 +80,7 @@ impl ConfigDraft {
         Self {
             poll_interval_secs: c.poll_interval_secs,
             icon_rotation_secs: c.icon_rotation_secs,
+            show_pace_marker: c.show_pace_marker,
 
             anthropic_enabled: c.anthropic.enabled,
             anthropic_show_spend: c.anthropic.show_spend,
@@ -111,6 +113,7 @@ impl ConfigDraft {
         let mut c = Config::load_or_default().unwrap_or_default();
         c.poll_interval_secs = self.poll_interval_secs.max(60);
         c.icon_rotation_secs = self.icon_rotation_secs.max(5);
+        c.show_pace_marker = self.show_pace_marker;
 
         c.anthropic = AnthropicConfig {
             enabled: self.anthropic_enabled,
@@ -286,6 +289,13 @@ impl ConfigDraft {
                 ui,
                 "How often the tray icon swaps to the next quota-bearing provider's \
                  gauge. Shorter feels live; longer is calmer.",
+            );
+            ui.add_space(4.0);
+            ui.checkbox(&mut self.show_pace_marker, "Show pace marker on tray icon");
+            help(
+                ui,
+                "1 px red line marking elapsed time in each window. Off keeps the icon \
+                 as just the fill bars.",
             );
         });
 
