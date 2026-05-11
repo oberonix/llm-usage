@@ -172,6 +172,7 @@ impl Provider for CodexCliProvider {
             error: None,
             windows: Default::default(),
             headline: None,
+            plan_label: None,
         };
 
         let w5 = snap.window_mut(WindowKind::FiveHourRolling);
@@ -213,6 +214,7 @@ impl Provider for CodexCliProvider {
             }
         }
 
+        snap.plan_label = plan_label.clone();
         snap.headline = Some(build_headline(
             plan_label.as_deref(),
             snap.window(WindowKind::FiveHourRolling),

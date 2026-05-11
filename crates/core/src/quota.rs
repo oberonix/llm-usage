@@ -153,6 +153,7 @@ mod tests {
             error: None,
             windows,
             headline: None,
+            plan_label: None,
         };
 
         let first = engine.evaluate(&snap);

@@ -191,8 +191,8 @@ impl eframe::App for DashboardApp {
                     ui.add_space(8.0);
                     self.tab_button(ui, Tab::Settings, "Settings");
                 });
-                ui.add_space(2.0);
-                ui.separator();
+                // No separator line — the underline under the active
+                // tab button is the divider.
             });
 
         // Per-tab subheader (Refresh + last-updated indicator) keeps the
@@ -276,7 +276,12 @@ impl DashboardApp {
                 // Horizontal padding lives inside the scroll area so the
                 // scroll bar sits at the panel edge, not 20 px in.
                 egui::Frame::none()
-                    .inner_margin(egui::Margin::symmetric(20.0, 0.0))
+                    .inner_margin(egui::Margin {
+                        left: 20.0,
+                        right: 20.0,
+                        top: 12.0,
+                        bottom: 0.0,
+                    })
                     .show(ui, |ui| {
                         self.render_status_body(ui);
                     });
@@ -333,7 +338,12 @@ impl DashboardApp {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 egui::Frame::none()
-                    .inner_margin(egui::Margin::symmetric(20.0, 0.0))
+                    .inner_margin(egui::Margin {
+                        left: 20.0,
+                        right: 20.0,
+                        top: 12.0,
+                        bottom: 0.0,
+                    })
                     .show(ui, |ui| {
                         self.render_settings_body(ui);
                     });
@@ -380,15 +390,10 @@ fn render_provider_card(ui: &mut egui::Ui, snap: &UsageSnapshot) {
     let tint_rgb = snap.provider.tint_rgb();
     let tint = Color32::from_rgb(tint_rgb.0, tint_rgb.1, tint_rgb.2);
     card_frame(ui, tint, |ui| {
-        header_row(ui, snap.provider, snap.status, tint);
-        if let Some(h) = &snap.headline {
-            ui.add_space(2.0);
-            ui.label(
-                RichText::new(h)
-                    .color(Color32::from_gray(180))
-                    .size(13.0),
-            );
-        }
+        header_row(ui, snap.provider, snap.plan_label.as_deref(), snap.status, tint);
+        // Headline removed: the window grid below already shows the
+        // same percentages and reset times; the headline duplicated
+        // them and felt like a "subtitle line" the user didn't want.
         if let Some(err) = &snap.error {
             ui.add_space(2.0);
             ui.colored_label(Color32::from_rgb(0xE5, 0x39, 0x35), err);
@@ -471,10 +476,10 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
             // convention but were hard to scan otherwise.
             let mut parts: Vec<String> = Vec::new();
             if w.tokens_in > 0 {
-                parts.push(format!("in {}", fmt_tokens(w.tokens_in)));
+                parts.push(format!("{} in", fmt_tokens(w.tokens_in)));
             }
             if w.tokens_out > 0 {
-                parts.push(format!("out {}", fmt_tokens(w.tokens_out)));
+                parts.push(format!("{} out", fmt_tokens(w.tokens_out)));
             }
             if w.request_count > 0 {
                 parts.push(format!("{} reqs", w.request_count));
@@ -511,8 +516,7 @@ fn reset_label(secs: i64) -> String {
 fn window_order(label: &str) -> u32 {
     match label {
         // Quota windows — short rolling first, then weekly.
-        "session" => 10,
-        "5h" => 11,
+        "5h" => 10,
         "week" => 20,
         "week (Sonnet)" => 21,
         "week (Opus)" => 22,
@@ -582,16 +586,39 @@ pub fn card_frame(ui: &mut egui::Ui, tint: Color32, body: impl FnOnce(&mut egui:
     });
 }
 
-fn header_row(ui: &mut egui::Ui, provider: ProviderId, status: ProviderStatus, _tint: Color32) {
-    // No dot: the left-edge accent stripe on the card already identifies
-    // the provider by colour; a second swatch in the header just added
-    // visual noise.
+fn header_row(
+    ui: &mut egui::Ui,
+    provider: ProviderId,
+    plan_label: Option<&str>,
+    status: ProviderStatus,
+    _tint: Color32,
+) {
+    // No dot: the left-edge accent stripe on the card already
+    // identifies the provider by colour. Plan tag (if any) follows
+    // the name inline so the user can see "Codex CLI · Plus" without
+    // a separate headline row.
     ui.horizontal(|ui| {
         ui.label(RichText::new(provider.human()).strong().size(15.5));
+        if let Some(plan) = plan_label {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("· {}", title_case(plan)))
+                    .color(Color32::from_gray(150))
+                    .size(13.0),
+            );
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             status_chip(ui, status);
         });
     });
+}
+
+fn title_case(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 fn status_chip(ui: &mut egui::Ui, status: ProviderStatus) {

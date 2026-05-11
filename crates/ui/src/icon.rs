@@ -93,13 +93,11 @@ fn provider_tint(id: ProviderId) -> (u8, u8, u8) {
 }
 
 /// Pick the (short-window, weekly) fractions out of a snapshot.
-/// Searches a small fallback list of window keys because providers
-/// label their short window differently (Anthropic uses "5h", Ollama
-/// Cloud uses "session", Gemini uses "today").
+/// All providers now label their short window "5h" (Ollama Cloud's
+/// "session" is normalised to it at the source), so a single key
+/// lookup suffices.
 pub fn pick_fractions(snap: &UsageSnapshot) -> (Option<f64>, Option<f64>) {
-    let session = ["5h", "session", "today"]
-        .iter()
-        .find_map(|k| snap.windows.get(*k).and_then(|w| w.fraction_used));
+    let session = snap.windows.get("5h").and_then(|w| w.fraction_used);
     let weekly = snap.windows.get("week").and_then(|w| w.fraction_used);
     (session, weekly)
 }

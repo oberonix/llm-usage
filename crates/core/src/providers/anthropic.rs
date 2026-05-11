@@ -187,6 +187,7 @@ impl Provider for AnthropicProvider {
             error: agg.error.clone(),
             windows: Default::default(),
             headline: None,
+            plan_label: None,
         };
 
         // Fill windows.

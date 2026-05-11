@@ -112,6 +112,10 @@ pub struct UsageSnapshot {
     pub windows: BTreeMap<String, WindowUsage>,
     /// One-line tray summary, e.g. "$4.21 today · 62% of weekly".
     pub headline: Option<String>,
+    /// Optional plan / tier tag (e.g. "plus", "pro"). Surfaced in the
+    /// dashboard's provider header alongside the provider name.
+    #[serde(default)]
+    pub plan_label: Option<String>,
 }
 
 impl UsageSnapshot {
@@ -123,6 +127,7 @@ impl UsageSnapshot {
             error: Some(error.into()),
             windows: BTreeMap::new(),
             headline: None,
+            plan_label: None,
         }
     }
 

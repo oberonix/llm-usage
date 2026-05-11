@@ -141,11 +141,15 @@ impl Provider for OllamaCloudProvider {
             error: None,
             windows: Default::default(),
             headline: None,
+            plan_label: parsed.plan.clone(),
         };
 
         for row in &parsed.rows {
+            // Normalise the short rolling window to "5h" so it aligns
+            // with the same-named row from Anthropic and Codex even
+            // though Ollama calls it "Session usage" on the page.
             let key = match row.label.as_str() {
-                "Session usage" => "session".to_string(),
+                "Session usage" => "5h".to_string(),
                 "Weekly usage" => WindowKind::ThisWeek.label().to_string(),
                 other => other.to_ascii_lowercase().replace(' ', "-"),
             };
@@ -248,7 +252,7 @@ fn build_headline(parsed: &Parsed, now: DateTime<Utc>) -> String {
     }
     for row in &parsed.rows {
         let short_label = match row.label.as_str() {
-            "Session usage" => "session",
+            "Session usage" => "5h",
             "Weekly usage" => "7d",
             other => other,
         };
@@ -352,8 +356,10 @@ mod tests {
             .with_timezone(&Utc);
         let h = build_headline(&parsed, now);
         // 03:00Z is 2h away → "R:2h"; 2026-05-11T00:00 is 23h away → "R:23h".
+        // Short window is normalised to "5h" so it matches the label
+        // every other provider uses.
         assert!(h.contains("pro"), "{}", h);
-        assert!(h.contains("session 28% R:2h"), "{}", h);
+        assert!(h.contains("5h 28% R:2h"), "{}", h);
         assert!(h.contains("7d 84% R:23h"), "{}", h);
     }
 
