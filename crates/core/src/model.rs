@@ -26,7 +26,7 @@ impl ProviderId {
     pub fn human(&self) -> &'static str {
         match self {
             ProviderId::Anthropic => "Anthropic",
-            ProviderId::CodexCli => "Codex CLI",
+            ProviderId::CodexCli => "Codex",
             ProviderId::OllamaCloud => "Ollama Cloud",
         }
     }

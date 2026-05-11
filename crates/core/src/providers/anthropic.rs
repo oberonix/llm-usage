@@ -11,7 +11,9 @@
 //!                                "ephemeral_5m_input_tokens": …,
 //!                                "ephemeral_1h_input_tokens": … } } } }
 
-use crate::anthropic_oauth::{self, OAuthBackoff, OAuthError, OAuthUsageResponse, QuotaBucket};
+use crate::anthropic_oauth::{
+    self, OAuthBackoff, OAuthCredentials, OAuthError, OAuthUsageResponse, QuotaBucket,
+};
 use crate::config::AnthropicConfig;
 use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind, WindowUsage};
 use crate::pricing::{anthropic_default, AnthropicTokenUsage, ModelRate};
@@ -317,6 +319,13 @@ impl Provider for AnthropicProvider {
                 snap.status = ProviderStatus::Degraded;
                 snap.error = Some(format!("quota: {}", err));
             }
+        }
+
+        // Best-effort plan tag from the credentials file ("Max 5x",
+        // "Pro", etc.). Failing to read it is non-fatal — the header
+        // just falls back to the provider name alone.
+        if let Ok(creds) = OAuthCredentials::load() {
+            snap.plan_label = creds.plan_label();
         }
 
         if !self.cfg.show_spend {

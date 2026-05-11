@@ -327,7 +327,7 @@ impl DashboardApp {
                 ui.add_space(4.0);
                 ui.weak(
                     "Switch to the Settings tab to enable Anthropic, \
-                     Codex CLI, or Ollama Cloud.",
+                     Codex, or Ollama Cloud.",
                 );
             });
         }
@@ -593,20 +593,16 @@ fn header_row(
     status: ProviderStatus,
     _tint: Color32,
 ) {
-    // No dot: the left-edge accent stripe on the card already
-    // identifies the provider by colour. Plan tag (if any) follows
-    // the name inline so the user can see "Codex CLI · Plus" without
-    // a separate headline row.
+    // Provider name and plan tag share one bold label so the dash sits
+    // mid-line in the same style — no separate weight or colour for
+    // the plan portion. The left-edge accent stripe on the card already
+    // identifies the provider by colour.
+    let title = match plan_label {
+        Some(plan) => format!("{} · {}", provider.human(), title_case(plan)),
+        None => provider.human().to_string(),
+    };
     ui.horizontal(|ui| {
-        ui.label(RichText::new(provider.human()).strong().size(15.5));
-        if let Some(plan) = plan_label {
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(format!("· {}", title_case(plan)))
-                    .color(Color32::from_gray(150))
-                    .size(13.0),
-            );
-        }
+        ui.label(RichText::new(title).strong().size(15.5));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             status_chip(ui, status);
         });

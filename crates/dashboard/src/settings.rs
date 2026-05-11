@@ -349,7 +349,7 @@ impl ConfigDraft {
 
     fn render_codex(&mut self, ui: &mut egui::Ui) {
         provider_card(ui, tint(ProviderId::CodexCli), |ui| {
-            section_header_row(ui, "Codex CLI", Some(ProviderId::CodexCli));
+            section_header_row(ui, "Codex", Some(ProviderId::CodexCli));
             enabled_row(
                 ui,
                 &mut self.codex_enabled,

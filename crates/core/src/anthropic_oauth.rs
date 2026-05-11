@@ -76,6 +76,36 @@ impl OAuthCredentials {
             None => false,
         }
     }
+
+    /// Human-readable plan label derived from the credentials file.
+    /// We prefer `rateLimitTier` because it carries the multiplier
+    /// (`default_claude_max_5x`, `default_claude_max_20x`); fall back to
+    /// `subscriptionType` for tiers that don't have one (e.g. "pro",
+    /// "team").
+    ///
+    /// Examples:
+    /// - `rateLimitTier="default_claude_max_5x"` → `Some("Max 5x")`
+    /// - `subscriptionType="pro"`                → `Some("Pro")`
+    pub fn plan_label(&self) -> Option<String> {
+        let body = &self.claude_ai_oauth;
+        if let Some(tier) = body.rate_limit_tier.as_deref() {
+            let trimmed = tier.strip_prefix("default_claude_").unwrap_or(tier);
+            if let Some(rest) = trimmed.strip_prefix("max_") {
+                return Some(format!("Max {}", rest));
+            }
+        }
+        body.subscription_type
+            .as_deref()
+            .map(title_case_first_char)
+    }
+}
+
+fn title_case_first_char(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 pub fn credentials_path() -> Result<PathBuf, OAuthError> {
