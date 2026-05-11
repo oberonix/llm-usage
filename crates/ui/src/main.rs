@@ -186,12 +186,11 @@ fn main() -> Result<()> {
 }
 
 /// Rebuild the tray menu from the current snapshots. Each provider
-/// contributes one informational (disabled) row per quota-bearing
-/// window: `▰▰▰▱▱▱▱▱ 35% │ Anthropic · Max 5x — week (resets 2d)`.
-/// The first row of a provider carries the name + plan tag; subsequent
-/// rows just show the window label indented. Providers without any
-/// quota fractions are skipped — those have nothing to draw, and the
-/// "Open dashboard…" action below still exposes their activity counts.
+/// gets a header row carrying the name + plan tag (`Anthropic · Max 5x`)
+/// followed by one informational (disabled) row per quota-bearing
+/// window with a Unicode block bar: `▰▰▰▱▱▱▱▱ 35% week (resets 2d)`.
+/// No separator between providers — the bare header row visually
+/// delineates them and keeps the lines tighter together.
 fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
     let menu = Menu::new();
     let mut printed_a_provider = false;
@@ -212,16 +211,19 @@ fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
             continue;
         }
         quota_windows.sort_by_key(|(label, _)| menu_window_order(label.as_str()));
-
-        if printed_a_provider {
-            let _ = menu.append(&PredefinedMenuItem::separator());
-        }
         printed_a_provider = true;
 
-        for (i, (label, w)) in quota_windows.iter().enumerate() {
-            let text = format_quota_row(snap, label, w, i == 0);
-            let item = MenuItem::new(text, false, None);
-            let _ = menu.append(&item);
+        let plan = snap
+            .plan_label
+            .as_deref()
+            .map(|p| format!(" · {}", p))
+            .unwrap_or_default();
+        let header = format!("{}{}", snap.provider.human(), plan);
+        let _ = menu.append(&MenuItem::new(header, false, None));
+
+        for (label, w) in &quota_windows {
+            let text = format_quota_row(label, w);
+            let _ = menu.append(&MenuItem::new(text, false, None));
         }
     }
 
@@ -270,12 +272,7 @@ fn menu_window_order(label: &str) -> u32 {
     }
 }
 
-fn format_quota_row(
-    snap: &UsageSnapshot,
-    label: &str,
-    w: &WindowUsage,
-    is_first: bool,
-) -> String {
+fn format_quota_row(label: &str, w: &WindowUsage) -> String {
     let frac = w.fraction_used.unwrap_or(0.0);
     let bar = unicode_bar(frac, 8);
     let pct = format!("{:>3.0}%", frac * 100.0);
@@ -291,25 +288,9 @@ fn format_quota_row(
         })
         .map(|s| format!(" ({})", s))
         .unwrap_or_default();
-
-    if is_first {
-        let plan = snap
-            .plan_label
-            .as_deref()
-            .map(|p| format!(" · {}", p))
-            .unwrap_or_default();
-        format!(
-            "{} {} │ {}{} — {}{}",
-            bar,
-            pct,
-            snap.provider.human(),
-            plan,
-            label,
-            reset
-        )
-    } else {
-        format!("{} {} │   {}{}", bar, pct, label, reset)
-    }
+    // Two-space gap between the bar+pct and the window label — no `│`
+    // separator. Keeps each line shorter and visually less boxed.
+    format!("{} {}  {}{}", bar, pct, label, reset)
 }
 
 fn unicode_bar(fraction: f64, cells: usize) -> String {
