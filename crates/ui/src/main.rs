@@ -297,7 +297,7 @@ fn format_quota_row(label: &str, w: &WindowUsage) -> String {
         })
         .map(|s| format!(" · {}", s))
         .unwrap_or_default();
-    format!("{} {} {}{}", bar, pct, label, reset)
+    format!("{} {} · {}{}", bar, pct, label, reset)
 }
 
 fn unicode_bar(fraction: f64, cells: usize) -> String {
