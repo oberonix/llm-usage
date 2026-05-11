@@ -9,12 +9,6 @@ use llm_usage_core::config::{
 use llm_usage_core::model::ProviderId;
 use std::path::PathBuf;
 
-/// Result of a `Save` press — used to render a toast at the top of the window.
-pub enum SaveOutcome {
-    Saved(PathBuf),
-    Error(String),
-}
-
 /// Pre-baked dropdown options for the poll interval.
 /// Anthropic's OAuth endpoint rate-limits aggressive polling, so we
 /// start at 1 min and don't expose anything shorter. 1 hour is the
@@ -262,18 +256,6 @@ impl ConfigDraft {
         self.ollama_cloud_setup_rx = None;
     }
 
-    pub fn save(&self) -> SaveOutcome {
-        let path = match config::config_path() {
-            Ok(p) => p,
-            Err(e) => return SaveOutcome::Error(format!("config path: {}", e)),
-        };
-        let cfg = self.to_config();
-        match cfg.save(&path) {
-            Ok(()) => SaveOutcome::Saved(path),
-            Err(e) => SaveOutcome::Error(e.to_string()),
-        }
-    }
-
     pub fn render(&mut self, ui: &mut egui::Ui) {
         self.poll_setup_result();
 
@@ -516,14 +498,10 @@ fn provider_card(ui: &mut egui::Ui, tint: Color32, body: impl FnOnce(&mut egui::
     ui.add_space(8.0);
 }
 
-fn section_header_row(ui: &mut egui::Ui, title: &str, id: Option<ProviderId>) {
-    ui.horizontal(|ui| {
-        if let Some(id) = id {
-            let t = tint(id);
-            ui.label(RichText::new("●").color(t).size(14.0));
-        }
-        ui.label(RichText::new(title).strong().size(14.0));
-    });
+fn section_header_row(ui: &mut egui::Ui, title: &str, _id: Option<ProviderId>) {
+    // No coloured dot before the title — the left-edge accent stripe
+    // on the card already identifies the provider by colour.
+    ui.label(RichText::new(title).strong().size(14.0));
     ui.add_space(2.0);
 }
 
@@ -544,17 +522,15 @@ fn enabled_row(
     });
 }
 
-/// A label + right-aligned input block. Keeps all forms in the tab
-/// visually aligned without forcing a full grid layout.
+/// Inline label + input. Label hugs the left edge with no fixed-width
+/// allocation, so the row reads as a single sentence rather than a
+/// two-column form.
 fn field_row(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
-        ui.add_sized(
-            [120.0, 20.0],
-            egui::Label::new(
-                RichText::new(label)
-                    .size(12.5)
-                    .color(Color32::from_gray(180)),
-            ),
+        ui.label(
+            RichText::new(label)
+                .size(12.5)
+                .color(Color32::from_gray(180)),
         );
         body(ui);
     });

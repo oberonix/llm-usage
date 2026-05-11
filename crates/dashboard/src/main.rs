@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::settings::{ConfigDraft, SaveOutcome};
+use crate::settings::ConfigDraft;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -196,8 +196,10 @@ struct DashboardApp {
     refresh_pending: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
     tab: Tab,
     draft: ConfigDraft,
-    /// Toast-style status message after a save attempt; clears after a few seconds.
-    save_status: Option<(Instant, SaveOutcome)>,
+    /// Serialized TOML of the last config we wrote to disk. Used to
+    /// detect form changes so we can auto-save without firing on every
+    /// frame.
+    last_saved_toml: Option<String>,
     /// Held for the app's lifetime so notify keeps delivering events.
     _snapshots_watcher: Option<RecommendedWatcher>,
     /// Watches `<mode>.focus` so the running singleton brings itself
@@ -221,6 +223,7 @@ impl DashboardApp {
         let daily_history = Arc::new(Mutex::new(Vec::new()));
         let refresh_pending = Arc::new(Mutex::new(None));
         let draft = ConfigDraft::from_config(&config);
+        let last_saved_toml = toml::to_string_pretty(&config).ok();
 
         // Initial load from the tray's shared file. If the tray hasn't
         // written one yet (fresh install), the map stays empty and the
@@ -250,7 +253,7 @@ impl DashboardApp {
             refresh_pending,
             tab: initial_tab,
             draft,
-            save_status: None,
+            last_saved_toml,
             _snapshots_watcher: watcher,
             _focus_watcher: focus_watcher,
             popup_mode,
@@ -313,9 +316,10 @@ impl eframe::App for DashboardApp {
 
         // Tab strip is now the top of the window — the app name is
         // already in the OS title bar, so a duplicate heading inside
-        // the window just steals vertical space. Save toast moves
-        // inline with the Save/Reset buttons further down.
+        // the window just steals vertical space. No separator line
+        // beneath it — the active-tab underline alone marks the divide.
         egui::TopBottomPanel::top("tab_strip")
+            .show_separator_line(false)
             .frame(
                 egui::Frame::none()
                     .fill(ctx.style().visuals.window_fill)
@@ -340,6 +344,7 @@ impl eframe::App for DashboardApp {
         // tab strip uncluttered. Only the Status tab needs it for now.
         if self.tab == Tab::Status {
             egui::TopBottomPanel::top("status_subheader")
+                .show_separator_line(false)
                 .frame(
                     egui::Frame::none()
                         .fill(ctx.style().visuals.window_fill)
@@ -557,52 +562,41 @@ impl DashboardApp {
     fn render_settings_body(&mut self, ui: &mut egui::Ui) {
         self.draft.render(ui);
         ui.add_space(16.0);
-        ui.separator();
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            let save_btn = egui::Button::new(
-                RichText::new("Save")
-                    .strong()
-                    .color(Color32::WHITE)
-                    .size(13.0),
-            )
-            .fill(Color32::from_rgb(0x4C, 0xAF, 0x50))
-            .min_size(egui::vec2(80.0, 26.0));
-            if ui.add(save_btn).clicked() {
-                let outcome = self.draft.save();
-                if let SaveOutcome::Saved(_) = &outcome {
-                    self.config = self.draft.to_config();
-                }
-                self.save_status = Some((Instant::now(), outcome));
-            }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Reset").size(13.0))
-                        .min_size(egui::vec2(80.0, 26.0)),
-                )
-                .clicked()
-            {
-                self.draft = ConfigDraft::from_config(&self.config);
-            }
-            ui.add_space(12.0);
-            ui.weak("Tray and dashboard auto-reload when config.toml changes.");
-            if let Some((at, outcome)) = &self.save_status {
-                if at.elapsed().as_secs() < 6 {
-                    let (text, color) = match outcome {
-                        SaveOutcome::Saved(path) => (
-                            format!("→ Saved to {}", path.display()),
-                            Color32::from_rgb(0x4C, 0xAF, 0x50),
-                        ),
-                        SaveOutcome::Error(e) => (
-                            format!("→ Save failed: {}", e),
-                            Color32::from_rgb(0xC6, 0x28, 0x28),
-                        ),
-                    };
-                    ui.add_space(8.0);
-                    ui.colored_label(color, text);
-                }
-            }
-        });
+        let reset = ui.add(
+            egui::Button::new(RichText::new("Reset to defaults").size(13.0))
+                .min_size(egui::vec2(140.0, 26.0)),
+        );
+        if reset.clicked() {
+            self.draft = ConfigDraft::from_config(&Config::default());
+        }
+        ui.add_space(24.0);
+
+        // Auto-save: any form change re-serialises the resulting Config
+        // and writes it to disk if the bytes differ from the last write.
+        // The tray's config watcher picks the new file up and reloads.
+        self.auto_save_if_changed();
+    }
+
+    /// Called every frame from the Settings tab. Cheap when nothing has
+    /// changed (one serialisation + string compare); writes to disk
+    /// only on actual edits.
+    fn auto_save_if_changed(&mut self) {
+        let new_cfg = self.draft.to_config();
+        let Ok(new_toml) = toml::to_string_pretty(&new_cfg) else {
+            return;
+        };
+        if Some(&new_toml) == self.last_saved_toml.as_ref() {
+            return;
+        }
+        let Ok(path) = llm_usage_core::config::config_path() else {
+            return;
+        };
+        if let Err(e) = new_cfg.save(&path) {
+            tracing::warn!(error = %e, "auto-save failed");
+            return;
+        }
+        self.last_saved_toml = Some(new_toml);
+        self.config = new_cfg;
     }
 }
 
