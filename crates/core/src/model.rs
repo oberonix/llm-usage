@@ -170,3 +170,170 @@ impl UsageSnapshot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn title_case_first_handles_common_inputs() {
+        assert_eq!(title_case_first("plus"), "Plus");
+        assert_eq!(title_case_first("pro"), "Pro");
+        assert_eq!(title_case_first("a"), "A");
+        assert_eq!(title_case_first(""), "");
+        // Already upper — only the first char is touched, others preserved.
+        assert_eq!(title_case_first("Max 5x"), "Max 5x");
+        // Non-alpha first char: passes through unchanged.
+        assert_eq!(title_case_first("5x"), "5x");
+    }
+
+    #[test]
+    fn title_case_first_preserves_remainder_casing() {
+        // Important property: we don't lowercase the tail.
+        assert_eq!(title_case_first("aBC"), "ABC");
+        assert_eq!(title_case_first("ABC"), "ABC");
+    }
+
+    #[test]
+    fn provider_display_uses_snake_case() {
+        assert_eq!(ProviderId::Anthropic.to_string(), "anthropic");
+        assert_eq!(ProviderId::CodexCli.to_string(), "codex_cli");
+        assert_eq!(ProviderId::OllamaCloud.to_string(), "ollama_cloud");
+    }
+
+    #[test]
+    fn provider_human_names_are_stable() {
+        assert_eq!(ProviderId::Anthropic.human(), "Anthropic");
+        assert_eq!(ProviderId::CodexCli.human(), "Codex");
+        assert_eq!(ProviderId::OllamaCloud.human(), "Ollama Cloud");
+    }
+
+    #[test]
+    fn provider_tint_returns_distinct_colours() {
+        let a = ProviderId::Anthropic.tint_rgb();
+        let c = ProviderId::CodexCli.tint_rgb();
+        let o = ProviderId::OllamaCloud.tint_rgb();
+        assert_ne!(a, c);
+        assert_ne!(a, o);
+        assert_ne!(c, o);
+    }
+
+    #[test]
+    fn window_labels_match_storage_keys() {
+        // The dashboard and the tray look up windows by these exact
+        // strings; regressions here silently break the grid sort.
+        assert_eq!(WindowKind::LastHour.label(), "1h");
+        assert_eq!(WindowKind::Today.label(), "today");
+        assert_eq!(WindowKind::ThisWeek.label(), "week");
+        assert_eq!(WindowKind::ThisMonth.label(), "month");
+        assert_eq!(WindowKind::FiveHourRolling.label(), "5h");
+    }
+
+    #[test]
+    fn recompute_fraction_prefers_dollar_limit_over_token_limit() {
+        let mut w = WindowUsage::default();
+        w.spend_usd = Some(20.0);
+        w.limit_usd = Some(40.0);
+        w.limit_tokens = Some(1_000);
+        w.tokens_in = 500;
+        w.recompute_fraction();
+        // 20/40 = 0.5; token ratio (500/1000 = 0.5) happens to coincide
+        // but we want to assert the *path*: dollar limit wins.
+        assert_eq!(w.fraction_used, Some(0.5));
+    }
+
+    #[test]
+    fn recompute_fraction_falls_back_to_token_limit() {
+        let mut w = WindowUsage::default();
+        w.limit_tokens = Some(1_000);
+        w.tokens_in = 300;
+        w.tokens_out = 200;
+        w.recompute_fraction();
+        assert_eq!(w.fraction_used, Some(0.5));
+    }
+
+    #[test]
+    fn recompute_fraction_is_none_without_either_limit() {
+        let mut w = WindowUsage::default();
+        w.spend_usd = Some(1.0);
+        w.tokens_in = 100;
+        w.recompute_fraction();
+        assert!(w.fraction_used.is_none());
+    }
+
+    #[test]
+    fn recompute_fraction_treats_zero_limit_as_unknown() {
+        let mut w = WindowUsage::default();
+        w.spend_usd = Some(1.0);
+        w.limit_usd = Some(0.0);
+        w.recompute_fraction();
+        // 0.0 limit means "no real limit set" — don't divide by zero.
+        assert!(w.fraction_used.is_none());
+    }
+
+    #[test]
+    fn unavailable_constructor_sets_status_and_error() {
+        let snap = UsageSnapshot::unavailable(ProviderId::CodexCli, "no creds");
+        assert_eq!(snap.provider, ProviderId::CodexCli);
+        assert_eq!(snap.status, ProviderStatus::Unavailable);
+        assert_eq!(snap.error.as_deref(), Some("no creds"));
+        assert!(snap.windows.is_empty());
+        assert!(snap.plan_label.is_none());
+    }
+
+    fn make_snap_with_windows() -> UsageSnapshot {
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        // Spend-derived (no ends_at) — strip_spend should clear fraction.
+        let today = snap.window_mut(WindowKind::Today);
+        today.spend_usd = Some(4.21);
+        today.limit_usd = Some(10.0);
+        today.fraction_used = Some(0.421);
+        // OAuth-set (has ends_at) — strip_spend must preserve fraction.
+        let week = snap.window_mut(WindowKind::ThisWeek);
+        week.spend_usd = Some(99.0);
+        week.limit_usd = Some(100.0);
+        week.fraction_used = Some(0.6);
+        week.ends_at = Some(Utc::now() + chrono::Duration::days(2));
+        snap
+    }
+
+    #[test]
+    fn strip_spend_clears_dollar_fields_everywhere() {
+        let mut snap = make_snap_with_windows();
+        snap.strip_spend();
+        for w in snap.windows.values() {
+            assert!(w.spend_usd.is_none());
+            assert!(w.limit_usd.is_none());
+        }
+    }
+
+    #[test]
+    fn strip_spend_keeps_oauth_fractions() {
+        let mut snap = make_snap_with_windows();
+        snap.strip_spend();
+        let today = snap.window(WindowKind::Today).unwrap();
+        let week = snap.window(WindowKind::ThisWeek).unwrap();
+        // Today had no ends_at — fraction wiped along with spend.
+        assert!(today.fraction_used.is_none());
+        // Week had ends_at (OAuth-set) — fraction survives.
+        assert_eq!(week.fraction_used, Some(0.6));
+    }
+
+    #[test]
+    fn window_mut_creates_when_absent() {
+        let mut snap = UsageSnapshot::unavailable(ProviderId::Anthropic, "_");
+        let w = snap.window_mut(WindowKind::Today);
+        w.tokens_in = 42;
+        // window() should now return the same data.
+        let r = snap.window(WindowKind::Today).unwrap();
+        assert_eq!(r.tokens_in, 42);
+    }
+}

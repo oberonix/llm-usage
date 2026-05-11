@@ -72,3 +72,70 @@ fn write_atomically(target: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("rename {} -> {}", tmp.display(), target.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowUsage};
+    use std::collections::BTreeMap;
+    use tempfile::TempDir;
+
+    fn sample_snapshots() -> BTreeMap<ProviderId, UsageSnapshot> {
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: chrono::Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: Some("ok".into()),
+            plan_label: Some("Max 5x".into()),
+        };
+        snap.windows.insert(
+            "5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.42),
+                ..Default::default()
+            },
+        );
+        let mut out = BTreeMap::new();
+        out.insert(ProviderId::Anthropic, snap);
+        out
+    }
+
+    #[test]
+    fn snapshots_file_new_records_now() {
+        let before = chrono::Utc::now();
+        let f = SnapshotsFile::new(sample_snapshots());
+        let after = chrono::Utc::now();
+        assert!(f.updated_at >= before && f.updated_at <= after);
+        assert_eq!(f.snapshots.len(), 1);
+    }
+
+    #[test]
+    fn write_atomically_replaces_target_via_rename() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.json");
+        std::fs::write(&path, b"old").unwrap();
+        write_atomically(&path, b"new").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        // No leftover .tmp file after a successful rename.
+        assert!(!path.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn snapshots_file_serialises_round_trip() {
+        // Direct in-memory serialise + deserialise so the test doesn't
+        // depend on the project dirs (which the public read_snapshots
+        // / write_snapshots resolve to).
+        let f = SnapshotsFile::new(sample_snapshots());
+        let json = serde_json::to_vec_pretty(&f).unwrap();
+        let parsed: SnapshotsFile = serde_json::from_slice(&json).unwrap();
+        assert_eq!(parsed.snapshots.len(), 1);
+        let anth = parsed.snapshots.get(&ProviderId::Anthropic).unwrap();
+        assert_eq!(anth.plan_label.as_deref(), Some("Max 5x"));
+        assert_eq!(
+            anth.windows.get("5h").and_then(|w| w.fraction_used),
+            Some(0.42)
+        );
+    }
+}

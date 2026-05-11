@@ -318,3 +318,152 @@ fn format_reset(secs: i64) -> String {
         format!("{}d", secs / 86_400)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_bar_zero_is_all_empty() {
+        assert_eq!(unicode_bar(0.0, 10), "▱▱▱▱▱▱▱▱▱▱");
+    }
+
+    #[test]
+    fn unicode_bar_full_is_all_filled() {
+        assert_eq!(unicode_bar(1.0, 10), "▰▰▰▰▰▰▰▰▰▰");
+    }
+
+    #[test]
+    fn unicode_bar_half() {
+        assert_eq!(unicode_bar(0.5, 10), "▰▰▰▰▰▱▱▱▱▱");
+    }
+
+    #[test]
+    fn unicode_bar_clamps_above_one() {
+        // Over-cap input should still produce a clean fully-filled bar.
+        assert_eq!(unicode_bar(1.5, 8), "▰▰▰▰▰▰▰▰");
+    }
+
+    #[test]
+    fn unicode_bar_clamps_below_zero() {
+        assert_eq!(unicode_bar(-0.2, 5), "▱▱▱▱▱");
+    }
+
+    #[test]
+    fn unicode_bar_rounds_to_nearest_cell() {
+        // 0.25 of 10 = 2.5 → rounds to 2 or 3 depending on Rust's
+        // round-half-away-from-zero policy (it rounds away → 3).
+        let s = unicode_bar(0.25, 10);
+        let filled = s.chars().filter(|c| *c == '▰').count();
+        assert!(filled == 2 || filled == 3, "got {} filled in {}", filled, s);
+    }
+
+    #[test]
+    fn color_for_thresholds() {
+        let g = color_for(0.1);
+        let a = color_for(0.7);
+        let r = color_for(0.95);
+        assert!(g.contains("32"));
+        assert!(a.contains("33"));
+        assert!(r.contains("31"));
+        assert_eq!(color_for(0.59), g);
+        assert_eq!(color_for(0.60), a);
+        assert_eq!(color_for(0.85), r);
+    }
+
+    #[test]
+    fn format_reset_picks_right_unit() {
+        assert_eq!(format_reset(30), "0m"); // sub-minute rounds down
+        assert_eq!(format_reset(90), "1m");
+        assert_eq!(format_reset(3600), "1h");
+        assert_eq!(format_reset(86_400), "1d");
+        assert_eq!(format_reset(2 * 86_400), "2d");
+    }
+
+    #[test]
+    fn window_order_matches_dashboard() {
+        let mut labels = vec!["month", "1h", "week", "5h", "today"];
+        labels.sort_by_key(|l| window_order(l));
+        assert_eq!(labels, vec!["5h", "week", "1h", "today", "month"]);
+    }
+
+    fn make_snapshot(provider: ProviderId) -> UsageSnapshot {
+        let mut snap = UsageSnapshot {
+            provider,
+            timestamp: chrono::Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: Some("Plus".into()),
+        };
+        snap.windows.insert(
+            "5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.40),
+                ends_at: Some(chrono::Utc::now() + chrono::Duration::hours(3)),
+                ..Default::default()
+            },
+        );
+        snap.windows.insert(
+            "week".into(),
+            WindowUsage {
+                fraction_used: Some(0.20),
+                ends_at: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+                ..Default::default()
+            },
+        );
+        snap
+    }
+
+    #[test]
+    fn build_screen_includes_header_bars_and_footer() {
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::CodexCli, make_snapshot(ProviderId::CodexCli));
+        let s = build_screen(&snaps, /*use_color*/ false, /*clear*/ false);
+        assert!(s.contains("Codex"), "expected provider name in: {}", s);
+        assert!(s.contains("Plus"), "expected plan tag in: {}", s);
+        assert!(s.contains("5h"), "expected window label in: {}", s);
+        assert!(s.contains("week"), "expected weekly label in: {}", s);
+        assert!(s.contains("last refreshed"), "expected footer in: {}", s);
+        // No trailing newline (cursor parks on the footer line).
+        assert!(!s.ends_with('\n'), "got trailing newline in: {:?}", s.chars().last());
+    }
+
+    #[test]
+    fn build_screen_empty_shows_waiting() {
+        let snaps: BTreeMap<ProviderId, UsageSnapshot> = BTreeMap::new();
+        let s = build_screen(&snaps, false, false);
+        assert!(s.contains("waiting for first snapshot"));
+    }
+
+    #[test]
+    fn build_screen_skips_providers_without_quota_windows() {
+        let mut snap = make_snapshot(ProviderId::Anthropic);
+        // Drop both quota windows; leave only a token-only one.
+        snap.windows.clear();
+        snap.windows.insert(
+            "today".into(),
+            WindowUsage {
+                tokens_in: 100,
+                ..Default::default()
+            },
+        );
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::Anthropic, snap);
+        let s = build_screen(&snaps, false, false);
+        // Skipped → waiting shown.
+        assert!(s.contains("waiting for first snapshot"), "got: {}", s);
+    }
+
+    #[test]
+    fn build_screen_with_color_includes_ansi_clear_when_requested() {
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::CodexCli, make_snapshot(ProviderId::CodexCli));
+        let with_clear = build_screen(&snaps, /*color*/ true, /*clear*/ true);
+        let without_clear = build_screen(&snaps, /*color*/ true, /*clear*/ false);
+        // Clear sequence at the top of one but not the other.
+        assert!(with_clear.starts_with("\x1b[2J\x1b[H"));
+        assert!(!without_clear.starts_with("\x1b[2J\x1b[H"));
+    }
+}

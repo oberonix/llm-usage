@@ -139,4 +139,51 @@ mod tests {
             .unwrap()
             .is_some());
     }
+
+    #[test]
+    fn alert_dedupe_keyed_on_all_four_columns() {
+        // Different threshold → independent dedupe entry.
+        let s = Store::open_in_memory().unwrap();
+        s.record_alert_fired("anthropic", "week", "2026-W19", 50).unwrap();
+        assert!(s.alert_already_fired("anthropic", "week", "2026-W19", 50).unwrap().is_some());
+        assert!(s.alert_already_fired("anthropic", "week", "2026-W19", 75).unwrap().is_none());
+        // Different provider → independent dedupe entry.
+        assert!(s.alert_already_fired("codex_cli", "week", "2026-W19", 50).unwrap().is_none());
+        // Different window id → independent dedupe entry.
+        assert!(s.alert_already_fired("anthropic", "week", "2026-W20", 50).unwrap().is_none());
+        // Different window kind → independent dedupe entry.
+        assert!(s.alert_already_fired("anthropic", "month", "2026-W19", 50).unwrap().is_none());
+    }
+
+    #[test]
+    fn alert_fired_returns_recent_timestamp() {
+        let s = Store::open_in_memory().unwrap();
+        let before = Utc::now();
+        s.record_alert_fired("anthropic", "today", "2026-05-10", 90).unwrap();
+        let at = s
+            .alert_already_fired("anthropic", "today", "2026-05-10", 90)
+            .unwrap()
+            .unwrap();
+        // Some clock skew is acceptable; just sanity-check we're in the right ballpark.
+        assert!(at >= before - chrono::Duration::seconds(2));
+        assert!(at <= Utc::now() + chrono::Duration::seconds(2));
+    }
+
+    #[test]
+    fn record_alert_fired_is_idempotent_on_same_key() {
+        // INSERT OR REPLACE behaviour: second call overwrites timestamp.
+        let s = Store::open_in_memory().unwrap();
+        s.record_alert_fired("anthropic", "week", "2026-W19", 75).unwrap();
+        // Should not error.
+        s.record_alert_fired("anthropic", "week", "2026-W19", 75).unwrap();
+    }
+
+    #[test]
+    fn provider_state_is_upsertable() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_provider_state("anthropic", "Ok", None).unwrap();
+        s.record_provider_state("anthropic", "Degraded", Some("rate limited")).unwrap();
+        // Should not blow up; cannot read back without an accessor but
+        // exercising the write path is what matters here.
+    }
 }

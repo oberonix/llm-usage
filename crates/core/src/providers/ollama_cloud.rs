@@ -368,6 +368,41 @@ mod tests {
     }
 
     #[test]
+    fn format_reset_picks_largest_unit_under_threshold() {
+        let now = DateTime::parse_from_rfc3339("2026-05-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 30 minutes ahead → minutes.
+        let r = now + chrono::Duration::minutes(30);
+        assert_eq!(format_reset(r, now), " R:30m");
+        // 2 hours ahead → hours.
+        let r = now + chrono::Duration::hours(2);
+        assert_eq!(format_reset(r, now), " R:2h");
+        // 3 days ahead → days.
+        let r = now + chrono::Duration::days(3);
+        assert_eq!(format_reset(r, now), " R:3d");
+    }
+
+    #[test]
+    fn format_reset_empty_when_in_the_past() {
+        let now = DateTime::parse_from_rfc3339("2026-05-10T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let r = now - chrono::Duration::minutes(1);
+        assert_eq!(format_reset(r, now), "");
+    }
+
+    #[test]
+    fn parse_settings_picks_up_plan_badge() {
+        // A truncated sample with just the plan; rows can be empty.
+        let html = r#"
+<html><body><h2><span>Cloud Usage</span><span class="capitalize">free</span></h2></body></html>"#;
+        let parsed = parse_settings(html);
+        assert_eq!(parsed.plan.as_deref(), Some("free"));
+        assert!(parsed.rows.is_empty());
+    }
+
+    #[test]
     fn integer_percent_parses() {
         // No decimal — must still match the regex.
         let html = r#"

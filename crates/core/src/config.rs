@@ -187,6 +187,105 @@ pub fn data_path() -> Result<PathBuf> {
     Ok(project_dirs()?.data_dir().join("usage.sqlite"))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn defaults_round_trip_via_toml() {
+        let cfg = Config::default();
+        let toml = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(parsed.poll_interval_secs, cfg.poll_interval_secs);
+        assert_eq!(parsed.icon_rotation_secs, cfg.icon_rotation_secs);
+        assert_eq!(parsed.show_pace_marker, cfg.show_pace_marker);
+        assert_eq!(parsed.check_for_updates, cfg.check_for_updates);
+        assert_eq!(parsed.anthropic.enabled, cfg.anthropic.enabled);
+        assert_eq!(parsed.anthropic.warn_at, cfg.anthropic.warn_at);
+        assert_eq!(parsed.codex_cli.warn_at, cfg.codex_cli.warn_at);
+        assert_eq!(parsed.ollama_cloud.warn_at, cfg.ollama_cloud.warn_at);
+    }
+
+    #[test]
+    fn save_then_load_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.icon_rotation_secs = 42;
+        cfg.show_pace_marker = false;
+        cfg.anthropic.show_spend = true;
+        cfg.codex_cli.warn_at = vec![0.5, 0.9];
+        cfg.save(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.icon_rotation_secs, 42);
+        assert!(!loaded.show_pace_marker);
+        assert!(loaded.anthropic.show_spend);
+        assert_eq!(loaded.codex_cli.warn_at, vec![0.5, 0.9]);
+    }
+
+    #[test]
+    fn load_from_missing_file_errors_helpfully() {
+        let err = Config::load_from(std::path::Path::new("/nope/missing.toml")).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("read"), "got: {}", msg);
+    }
+
+    #[test]
+    fn load_from_bad_toml_errors_with_parse_context() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("bad.toml");
+        std::fs::write(&p, "not = valid = toml").unwrap();
+        let err = Config::load_from(&p).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("parse"), "got: {}", msg);
+    }
+
+    #[test]
+    fn load_silently_ignores_unknown_sections() {
+        // Old config files may still have [openai] / [gemini_cli] /
+        // [ollama_local] sections after the archive. Serde must
+        // tolerate them.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("legacy.toml");
+        std::fs::write(
+            &p,
+            r#"
+            poll_interval_secs = 600
+            [anthropic]
+            enabled = true
+            [openai]
+            enabled = true
+            [gemini_cli]
+            enabled = true
+            [ollama_local]
+            base_url = "http://localhost:11434"
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::load_from(&p).unwrap();
+        assert_eq!(cfg.poll_interval_secs, 600);
+        assert!(cfg.anthropic.enabled);
+    }
+
+    #[test]
+    fn singleton_path_format() {
+        let p = singleton_pid_path("dashboard").unwrap();
+        assert!(p.to_string_lossy().ends_with("dashboard.pid"));
+        let f = singleton_focus_trigger_path("popup").unwrap();
+        assert!(f.to_string_lossy().ends_with("popup.focus"));
+    }
+
+    #[test]
+    fn snapshot_and_refresh_paths_co_locate() {
+        // The dashboard watches snapshots.json via a parent-directory
+        // notify watcher, so the refresh trigger must share a parent.
+        let snap = snapshots_path().unwrap();
+        let trig = refresh_trigger_path().unwrap();
+        assert_eq!(snap.parent(), trig.parent());
+    }
+}
+
 /// Shared snapshot file: the tray writes here after every poll, the
 /// dashboard reads from it. Co-located with the sqlite store under the
 /// OS data directory.

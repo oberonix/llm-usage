@@ -680,4 +680,66 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn format_thresholds_displays_off_for_empty() {
+        assert_eq!(format_thresholds(&[]), "off");
+    }
+
+    #[test]
+    fn empty_to_none_trims_whitespace() {
+        assert!(empty_to_none("   ").is_none());
+        assert!(empty_to_none("").is_none());
+        assert_eq!(empty_to_none("  foo  "), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn poll_options_are_ascending_seconds() {
+        let secs: Vec<u64> = POLL_OPTIONS.iter().map(|(s, _)| *s).collect();
+        let mut sorted = secs.clone();
+        sorted.sort();
+        assert_eq!(secs, sorted, "POLL_OPTIONS must be sorted by seconds");
+    }
+
+    #[test]
+    fn rotation_options_start_at_five_seconds() {
+        assert_eq!(ROTATION_OPTIONS.first().unwrap().0, 5);
+    }
+
+    #[test]
+    fn config_draft_round_trips_through_to_config() {
+        let mut cfg = Config::default();
+        cfg.icon_rotation_secs = 30;
+        cfg.show_pace_marker = false;
+        cfg.check_for_updates = false;
+        cfg.anthropic.show_spend = true;
+        cfg.anthropic.warn_at = vec![0.5, 0.9];
+        cfg.codex_cli.warn_at = vec![0.75, 0.9];
+        cfg.ollama_cloud.enabled = true;
+        cfg.ollama_cloud.session_cookie = Some("session=abc".into());
+        cfg.ollama_cloud.warn_at = vec![0.9];
+
+        let draft = ConfigDraft::from_config(&cfg);
+        let round = draft.to_config();
+        assert_eq!(round.icon_rotation_secs, 30);
+        assert!(!round.show_pace_marker);
+        assert!(!round.check_for_updates);
+        assert!(round.anthropic.show_spend);
+        assert_eq!(round.anthropic.warn_at, vec![0.5, 0.9]);
+        assert_eq!(round.codex_cli.warn_at, vec![0.75, 0.9]);
+        assert!(round.ollama_cloud.enabled);
+        assert_eq!(round.ollama_cloud.session_cookie.as_deref(), Some("session=abc"));
+        assert_eq!(round.ollama_cloud.warn_at, vec![0.9]);
+    }
+
+    #[test]
+    fn config_draft_to_config_clamps_minimums() {
+        let mut cfg = Config::default();
+        cfg.poll_interval_secs = 30; // below 60 floor
+        cfg.icon_rotation_secs = 1;  // below 5 floor
+        let draft = ConfigDraft::from_config(&cfg);
+        let round = draft.to_config();
+        assert_eq!(round.poll_interval_secs, 60);
+        assert_eq!(round.icon_rotation_secs, 5);
+    }
 }

@@ -212,3 +212,162 @@ impl OAuthBackoff {
         self.last_good_at = Some(now);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn creds(sub: Option<&str>, tier: Option<&str>) -> OAuthCredentials {
+        OAuthCredentials {
+            claude_ai_oauth: OAuthBody {
+                access_token: "tok".into(),
+                expires_at_ms: None,
+                subscription_type: sub.map(String::from),
+                rate_limit_tier: tier.map(String::from),
+            },
+        }
+    }
+
+    #[test]
+    fn plan_label_max_with_multiplier() {
+        let c = creds(Some("max"), Some("default_claude_max_5x"));
+        assert_eq!(c.plan_label().as_deref(), Some("Max 5x"));
+        let c = creds(Some("max"), Some("default_claude_max_20x"));
+        assert_eq!(c.plan_label().as_deref(), Some("Max 20x"));
+    }
+
+    #[test]
+    fn plan_label_falls_back_to_subscription_for_pro() {
+        let c = creds(Some("pro"), Some("default_claude_pro"));
+        assert_eq!(c.plan_label().as_deref(), Some("Pro"));
+    }
+
+    #[test]
+    fn plan_label_handles_team_via_subscription() {
+        // Hypothetical "team" tier — exercise the fall-through path.
+        let c = creds(Some("team"), Some("default_claude_team"));
+        assert_eq!(c.plan_label().as_deref(), Some("Team"));
+    }
+
+    #[test]
+    fn plan_label_none_when_no_data() {
+        let c = creds(None, None);
+        assert!(c.plan_label().is_none());
+    }
+
+    #[test]
+    fn plan_label_strips_default_claude_prefix_only_when_present() {
+        // Unknown tier without the prefix — falls through to subscription.
+        let c = creds(Some("max"), Some("weird-tier-no-prefix"));
+        assert_eq!(c.plan_label().as_deref(), Some("Max"));
+    }
+
+    #[test]
+    fn is_expired_relative_to_now() {
+        let past_ms = (Utc::now() - chrono::Duration::hours(1)).timestamp_millis();
+        let future_ms = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis();
+        let expired = OAuthCredentials {
+            claude_ai_oauth: OAuthBody {
+                access_token: "tok".into(),
+                expires_at_ms: Some(past_ms),
+                subscription_type: None,
+                rate_limit_tier: None,
+            },
+        };
+        let live = OAuthCredentials {
+            claude_ai_oauth: OAuthBody {
+                access_token: "tok".into(),
+                expires_at_ms: Some(future_ms),
+                subscription_type: None,
+                rate_limit_tier: None,
+            },
+        };
+        assert!(expired.is_expired());
+        assert!(!live.is_expired());
+    }
+
+    #[test]
+    fn is_expired_treats_missing_expiry_as_alive() {
+        let c = OAuthCredentials {
+            claude_ai_oauth: OAuthBody {
+                access_token: "tok".into(),
+                expires_at_ms: None,
+                subscription_type: None,
+                rate_limit_tier: None,
+            },
+        };
+        assert!(!c.is_expired());
+    }
+
+    #[test]
+    fn quota_bucket_parses_iso_resets_at() {
+        let b = QuotaBucket {
+            utilization: 12.0,
+            resets_at: Some("2026-05-10T03:00:00Z".to_string()),
+        };
+        let t = b.resets_at_utc().unwrap();
+        // Confirm the parse hit Z time and rebuild the same ISO string.
+        assert_eq!(t.to_rfc3339(), "2026-05-10T03:00:00+00:00");
+    }
+
+    #[test]
+    fn quota_bucket_returns_none_on_bad_iso() {
+        let b = QuotaBucket {
+            utilization: 0.0,
+            resets_at: Some("not a date".into()),
+        };
+        assert!(b.resets_at_utc().is_none());
+    }
+
+    #[test]
+    fn backoff_first_429_uses_initial_cooldown() {
+        let mut b = OAuthBackoff::default();
+        let now = Utc::now();
+        b.record_429(now);
+        assert_eq!(b.current_cooldown_secs, OAuthBackoff::INITIAL_COOLDOWN_SECS);
+        assert!(b.in_cooldown(now));
+        // Just past the cooldown deadline — no longer in cooldown.
+        let later = now + chrono::Duration::seconds(b.current_cooldown_secs + 1);
+        assert!(!b.in_cooldown(later));
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_cap_on_repeated_429s() {
+        let mut b = OAuthBackoff::default();
+        let now = Utc::now();
+        b.record_429(now);
+        let first = b.current_cooldown_secs;
+        b.record_429(now);
+        assert_eq!(b.current_cooldown_secs, (first * 2).min(OAuthBackoff::MAX_COOLDOWN_SECS));
+        // Force enough repeats to hit the cap.
+        for _ in 0..10 {
+            b.record_429(now);
+        }
+        assert_eq!(b.current_cooldown_secs, OAuthBackoff::MAX_COOLDOWN_SECS);
+    }
+
+    #[test]
+    fn backoff_record_success_resets_state() {
+        let mut b = OAuthBackoff::default();
+        let now = Utc::now();
+        b.record_429(now);
+        b.record_429(now);
+        assert!(b.current_cooldown_secs > 0);
+
+        let body = OAuthUsageResponse::default();
+        b.record_success(now, &body);
+        assert_eq!(b.current_cooldown_secs, 0);
+        assert_eq!(b.next_allowed_unix_secs, 0);
+        assert!(b.last_good.is_some());
+        assert!(!b.in_cooldown(now));
+    }
+
+    #[test]
+    fn backoff_cooldown_remaining_is_zero_after_expiry() {
+        let mut b = OAuthBackoff::default();
+        let now = Utc::now();
+        b.record_429(now);
+        let later = now + chrono::Duration::seconds(b.current_cooldown_secs + 60);
+        assert_eq!(b.cooldown_remaining(later), 0);
+    }
+}

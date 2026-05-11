@@ -981,6 +981,76 @@ fn kick_daily_history(
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_order_groups_quota_first_then_activity() {
+        let mut labels = vec![
+            "month",
+            "today",
+            "1h",
+            "week (Sonnet)",
+            "5h",
+            "week",
+            "week (Opus)",
+            "unknown",
+        ];
+        labels.sort_by_key(|l| window_order(l));
+        assert_eq!(
+            labels,
+            vec![
+                "5h",
+                "week",
+                "week (Sonnet)",
+                "week (Opus)",
+                "unknown",   // bucketed between quota & activity (50)
+                "1h",
+                "today",
+                "month",
+            ]
+        );
+    }
+
+    #[test]
+    fn fmt_tokens_scales_with_size() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_500), "1.5k");
+        assert_eq!(fmt_tokens(15_000), "15.0k");
+        assert_eq!(fmt_tokens(2_500_000), "2.5M");
+    }
+
+    #[test]
+    fn fraction_color_thresholds() {
+        // Green below 60% utilization, amber 60-85%, red above.
+        let g = fraction_color(0.10);
+        let a = fraction_color(0.70);
+        let r = fraction_color(0.95);
+        assert_ne!(g, a);
+        assert_ne!(a, r);
+        assert_ne!(g, r);
+        // Threshold edge cases.
+        assert_eq!(fraction_color(0.0), g);
+        assert_eq!(fraction_color(0.59), g);
+        assert_eq!(fraction_color(0.60), a);
+        assert_eq!(fraction_color(0.84), a);
+        assert_eq!(fraction_color(0.85), r);
+        assert_eq!(fraction_color(1.0), r);
+    }
+
+    #[test]
+    fn fmt_age_scales_with_seconds_elapsed() {
+        assert_eq!(fmt_age(chrono::Duration::seconds(15)), "15s ago");
+        assert_eq!(fmt_age(chrono::Duration::seconds(120)), "2m ago");
+        assert_eq!(fmt_age(chrono::Duration::seconds(3 * 3600)), "3h ago");
+        assert_eq!(fmt_age(chrono::Duration::seconds(2 * 86_400)), "2d ago");
+        // Negative durations (clock skew) clamp to 0.
+        assert_eq!(fmt_age(chrono::Duration::seconds(-30)), "0s ago");
+    }
+}
+
 fn fmt_age(age: chrono::Duration) -> String {
     let secs = age.num_seconds().max(0);
     if secs < 60 {

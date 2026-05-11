@@ -510,6 +510,132 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn push_segment_separates_with_middle_dot() {
+        let mut s = String::new();
+        push_segment(&mut s, "5h 12%");
+        push_segment(&mut s, "7d 30%");
+        assert_eq!(s, "5h 12% · 7d 30%");
+    }
+
+    #[test]
+    fn push_segment_no_leading_separator_on_empty_base() {
+        let mut s = String::new();
+        push_segment(&mut s, "only");
+        assert_eq!(s, "only");
+    }
+
+    #[test]
+    fn format_quota_shows_reset_in_appropriate_unit() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-10T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        // 30 minutes ahead → "Rm".
+        let b = QuotaBucket {
+            utilization: 12.0,
+            resets_at: Some("2026-05-10T10:30:00Z".into()),
+        };
+        let s = format_quota("5h", &b, now);
+        assert!(s.contains("12%"));
+        assert!(s.contains("R:30m"), "got {}", s);
+
+        // 5 hours ahead → "Rh".
+        let b = QuotaBucket {
+            utilization: 30.0,
+            resets_at: Some("2026-05-10T15:00:00Z".into()),
+        };
+        let s = format_quota("7d", &b, now);
+        assert!(s.contains("30%"));
+        assert!(s.contains("R:5h"), "got {}", s);
+
+        // 3 days ahead → "Rd".
+        let b = QuotaBucket {
+            utilization: 80.0,
+            resets_at: Some("2026-05-13T10:00:00Z".into()),
+        };
+        let s = format_quota("7d", &b, now);
+        assert!(s.contains("R:3d"), "got {}", s);
+    }
+
+    #[test]
+    fn format_quota_omits_reset_when_in_the_past() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-05-10T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let b = QuotaBucket {
+            utilization: 42.0,
+            resets_at: Some("2026-05-10T09:00:00Z".into()),
+        };
+        let s = format_quota("5h", &b, now);
+        assert!(s.contains("42%"));
+        assert!(!s.contains("R:"), "got {}", s);
+    }
+
+    #[test]
+    fn same_local_day_returns_true_for_identical_instants() {
+        // Local-day equality is timezone-dependent at the edges; we
+        // assert the identity case (same instant) which always holds
+        // and the day-apart case which always differs.
+        let a = chrono::DateTime::parse_from_rfc3339("2026-05-10T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(same_local_day(a, a));
+        let c = a + chrono::Duration::days(2);
+        assert!(!same_local_day(a, c));
+    }
+
+    #[test]
+    fn same_iso_week_groups_mid_week_timestamps() {
+        // Wednesday and Friday of the same ISO week.
+        let a = chrono::DateTime::parse_from_rfc3339("2026-05-13T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let b = chrono::DateTime::parse_from_rfc3339("2026-05-15T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(same_iso_week(a, b));
+    }
+
+    #[test]
+    fn same_month_is_year_and_month_strict() {
+        let a = chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let b = chrono::DateTime::parse_from_rfc3339("2026-05-31T23:59:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(same_month(a, b));
+        let c = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(!same_month(a, c));
+        // Different year, same month number → still different.
+        let d = chrono::DateTime::parse_from_rfc3339("2025-05-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(!same_month(a, d));
+    }
+
+    #[test]
+    fn window_agg_add_accumulates_components() {
+        let mut a = WindowAgg::default();
+        a.add(
+            AnthropicTokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_input_tokens: 25,
+                cache_creation_5m_input_tokens: 10,
+                cache_creation_1h_input_tokens: 5,
+            },
+            0.42,
+        );
+        assert_eq!(a.requests, 1);
+        assert!((a.cost - 0.42).abs() < 1e-9);
+        // tokens_in is the sum of input + every cache bucket.
+        assert_eq!(a.tokens_in, 100 + 25 + 10 + 5);
+        assert_eq!(a.tokens_out, 50);
+    }
+
+    #[test]
     fn parses_real_schema() {
         let dir = TempDir::new().unwrap();
         let proj = dir.path().join("project-a");

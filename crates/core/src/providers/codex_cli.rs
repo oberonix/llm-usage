@@ -529,6 +529,84 @@ mod tests {
     }
 
     #[test]
+    fn codex_cost_per_model_tier() {
+        // gpt-5 / codex use the same rate.
+        let c = codex_cost_usd("gpt-5-codex", 1_000_000, 0, 0);
+        let expected = 1.25;
+        assert!((c - expected).abs() < 1e-9, "got {}", c);
+        // gpt-4o uses the higher-cost row.
+        let c = codex_cost_usd("gpt-4o", 1_000_000, 0, 0);
+        let expected = 2.5;
+        assert!((c - expected).abs() < 1e-9, "got {}", c);
+        // Unknown model falls back.
+        let c = codex_cost_usd("mystery-model", 1_000_000, 0, 0);
+        assert!((c - 1.0).abs() < 1e-9, "got {}", c);
+    }
+
+    #[test]
+    fn codex_cost_charges_cached_tokens_separately() {
+        // input_tokens INCLUDES cached_input_tokens per OpenAI convention;
+        // we should bill (input - cached) at the regular rate and `cached`
+        // at the cached rate.
+        let c = codex_cost_usd("gpt-5", /* input */ 1_000_000, /* output */ 0, /* cached */ 500_000);
+        // billed_input = 500_000 → 500_000 * 1.25/1e6 = 0.625
+        // cached = 500_000 → 500_000 * 0.125/1e6 = 0.0625
+        // total = 0.6875
+        assert!((c - 0.6875).abs() < 1e-9, "got {}", c);
+    }
+
+    #[test]
+    fn codex_cost_output_is_pricier_than_input() {
+        // sanity: output rate > input rate for gpt-5.
+        let in_cost = codex_cost_usd("gpt-5", 1_000_000, 0, 0);
+        let out_cost = codex_cost_usd("gpt-5", 0, 1_000_000, 0);
+        assert!(out_cost > in_cost, "out {} should be > in {}", out_cost, in_cost);
+    }
+
+    #[test]
+    fn codex_cost_handles_saturating_subtraction() {
+        // cached > input is invalid but should not panic — the formula
+        // uses saturating_sub so billed_input goes to zero.
+        let c = codex_cost_usd("gpt-5", 100, 0, 1_000_000);
+        // billed_input = 0; cached charged: 1M * 0.125 / 1M = 0.125.
+        assert!((c - 0.125).abs() < 1e-9, "got {}", c);
+    }
+
+    #[test]
+    fn bucket_skips_zero_event() {
+        let mut b = Bucket::default();
+        let e = TokenEvent {
+            timestamp: Utc::now(),
+            model: "gpt-5".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+        };
+        b.add(&e);
+        assert_eq!(b.turns, 0);
+    }
+
+    #[test]
+    fn bucket_aggregates_multiple_events() {
+        let mut b = Bucket::default();
+        let now = Utc::now();
+        for _ in 0..3 {
+            b.add(&TokenEvent {
+                timestamp: now,
+                model: "gpt-5".into(),
+                input_tokens: 100,
+                output_tokens: 50,
+                cached_tokens: 10,
+            });
+        }
+        assert_eq!(b.turns, 3);
+        assert_eq!(b.input_tokens, 300);
+        assert_eq!(b.output_tokens, 150);
+        assert_eq!(b.cached_tokens, 30);
+        assert!(b.cost_usd > 0.0);
+    }
+
+    #[test]
     fn parses_real_rate_limits_schema() {
         let dir = TempDir::new().unwrap();
         let day = dir.path().join("sessions/2026/05/09");

@@ -363,3 +363,119 @@ fn put_pixel(buf: &mut [u8], x: usize, y: usize, c: (u8, u8, u8)) {
     buf[i + 2] = c.2;
     buf[i + 3] = 0xFF;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_usage_core::model::{ProviderStatus, UsageSnapshot, WindowUsage};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn provider_tint_matches_core_table() {
+        // The icon and the dashboard share `ProviderId::tint_rgb()` —
+        // this test catches the case where the tray helper drifts.
+        assert_eq!(provider_tint(ProviderId::Anthropic), ProviderId::Anthropic.tint_rgb());
+        assert_eq!(provider_tint(ProviderId::CodexCli), ProviderId::CodexCli.tint_rgb());
+        assert_eq!(provider_tint(ProviderId::OllamaCloud), ProviderId::OllamaCloud.tint_rgb());
+    }
+
+    #[test]
+    fn bar_color_changes_at_thresholds() {
+        assert_eq!(bar_color(0.10), (0x4C, 0xAF, 0x50));
+        assert_eq!(bar_color(0.70), (0xFF, 0xB3, 0x00));
+        assert_eq!(bar_color(0.95), (0xE5, 0x39, 0x35));
+    }
+
+    #[test]
+    fn provider_label_three_chars_per_provider() {
+        assert_eq!(provider_label(ProviderId::Anthropic), "ANT");
+        assert_eq!(provider_label(ProviderId::CodexCli), "COD");
+        assert_eq!(provider_label(ProviderId::OllamaCloud), "OLC");
+    }
+
+    fn snap_with_quota(short: Option<f64>, weekly: Option<f64>, with_reset: bool) -> UsageSnapshot {
+        let now = chrono::Utc::now();
+        let mut windows: BTreeMap<String, WindowUsage> = BTreeMap::new();
+        if let Some(f) = short {
+            windows.insert(
+                "5h".into(),
+                WindowUsage {
+                    fraction_used: Some(f),
+                    ends_at: with_reset.then(|| now + chrono::Duration::hours(3)),
+                    ..Default::default()
+                },
+            );
+        }
+        if let Some(f) = weekly {
+            windows.insert(
+                "week".into(),
+                WindowUsage {
+                    fraction_used: Some(f),
+                    ends_at: with_reset.then(|| now + chrono::Duration::days(2)),
+                    ..Default::default()
+                },
+            );
+        }
+        UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: now,
+            status: ProviderStatus::Ok,
+            error: None,
+            windows,
+            headline: None,
+            plan_label: None,
+        }
+    }
+
+    #[test]
+    fn pick_bars_extracts_fraction_and_pace_when_ends_at_present() {
+        let snap = snap_with_quota(Some(0.2), Some(0.5), true);
+        let (s, w) = pick_bars(&snap);
+        assert_eq!(s.fraction, Some(0.2));
+        assert_eq!(w.fraction, Some(0.5));
+        // Pace = elapsed / total. 3h left of 5h → elapsed 2h → 0.4.
+        let p = s.pace.unwrap();
+        assert!((p - 0.4).abs() < 0.05, "got {}", p);
+        let p = w.pace.unwrap();
+        // 2 days left of 7 → elapsed 5/7 ≈ 0.71.
+        assert!(p > 0.6 && p < 0.8, "got {}", p);
+    }
+
+    #[test]
+    fn pick_bars_no_pace_when_ends_at_missing() {
+        let snap = snap_with_quota(Some(0.2), Some(0.5), false);
+        let (s, w) = pick_bars(&snap);
+        assert_eq!(s.fraction, Some(0.2));
+        assert!(s.pace.is_none());
+        assert_eq!(w.fraction, Some(0.5));
+        assert!(w.pace.is_none());
+    }
+
+    #[test]
+    fn pick_bars_handles_absent_windows() {
+        let snap = snap_with_quota(None, None, false);
+        let (s, w) = pick_bars(&snap);
+        assert!(s.fraction.is_none());
+        assert!(s.pace.is_none());
+        assert!(w.fraction.is_none());
+        assert!(w.pace.is_none());
+    }
+
+    #[test]
+    fn has_quota_data_matches_fraction_presence() {
+        let snap = snap_with_quota(Some(0.2), None, false);
+        assert!(has_quota_data(&snap));
+        let snap = snap_with_quota(None, None, false);
+        assert!(!has_quota_data(&snap));
+    }
+
+    #[test]
+    fn render_produces_correct_size_rgba_buffer() {
+        // Smoke: rendering shouldn't panic and the size const should be
+        // honoured. (Icon::from_rgba would panic if the dims were off.)
+        let session = BarSlot { fraction: Some(0.5), pace: Some(0.3) };
+        let weekly = BarSlot { fraction: None, pace: None };
+        let _ = render(ProviderId::Anthropic, session, weekly);
+        let _ = render_placeholder();
+    }
+}

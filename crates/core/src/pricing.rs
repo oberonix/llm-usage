@@ -122,4 +122,67 @@ mod tests {
         // 1M cache read @ $3/Mtok * 0.1 = $0.30.
         assert!((u.cost_usd(r) - 0.30).abs() < 1e-6);
     }
+
+    #[test]
+    fn rate_lookup_matches_substring_case_insensitive() {
+        // "Opus" anywhere — match wins over base default.
+        let r = anthropic_default("Claude-OPUS-something");
+        assert_eq!(r.input_per_mtok, 15.0);
+        let r = anthropic_default("claude-haiku-4");
+        assert_eq!(r.input_per_mtok, 1.0);
+        let r = anthropic_default("claude-sonnet-4-6");
+        assert_eq!(r.input_per_mtok, 3.0);
+    }
+
+    #[test]
+    fn unknown_model_falls_back_to_anthropic_default() {
+        let r = anthropic_default("unknown-model");
+        let baseline = ModelRate::anthropic_default();
+        assert_eq!(r.input_per_mtok, baseline.input_per_mtok);
+        assert_eq!(r.output_per_mtok, baseline.output_per_mtok);
+    }
+
+    #[test]
+    fn output_dominates_at_naive_input_output_mix() {
+        // Output is 5x input on opus — confirm the math.
+        let r = anthropic_default("claude-opus");
+        let u = AnthropicTokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            ..Default::default()
+        };
+        // 1M * $15 + 1M * $75 = $90.
+        assert!((u.cost_usd(r) - 90.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cache_writes_apply_correct_multipliers() {
+        let r = anthropic_default("claude-sonnet-4-6"); // input $3
+        let u = AnthropicTokenUsage {
+            cache_creation_5m_input_tokens: 1_000_000, // * 1.25 → $3.75
+            cache_creation_1h_input_tokens: 1_000_000, // * 2.0  → $6.00
+            ..Default::default()
+        };
+        // 3.75 + 6.00 = 9.75
+        assert!((u.cost_usd(r) - 9.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn total_billed_tokens_sums_every_bucket() {
+        let u = AnthropicTokenUsage {
+            input_tokens: 100,
+            output_tokens: 200,
+            cache_read_input_tokens: 300,
+            cache_creation_5m_input_tokens: 400,
+            cache_creation_1h_input_tokens: 500,
+        };
+        assert_eq!(u.total_billed_tokens(), 1500);
+    }
+
+    #[test]
+    fn empty_usage_costs_zero() {
+        let r = anthropic_default("anything");
+        let u = AnthropicTokenUsage::default();
+        assert_eq!(u.cost_usd(r), 0.0);
+    }
 }

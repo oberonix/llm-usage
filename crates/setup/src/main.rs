@@ -149,3 +149,53 @@ fn save_session_cookie(header: &str) -> Result<std::path::PathBuf> {
     cfg.save(&path)?;
     Ok(path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cookie(domain: &str, name: &str, value: &str) -> cookie::Cookie<'static> {
+        let mut c = cookie::Cookie::new(name.to_string(), value.to_string());
+        c.set_domain(domain.to_string());
+        c
+    }
+
+    #[test]
+    fn format_cookies_filters_to_ollama_domain() {
+        let v = vec![
+            cookie("ollama.com", "session", "abc"),
+            cookie("google.com", "irrelevant", "xyz"),
+            cookie(".ollama.com", "csrf", "def"),
+        ];
+        let s = format_cookies(&v);
+        assert!(s.contains("session=abc"));
+        assert!(s.contains("csrf=def"));
+        assert!(!s.contains("irrelevant"));
+    }
+
+    #[test]
+    fn format_cookies_joins_with_semicolon_space() {
+        let v = vec![
+            cookie("ollama.com", "a", "1"),
+            cookie("ollama.com", "b", "2"),
+        ];
+        let s = format_cookies(&v);
+        assert_eq!(s, "a=1; b=2");
+    }
+
+    #[test]
+    fn format_cookies_handles_leading_dot_subdomain() {
+        // The browser stores cookies with `.ollama.com` to denote
+        // "all subdomains". Our filter must strip that leading dot
+        // before matching.
+        let v = vec![cookie(".ollama.com", "x", "y")];
+        let s = format_cookies(&v);
+        assert_eq!(s, "x=y");
+    }
+
+    #[test]
+    fn format_cookies_no_match_returns_empty_string() {
+        let v = vec![cookie("foo.bar", "n", "v")];
+        assert!(format_cookies(&v).is_empty());
+    }
+}

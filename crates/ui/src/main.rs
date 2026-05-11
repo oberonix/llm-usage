@@ -370,6 +370,67 @@ fn format_reset(secs: i64) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_usage_core::model::WindowUsage;
+
+    #[test]
+    fn unicode_bar_zero_full_and_partial() {
+        assert_eq!(unicode_bar(0.0, 10), "▱▱▱▱▱▱▱▱▱▱");
+        assert_eq!(unicode_bar(1.0, 10), "▰▰▰▰▰▰▰▰▰▰");
+        assert_eq!(unicode_bar(0.5, 10), "▰▰▰▰▰▱▱▱▱▱");
+    }
+
+    #[test]
+    fn format_reset_units() {
+        assert_eq!(format_reset(30 * 60), "30m");
+        assert_eq!(format_reset(2 * 3600), "2h");
+        assert_eq!(format_reset(3 * 86_400), "3d");
+    }
+
+    #[test]
+    fn menu_window_order_lifts_quota_above_activity() {
+        let mut labels = vec!["week (Sonnet)", "5h", "month", "week"];
+        labels.sort_by_key(|l| menu_window_order(l));
+        // Unknown labels (50) come AFTER quota but BEFORE activity (100+).
+        assert_eq!(labels, vec!["5h", "week", "week (Sonnet)", "month"]);
+    }
+
+    #[test]
+    fn format_quota_row_includes_bar_pct_label_and_reset() {
+        let mut w = WindowUsage::default();
+        w.fraction_used = Some(0.42);
+        w.ends_at = Some(chrono::Utc::now() + chrono::Duration::hours(3));
+        let s = format_quota_row("5h", &w);
+        assert!(s.contains("5h"), "got {}", s);
+        assert!(s.contains("42%"), "got {}", s);
+        // "· " separator before label, before reset → at least 2.
+        let dots = s.matches('·').count();
+        assert!(dots >= 2, "expected ≥2 separator dots, got: {}", s);
+    }
+
+    #[test]
+    fn format_quota_row_omits_reset_when_ends_at_passed() {
+        let mut w = WindowUsage::default();
+        w.fraction_used = Some(0.10);
+        w.ends_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let s = format_quota_row("5h", &w);
+        // No second "·" since reset suffix is empty.
+        assert_eq!(s.matches('·').count(), 1, "got: {}", s);
+    }
+
+    #[test]
+    fn format_quota_row_zero_percent_renders_cleanly() {
+        let mut w = WindowUsage::default();
+        w.fraction_used = Some(0.0);
+        let s = format_quota_row("5h", &w);
+        assert!(s.contains("0%"), "got {}", s);
+        // Bar fully empty.
+        assert!(s.starts_with("▱"), "got {}", s);
+    }
+}
+
 /// Watch the config file for writes and signal the runtime to reload.
 ///
 /// We watch the *parent directory* (non-recursive) rather than the file
