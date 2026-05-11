@@ -224,7 +224,7 @@ impl eframe::App for DashboardApp {
             .frame(
                 egui::Frame::none()
                     .fill(ctx.style().visuals.window_fill)
-                    .inner_margin(egui::Margin::symmetric(20.0, 10.0)),
+                    .inner_margin(egui::Margin::ZERO),
             )
             .show(ctx, |ui| match self.tab {
                 Tab::Status => self.render_status(ui),
@@ -273,88 +273,106 @@ impl DashboardApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                let snaps = self.snapshots.lock().unwrap().clone();
-                let provider_iter = [
-                    (ProviderId::Anthropic, self.config.anthropic.enabled),
-                    (ProviderId::CodexCli, self.config.codex_cli.enabled),
-                    (ProviderId::OllamaCloud, self.config.ollama_cloud.enabled),
-                ];
-                let mut shown = 0usize;
-                for (id, enabled) in provider_iter {
-                    // Task #7: only render providers the user has enabled
-                    // in config. Disabled providers vanish entirely.
-                    if !enabled {
-                        continue;
-                    }
-                    shown += 1;
-                    if let Some(snap) = snaps.get(&id) {
-                        render_provider_card(ui, snap);
-                        if id == ProviderId::Anthropic && self.config.anthropic.show_spend {
-                            let history = self.daily_history.lock().unwrap().clone();
-                            if !history.is_empty() {
-                                render_daily_history_card(ui, &history);
-                            }
-                        }
-                    } else {
-                        render_loading_card(ui, id);
-                    }
-                    ui.add_space(10.0);
-                }
-                if shown == 0 {
-                    ui.add_space(40.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new("No providers enabled.")
-                                .size(15.0)
-                                .color(egui::Color32::from_gray(180)),
-                        );
-                        ui.add_space(4.0);
-                        ui.weak(
-                            "Switch to the Settings tab to enable Anthropic, \
-                             Codex CLI, or Ollama Cloud.",
-                        );
+                // Horizontal padding lives inside the scroll area so the
+                // scroll bar sits at the panel edge, not 20 px in.
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(20.0, 0.0))
+                    .show(ui, |ui| {
+                        self.render_status_body(ui);
                     });
-                }
             });
+    }
+
+    fn render_status_body(&self, ui: &mut egui::Ui) {
+        let snaps = self.snapshots.lock().unwrap().clone();
+        let provider_iter = [
+            (ProviderId::Anthropic, self.config.anthropic.enabled),
+            (ProviderId::CodexCli, self.config.codex_cli.enabled),
+            (ProviderId::OllamaCloud, self.config.ollama_cloud.enabled),
+        ];
+        let mut shown = 0usize;
+        for (id, enabled) in provider_iter {
+            // Only render providers the user has enabled in config.
+            // Disabled providers vanish entirely.
+            if !enabled {
+                continue;
+            }
+            shown += 1;
+            if let Some(snap) = snaps.get(&id) {
+                render_provider_card(ui, snap);
+                if id == ProviderId::Anthropic && self.config.anthropic.show_spend {
+                    let history = self.daily_history.lock().unwrap().clone();
+                    if !history.is_empty() {
+                        render_daily_history_card(ui, &history);
+                    }
+                }
+            } else {
+                render_loading_card(ui, id);
+            }
+            ui.add_space(10.0);
+        }
+        if shown == 0 {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("No providers enabled.")
+                        .size(15.0)
+                        .color(egui::Color32::from_gray(180)),
+                );
+                ui.add_space(4.0);
+                ui.weak(
+                    "Switch to the Settings tab to enable Anthropic, \
+                     Codex CLI, or Ollama Cloud.",
+                );
+            });
+        }
     }
 
     fn render_settings(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                self.draft.render(ui);
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(10.0);
-                ui.horizontal(|ui| {
-                    let save_btn = egui::Button::new(
-                        RichText::new("Save")
-                            .strong()
-                            .color(Color32::WHITE)
-                            .size(13.0),
-                    )
-                    .fill(Color32::from_rgb(0x4C, 0xAF, 0x50))
-                    .min_size(egui::vec2(80.0, 26.0));
-                    if ui.add(save_btn).clicked() {
-                        let outcome = self.draft.save();
-                        if let SaveOutcome::Saved(_) = &outcome {
-                            self.config = self.draft.to_config();
-                        }
-                        self.save_status = Some((Instant::now(), outcome));
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new("Reset").size(13.0))
-                                .min_size(egui::vec2(80.0, 26.0)),
-                        )
-                        .clicked()
-                    {
-                        self.draft = ConfigDraft::from_config(&self.config);
-                    }
-                    ui.add_space(12.0);
-                    ui.weak("Tray and dashboard auto-reload when config.toml changes.");
-                });
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::symmetric(20.0, 0.0))
+                    .show(ui, |ui| {
+                        self.render_settings_body(ui);
+                    });
             });
+    }
+
+    fn render_settings_body(&mut self, ui: &mut egui::Ui) {
+        self.draft.render(ui);
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let save_btn = egui::Button::new(
+                RichText::new("Save")
+                    .strong()
+                    .color(Color32::WHITE)
+                    .size(13.0),
+            )
+            .fill(Color32::from_rgb(0x4C, 0xAF, 0x50))
+            .min_size(egui::vec2(80.0, 26.0));
+            if ui.add(save_btn).clicked() {
+                let outcome = self.draft.save();
+                if let SaveOutcome::Saved(_) = &outcome {
+                    self.config = self.draft.to_config();
+                }
+                self.save_status = Some((Instant::now(), outcome));
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Reset").size(13.0))
+                        .min_size(egui::vec2(80.0, 26.0)),
+                )
+                .clicked()
+            {
+                self.draft = ConfigDraft::from_config(&self.config);
+            }
+            ui.add_space(12.0);
+            ui.weak("Tray and dashboard auto-reload when config.toml changes.");
+        });
     }
 }
 
@@ -377,11 +395,35 @@ fn render_provider_card(ui: &mut egui::Ui, snap: &UsageSnapshot) {
         }
         if !snap.windows.is_empty() {
             ui.add_space(8.0);
-            for (label, w) in &snap.windows {
+            // Quota-bearing windows first (5h / week / week (Sonnet) /
+            // week (Opus) / session), then activity-only windows
+            // (1h / today / month) at the bottom. Sort key encodes both
+            // grouping and intra-group order.
+            let mut entries: Vec<(&String, &llm_usage_core::model::WindowUsage)> =
+                snap.windows.iter().collect();
+            entries.sort_by_key(|(label, _)| (window_order(label.as_str()), label.as_str()));
+            for (label, w) in entries {
                 window_row(ui, label, w);
             }
         }
     });
+}
+
+fn window_order(label: &str) -> u32 {
+    match label {
+        // Quota windows — short rolling first, then weekly.
+        "session" => 10,
+        "5h" => 11,
+        "week" => 20,
+        "week (Sonnet)" => 21,
+        "week (Opus)" => 22,
+        // Activity windows
+        "1h" => 100,
+        "today" => 101,
+        "month" => 102,
+        // Anything new / unknown lands between quota and activity.
+        _ => 50,
+    }
 }
 
 fn render_loading_card(ui: &mut egui::Ui, id: ProviderId) {
@@ -441,9 +483,11 @@ pub fn card_frame(ui: &mut egui::Ui, tint: Color32, body: impl FnOnce(&mut egui:
     });
 }
 
-fn header_row(ui: &mut egui::Ui, provider: ProviderId, status: ProviderStatus, tint: Color32) {
+fn header_row(ui: &mut egui::Ui, provider: ProviderId, status: ProviderStatus, _tint: Color32) {
+    // No dot: the left-edge accent stripe on the card already identifies
+    // the provider by colour; a second swatch in the header just added
+    // visual noise.
     ui.horizontal(|ui| {
-        ui.label(RichText::new("●").color(tint).size(14.0));
         ui.label(RichText::new(provider.human()).strong().size(15.5));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             status_chip(ui, status);

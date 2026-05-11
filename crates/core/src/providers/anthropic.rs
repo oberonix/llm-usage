@@ -342,13 +342,15 @@ fn apply_oauth_usage(
     }
     // Sonnet- and Opus-specific weekly buckets are surfaced as separate
     // labelled windows so the dashboard can show all of them, but we leave
-    // them out of the compact tray headline (it's already busy).
+    // them out of the compact tray headline (it's already busy). The
+    // display labels match the all-models "week" window so users can read
+    // them as siblings of it.
     if let Some(b) = &usage.seven_day_sonnet {
-        let w = snap.windows.entry("7d-sonnet".to_string()).or_default();
+        let w = snap.windows.entry("week (Sonnet)".to_string()).or_default();
         fill_quota_window(w, b, now);
     }
     if let Some(b) = &usage.seven_day_opus {
-        let w = snap.windows.entry("7d-opus".to_string()).or_default();
+        let w = snap.windows.entry("week (Opus)".to_string()).or_default();
         fill_quota_window(w, b, now);
     }
 }
