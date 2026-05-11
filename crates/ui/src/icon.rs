@@ -27,9 +27,20 @@ const DIVIDER_Y: usize = 15;
 const WEEKLY_Y: usize = 16;
 const WEEKLY_HEIGHT: usize = 6;
 
-/// Render the active provider's icon. `session` and `weekly` are
-/// 0..1 fractions; `None` draws an empty bar (dim grey, no fill).
-pub fn render(provider: ProviderId, session: Option<f64>, weekly: Option<f64>) -> Icon {
+/// Data for one bar: how much is used (`fraction`, 0..1) and where the
+/// user is in the time window (`pace`, 0..1). If `pace` is set, a 1 px
+/// red vertical line is drawn at that x-position across the bar so the
+/// user can see whether they're ahead of or behind a steady consumption
+/// rate.
+#[derive(Default, Copy, Clone)]
+pub struct BarSlot {
+    pub fraction: Option<f64>,
+    pub pace: Option<f64>,
+}
+
+/// Render the active provider's icon. Each `BarSlot` carries the
+/// fraction used and the elapsed fraction of the matching time window.
+pub fn render(provider: ProviderId, session: BarSlot, weekly: BarSlot) -> Icon {
     let mut buf = vec![0u8; SIZE_U * SIZE_U * 4];
     let tint = provider_tint(provider);
     // Top: full-bleed tint. Also used as the 1 px divider between bars.
@@ -37,14 +48,21 @@ pub fn render(provider: ProviderId, session: Option<f64>, weekly: Option<f64>) -
     fill_rect(&mut buf, 0, DIVIDER_Y, SIZE_U, 1, tint);
 
     draw_label(&mut buf, provider_label(provider), (0xFF, 0xFF, 0xFF));
-    draw_bar(&mut buf, 0, SESSION_Y, SIZE_U, SESSION_HEIGHT, session);
-    draw_bar(&mut buf, 0, WEEKLY_Y, SIZE_U, WEEKLY_HEIGHT, weekly);
+    draw_bar(&mut buf, 0, SESSION_Y, SIZE_U, SESSION_HEIGHT, session.fraction);
+    if let Some(p) = session.pace {
+        draw_pace_marker(&mut buf, 0, SESSION_Y, SIZE_U, SESSION_HEIGHT, p);
+    }
+    draw_bar(&mut buf, 0, WEEKLY_Y, SIZE_U, WEEKLY_HEIGHT, weekly.fraction);
+    if let Some(p) = weekly.pace {
+        draw_pace_marker(&mut buf, 0, WEEKLY_Y, SIZE_U, WEEKLY_HEIGHT, p);
+    }
 
     Icon::from_rgba(buf, SIZE, SIZE).expect("icon construction")
 }
 
 /// Used at startup before any snapshots arrive, and whenever no
-/// provider has quota fractions to display.
+/// provider has quota fractions to display. No pace marker — there's
+/// no window context yet.
 pub fn render_placeholder() -> Icon {
     let mut buf = vec![0u8; SIZE_U * SIZE_U * 4];
     let neutral = (0x4A, 0x4A, 0x4A);
@@ -63,6 +81,30 @@ fn draw_bar(buf: &mut [u8], x: usize, y: usize, w: usize, h: usize, frac: Option
         if fill_w > 0 {
             fill_rect(buf, x, y, fill_w, h, bar_color(clamped));
         }
+    }
+}
+
+/// Vertical 1 px red line across a bar at the given pace (0..1). Drawn
+/// on top of the fill so it's always visible.
+fn draw_pace_marker(buf: &mut [u8], x: usize, y: usize, w: usize, h: usize, pace: f64) {
+    if w == 0 {
+        return;
+    }
+    let pace = pace.clamp(0.0, 1.0);
+    // Clamp the marker x to within the bar so an at-end window
+    // still shows a visible 1 px line rather than spilling off.
+    let pos = ((pace * (w - 1) as f64).round() as usize).min(w - 1);
+    let red = (0xFF, 0x20, 0x20);
+    for yy in y..(y + h).min(SIZE_U) {
+        let xx = x + pos;
+        if xx >= SIZE_U {
+            break;
+        }
+        let i = (yy * SIZE_U + xx) * 4;
+        buf[i] = red.0;
+        buf[i + 1] = red.1;
+        buf[i + 2] = red.2;
+        buf[i + 3] = 0xFF;
     }
 }
 
@@ -92,14 +134,40 @@ fn provider_tint(id: ProviderId) -> (u8, u8, u8) {
     id.tint_rgb()
 }
 
-/// Pick the (short-window, weekly) fractions out of a snapshot.
-/// All providers now label their short window "5h" (Ollama Cloud's
-/// "session" is normalised to it at the source), so a single key
-/// lookup suffices.
-pub fn pick_fractions(snap: &UsageSnapshot) -> (Option<f64>, Option<f64>) {
-    let session = snap.windows.get("5h").and_then(|w| w.fraction_used);
-    let weekly = snap.windows.get("week").and_then(|w| w.fraction_used);
+/// Pick the (short-window, weekly) bar data out of a snapshot.
+/// Includes both the utilization fraction and the pace through the
+/// time window (so the icon can draw the red pace marker).
+pub fn pick_bars(snap: &UsageSnapshot) -> (BarSlot, BarSlot) {
+    let now = chrono::Utc::now();
+    let session = bar_slot_for(snap.windows.get("5h"), "5h", now);
+    let weekly = bar_slot_for(snap.windows.get("week"), "week", now);
     (session, weekly)
+}
+
+fn bar_slot_for(
+    w: Option<&llm_usage_core::model::WindowUsage>,
+    label: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BarSlot {
+    let mut out = BarSlot::default();
+    let Some(w) = w else {
+        return out;
+    };
+    out.fraction = w.fraction_used;
+    // Pace = (window_duration − time_until_reset) / window_duration.
+    // We hardcode the duration per label so we don't need the
+    // provider to surface a "window length" field.
+    let window_secs: i64 = match label {
+        "5h" => 5 * 3600,
+        "week" => 7 * 86_400,
+        _ => return out,
+    };
+    if let Some(ends) = w.ends_at {
+        let remaining = (ends - now).num_seconds().max(0).min(window_secs);
+        let elapsed = window_secs - remaining;
+        out.pace = Some(elapsed as f64 / window_secs as f64);
+    }
+    out
 }
 
 /// True if this snapshot has at least one window with a known quota

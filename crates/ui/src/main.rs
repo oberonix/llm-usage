@@ -482,7 +482,7 @@ fn refresh_icon(
     let Some(snap) = snapshots.get(&id) else {
         return;
     };
-    let (session, weekly) = icon::pick_fractions(snap);
+    let (session, weekly) = icon::pick_bars(snap);
     let _ = tray.set_icon(Some(icon::render(id, session, weekly)));
     let headline = snap.headline.as_deref().unwrap_or("");
     let tooltip = if headline.is_empty() {
