@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tokio::sync::Notify;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::runtime::{render_label, RuntimeHandle, RuntimeMessage};
 
@@ -61,6 +61,9 @@ fn main() -> Result<()> {
         .with_menu(Box::new(build_menu(&BTreeMap::new())))
         .with_tooltip("llm-usage — waiting for first poll")
         .with_icon(icon::render_placeholder())
+        // Left-click spawns the popup window instead of opening the
+        // native menu. Right-click still shows the menu.
+        .with_menu_on_left_click(false)
         .build()?;
 
     let refresh = Arc::new(Notify::new());
@@ -167,8 +170,17 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Ok(_tray_event) = tray_channel.try_recv() {
-            // Click events come through here; no-op for now.
+        if let Ok(tray_event) = tray_channel.try_recv() {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = tray_event
+            {
+                // Spawn (or focus, if already running) the popup
+                // window with the graphical quota view.
+                spawn_dashboard(&["--popup"]);
+            }
         }
     });
 }

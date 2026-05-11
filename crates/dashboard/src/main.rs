@@ -34,11 +34,36 @@ fn main() -> Result<()> {
 
     let config = Config::load_or_default()?;
     let initial_tab = parse_initial_tab();
+    let popup_mode = std::env::args().skip(1).any(|a| a == "--popup");
+
+    // Singleton: a second instance of the same window kind forwards a
+    // focus request to the running one and exits. PID files / focus
+    // triggers live next to snapshots.json.
+    let mode_name = if popup_mode { "popup" } else { "dashboard" };
+    let pid_path = match try_acquire_singleton(mode_name) {
+        SingletonOutcome::Forwarded => return Ok(()),
+        SingletonOutcome::Acquired(p) => p,
+    };
+    let _pid_guard = PidGuard {
+        path: pid_path.clone(),
+    };
+
+    let viewport = if popup_mode {
+        egui::ViewportBuilder::default()
+            .with_inner_size([400.0, 500.0])
+            .with_title("LLM Usage")
+            .with_decorations(false)
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_taskbar(false)
+    } else {
+        egui::ViewportBuilder::default()
+            .with_inner_size([800.0, 620.0])
+            .with_title("LLM Usage")
+    };
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 620.0])
-            .with_title("LLM Usage"),
+        viewport,
         ..Default::default()
     };
 
@@ -53,11 +78,74 @@ fn main() -> Result<()> {
                 config,
                 cc.egui_ctx.clone(),
                 initial_tab,
+                popup_mode,
+                mode_name,
             )))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe: {}", e))?;
     Ok(())
+}
+
+enum SingletonOutcome {
+    /// We claimed the slot; caller owns the returned PID path.
+    Acquired(std::path::PathBuf),
+    /// A live instance already exists; the focus trigger was written
+    /// and the caller should exit.
+    Forwarded,
+}
+
+/// If a PID file for `name` exists and the recorded process is alive,
+/// touch the focus-trigger so the running instance brings itself to
+/// the front, and return `Forwarded`. Otherwise claim the slot.
+fn try_acquire_singleton(name: &str) -> SingletonOutcome {
+    let pid_path = match llm_usage_core::config::singleton_pid_path(name) {
+        Ok(p) => p,
+        Err(_) => return SingletonOutcome::Acquired(std::path::PathBuf::new()),
+    };
+    let focus_path = llm_usage_core::config::singleton_focus_trigger_path(name)
+        .unwrap_or_default();
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    if let Ok(s) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pid) = s.trim().parse::<u32>() {
+            if is_process_alive(pid) {
+                let _ = std::fs::write(&focus_path, chrono::Utc::now().to_rfc3339());
+                return SingletonOutcome::Forwarded;
+            }
+        }
+    }
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+    SingletonOutcome::Acquired(pid_path)
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    // `kill -0 <pid>` returns 0 if the process exists and we have
+    // permission to signal it. No actual signal is sent.
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Removes the PID file on drop so the next instance can claim the
+/// slot cleanly. Panics inside eframe still trigger Drop via
+/// stack-unwinding, so this is best-effort but reliable in practice.
+struct PidGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for PidGuard {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Look for `--tab=status` / `--tab=settings` so the tray can launch
@@ -90,10 +178,22 @@ struct DashboardApp {
     save_status: Option<(Instant, SaveOutcome)>,
     /// Held for the app's lifetime so notify keeps delivering events.
     _snapshots_watcher: Option<RecommendedWatcher>,
+    /// Watches `<mode>.focus` so the running singleton brings itself
+    /// to the foreground when a second invocation pings it.
+    _focus_watcher: Option<RecommendedWatcher>,
+    /// `true` when launched with `--popup`. Renders a compact,
+    /// decorationless variant of the Status tab.
+    popup_mode: bool,
 }
 
 impl DashboardApp {
-    fn new(config: Config, ctx: egui::Context, initial_tab: Tab) -> Self {
+    fn new(
+        config: Config,
+        ctx: egui::Context,
+        initial_tab: Tab,
+        popup_mode: bool,
+        mode_name: &str,
+    ) -> Self {
         let snapshots = Arc::new(Mutex::new(BTreeMap::new()));
         let last_updated = Arc::new(Mutex::new(None));
         let daily_history = Arc::new(Mutex::new(Vec::new()));
@@ -111,8 +211,10 @@ impl DashboardApp {
             snapshots.clone(),
             last_updated.clone(),
             refresh_pending.clone(),
-            ctx,
+            ctx.clone(),
         );
+
+        let focus_watcher = spawn_focus_watcher(mode_name, ctx);
 
         if config.anthropic.enabled && config.anthropic.show_spend {
             kick_daily_history(&config.anthropic, daily_history.clone());
@@ -128,13 +230,64 @@ impl DashboardApp {
             draft,
             save_status: None,
             _snapshots_watcher: watcher,
+            _focus_watcher: focus_watcher,
+            popup_mode,
         }
     }
+}
+
+/// Watches the focus-trigger file for our singleton slot. When a
+/// second invocation writes to it, we send a Focus viewport command
+/// so the existing window comes to the foreground.
+fn spawn_focus_watcher(mode_name: &str, ctx: egui::Context) -> Option<RecommendedWatcher> {
+    let trigger_path = llm_usage_core::config::singleton_focus_trigger_path(mode_name).ok()?;
+    let parent = trigger_path.parent()?.to_path_buf();
+    std::fs::create_dir_all(&parent).ok();
+
+    let last_fire = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60)));
+    let target = trigger_path.clone();
+    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let event = match res {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+            return;
+        }
+        if !event.paths.iter().any(|p| p == &target) {
+            return;
+        }
+        let now = Instant::now();
+        let mut guard = last_fire.lock().expect("poisoned");
+        if now.duration_since(*guard) < Duration::from_millis(150) {
+            return;
+        }
+        *guard = now;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }) {
+        Ok(w) => w,
+        Err(_) => return None,
+    };
+    if watcher.watch(&parent, RecursiveMode::NonRecursive).is_err() {
+        return None;
+    }
+    Some(watcher)
 }
 
 impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_secs(2));
+
+        if self.popup_mode {
+            // Esc dismisses the popup; otherwise it lingers because we
+            // disabled window decorations.
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            self.render_popup(ctx);
+            return;
+        }
 
         // Title bar — app name on its own line so it doesn't compete
         // with the tabs.
@@ -234,6 +387,69 @@ impl eframe::App for DashboardApp {
 }
 
 impl DashboardApp {
+    /// Compact "tray popup" layout: thin draggable header with title +
+    /// close button, then the same Status cards as the full dashboard.
+    /// No tab strip, no settings, no Refresh button (the tray polls).
+    fn render_popup(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("popup_header")
+            .frame(
+                egui::Frame::none()
+                    .fill(ctx.style().visuals.window_fill)
+                    .inner_margin(egui::Margin::symmetric(12.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let title = ui.label(
+                        RichText::new("LLM Usage").strong().size(14.0),
+                    );
+                    // Dragging the title bar moves the window — egui's
+                    // standard pattern when running without decorations.
+                    if title.interact(egui::Sense::drag()).dragged() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let close = ui.add(
+                                egui::Button::new(
+                                    RichText::new("✕")
+                                        .size(13.0)
+                                        .color(Color32::from_gray(180)),
+                                )
+                                .frame(false),
+                            );
+                            if close.clicked() {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        },
+                    );
+                });
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(ctx.style().visuals.window_fill)
+                    .inner_margin(egui::Margin::ZERO),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        egui::Frame::none()
+                            .inner_margin(egui::Margin {
+                                left: 12.0,
+                                right: 12.0,
+                                top: 6.0,
+                                bottom: 6.0,
+                            })
+                            .show(ui, |ui| {
+                                self.render_status_body(ui);
+                            });
+                    });
+            });
+    }
+
     /// One tab button. Uses a larger font and paints a 3 px coloured
     /// underline beneath the active label so the active tab is obvious
     /// without needing the OS theme to draw a selection state.
