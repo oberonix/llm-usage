@@ -3091,6 +3091,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "scraper",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

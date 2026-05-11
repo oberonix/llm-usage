@@ -5,7 +5,10 @@ Lightweight menu-bar widget showing your LLM account usage across
 companion view.
 
 - **Tray-only**: no Dock icon on macOS, no taskbar entry on Linux.
-- **Self-contained**: no network listeners, no telemetry, no auto-update.
+- **Self-contained**: no network listeners, no telemetry, no auto-update,
+  no background phone-home — the only outbound call that isn't to one
+  of your data providers is an optional once-a-day check against
+  GitHub Releases (toggle in Settings, off keeps it silent).
 - **Configurable**: thresholds, budgets, polling cadence — all in one
   TOML file, edited via a dashboard.
 

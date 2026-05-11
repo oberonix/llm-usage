@@ -18,6 +18,11 @@ pub struct Config {
     /// elapsed-fraction of the corresponding window. Off keeps the
     /// icon as just the fill bars.
     pub show_pace_marker: bool,
+    /// Check GitHub for new releases once a day and surface a tray
+    /// menu line when one's available. Off skips the network call
+    /// entirely. The only outbound traffic that isn't to a data
+    /// provider — see SECURITY.md.
+    pub check_for_updates: bool,
     pub anthropic: AnthropicConfig,
     pub codex_cli: CodexCliConfig,
     pub ollama_cloud: OllamaCloudConfig,
@@ -34,6 +39,7 @@ impl Default for Config {
             poll_interval_secs: 900,
             icon_rotation_secs: 15,
             show_pace_marker: true,
+            check_for_updates: true,
             anthropic: AnthropicConfig::default(),
             codex_cli: CodexCliConfig::default(),
             ollama_cloud: OllamaCloudConfig::default(),

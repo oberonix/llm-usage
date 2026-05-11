@@ -15,6 +15,12 @@ icon_rotation_secs = 15
 # the corresponding time window. Off keeps the icon as just the fill bars.
 show_pace_marker = true
 
+# Once a day, the tray asks GitHub whether a newer release has been
+# tagged and surfaces a menu item / one-time notification if so. The
+# only outbound HTTP call that isn't to a data provider. Off skips it
+# entirely.
+check_for_updates = true
+
 [anthropic]
 enabled = true
 # When false (default), only quota usage is shown. Flip to true to display

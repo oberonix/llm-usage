@@ -13,8 +13,11 @@ is on the `0.x` line — there are no LTS branches.
   `~/.config/llm-usage` and `~/.local/share/llm-usage` directories
   (or the macOS equivalents).
 - Network traffic to anywhere other than `api.anthropic.com`,
-  `ollama.com`, or `localhost` (Ollama local). The app explicitly
-  ships with no telemetry, no auto-update, and no listening sockets.
+  `ollama.com`, `api.github.com` (only the
+  `/repos/.../releases/latest` endpoint, only when the user hasn't
+  disabled update notifications in Settings), or `localhost` (Ollama
+  local). The app explicitly ships with no telemetry, no auto-update,
+  and no listening sockets.
 - A snapshot file that turns out to contain credentials.
 
 What is *not* a security issue:

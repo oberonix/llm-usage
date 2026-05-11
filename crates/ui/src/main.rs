@@ -9,6 +9,7 @@ mod runtime;
 
 use anyhow::Result;
 use llm_usage_core::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowUsage};
+use llm_usage_core::updates::UpdateInfo;
 use llm_usage_core::Config;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::BTreeMap;
@@ -38,6 +39,7 @@ fn rotation_interval_from(cfg: &Config) -> Duration {
 const DASHBOARD_ID: &str = "dashboard";
 const SETTINGS_ID: &str = "settings";
 const REFRESH_ID: &str = "refresh";
+const UPDATE_ID: &str = "update";
 const QUIT_ID: &str = "quit";
 
 fn main() -> Result<()> {
@@ -58,7 +60,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoopBuilder::new().build();
 
     let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(build_menu(&BTreeMap::new())))
+        .with_menu(Box::new(build_menu(&BTreeMap::new(), None)))
         .with_tooltip("llm-usage — waiting for first poll")
         .with_icon(icon::render_placeholder())
         // Left-click spawns the popup window instead of opening the
@@ -106,6 +108,7 @@ fn main() -> Result<()> {
     let mut last_rotation = Instant::now();
     let mut rotation_interval = rotation_interval_from(&config);
     let mut show_pace_marker = config.show_pace_marker;
+    let mut latest_update: Option<UpdateInfo> = None;
 
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(
@@ -127,7 +130,7 @@ fn main() -> Result<()> {
             match msg {
                 RuntimeMessage::Snapshots(snaps) => {
                     current_snapshots = snaps;
-                    let new_menu = build_menu(&current_snapshots);
+                    let new_menu = build_menu(&current_snapshots, latest_update.as_ref());
                     tray.set_menu(Some(Box::new(new_menu)));
                     refresh_icon(&tray, &current_snapshots, &mut active_idx, show_pace_marker);
                 }
@@ -161,6 +164,26 @@ fn main() -> Result<()> {
                         .timeout(notify_rust::Timeout::Milliseconds(6000))
                         .show();
                 }
+                RuntimeMessage::UpdateAvailable(info) => {
+                    let first_time = latest_update.as_ref() != Some(&info);
+                    let body = format!("v{} is available — click the tray menu", info.version);
+                    latest_update = Some(info);
+                    // Rebuild the menu so the new banner appears
+                    // immediately, not just on the next Snapshots tick.
+                    let new_menu =
+                        build_menu(&current_snapshots, latest_update.as_ref());
+                    tray.set_menu(Some(Box::new(new_menu)));
+                    // One-time native notification when the version
+                    // first changes, so users notice without having to
+                    // open the menu themselves.
+                    if first_time {
+                        let _ = notify_rust::Notification::new()
+                            .summary("llm-usage update available")
+                            .body(&body)
+                            .timeout(notify_rust::Timeout::Milliseconds(6000))
+                            .show();
+                    }
+                }
             }
         }
 
@@ -170,6 +193,11 @@ fn main() -> Result<()> {
                 REFRESH_ID => refresh.notify_one(),
                 DASHBOARD_ID => spawn_dashboard(&[]),
                 SETTINGS_ID => spawn_dashboard(&["--tab=settings"]),
+                UPDATE_ID => {
+                    if let Some(info) = &latest_update {
+                        open_url(&info.url);
+                    }
+                }
                 _ => {}
             }
         }
@@ -195,8 +223,24 @@ fn main() -> Result<()> {
 /// window with a Unicode block bar: `▰▰▰▱▱▱▱▱ 35% week (resets 2d)`.
 /// No separator between providers — the bare header row visually
 /// delineates them and keeps the lines tighter together.
-fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
+fn build_menu(
+    snapshots: &BTreeMap<ProviderId, UsageSnapshot>,
+    update: Option<&UpdateInfo>,
+) -> Menu {
     let menu = Menu::new();
+
+    // Update banner at the top so the user sees it before anything
+    // else when they open the menu. Clickable; opens the release page.
+    if let Some(info) = update {
+        let _ = menu.append(&MenuItem::with_id(
+            MenuId::new(UPDATE_ID),
+            format!("Update available: v{} →", info.version),
+            true,
+            None,
+        ));
+        let _ = menu.append(&PredefinedMenuItem::separator());
+    }
+
     let mut printed_a_provider = false;
 
     for id in PROVIDER_ORDER {
@@ -438,6 +482,20 @@ fn spawn_refresh_trigger_watcher(refresh: Arc<Notify>) -> Option<RecommendedWatc
     }
     tracing::info!(path = %trigger_path.display(), "refresh trigger watcher live");
     Some(watcher)
+}
+
+/// Open a URL in the user's default browser. `xdg-open` on Linux,
+/// `open` on macOS, `start` (via cmd) on Windows. Best-effort — we
+/// don't surface errors, the user can always copy the URL from the
+/// notification body.
+fn open_url(url: &str) {
+    #[cfg(target_os = "linux")]
+    let cmd = "xdg-open";
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "start";
+    let _ = std::process::Command::new(cmd).arg(url).spawn();
 }
 
 fn spawn_dashboard(args: &[&str]) {

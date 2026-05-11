@@ -12,6 +12,7 @@ use llm_usage_core::providers::{AnthropicProvider, CodexCliProvider, OllamaCloud
 use llm_usage_core::provider::Provider;
 use llm_usage_core::quota::QuotaEngine;
 use llm_usage_core::storage::Store;
+use llm_usage_core::updates::{self, UpdateInfo};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,7 @@ pub enum RuntimeMessage {
     Alert(String),
     ConfigReloaded,
     ConfigReloadFailed(String),
+    UpdateAvailable(UpdateInfo),
 }
 
 pub struct RuntimeHandle {
@@ -34,6 +36,7 @@ struct LoopState {
     engine: QuotaEngine,
     interval: Duration,
     alerts_disabled: bool,
+    check_for_updates: bool,
 }
 
 fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
@@ -59,8 +62,14 @@ fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
         engine,
         interval: Duration::from_secs(config.poll_interval_secs.max(60)),
         alerts_disabled: config.alerts.disabled,
+        check_for_updates: config.check_for_updates,
     }
 }
+
+/// How often we ask GitHub for the latest release. 24 hours keeps us
+/// far inside the unauthenticated rate limit (60 requests/hour/IP)
+/// and matches user expectations for an "occasional banner" UX.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 pub async fn run(
     initial_config: Config,
@@ -85,6 +94,11 @@ pub async fn run(
     let reload = handle.reload.clone();
     let mut state = build_state(&initial_config, store.clone());
     let mut snapshots: BTreeMap<ProviderId, UsageSnapshot> = BTreeMap::new();
+    // Set the next-check anchor in the past so the first iteration
+    // through the loop fires the check immediately (subject to the
+    // user's `check_for_updates` flag).
+    let mut next_update_check =
+        std::time::Instant::now() - Duration::from_secs(1);
 
     loop {
         for provider in &state.providers {
@@ -118,6 +132,24 @@ pub async fn run(
             tracing::warn!(error = %e, "failed to write shared snapshots file");
         }
         let _ = tx.send(RuntimeMessage::Snapshots(snapshots.clone()));
+
+        // Update check fires at most once per UPDATE_CHECK_INTERVAL and
+        // only when the user has the toggle on. Network / parse
+        // failures are logged at debug level and ignored.
+        if state.check_for_updates && std::time::Instant::now() >= next_update_check {
+            next_update_check = std::time::Instant::now() + UPDATE_CHECK_INTERVAL;
+            match updates::check(env!("CARGO_PKG_VERSION")).await {
+                Ok(Some(info)) => {
+                    let _ = tx.send(RuntimeMessage::UpdateAvailable(info));
+                }
+                Ok(None) => {
+                    tracing::debug!("update check: already on the latest release");
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "update check failed");
+                }
+            }
+        }
 
         tokio::select! {
             _ = tokio::time::sleep(state.interval) => {}

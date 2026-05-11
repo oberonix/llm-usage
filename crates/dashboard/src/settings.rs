@@ -48,6 +48,7 @@ pub struct ConfigDraft {
     pub poll_interval_secs: u64,
     pub icon_rotation_secs: u64,
     pub show_pace_marker: bool,
+    pub check_for_updates: bool,
 
     pub anthropic_enabled: bool,
     pub anthropic_show_spend: bool,
@@ -80,6 +81,7 @@ impl ConfigDraft {
             poll_interval_secs: c.poll_interval_secs,
             icon_rotation_secs: c.icon_rotation_secs,
             show_pace_marker: c.show_pace_marker,
+            check_for_updates: c.check_for_updates,
 
             anthropic_enabled: c.anthropic.enabled,
             anthropic_show_spend: c.anthropic.show_spend,
@@ -112,6 +114,7 @@ impl ConfigDraft {
         c.poll_interval_secs = self.poll_interval_secs.max(60);
         c.icon_rotation_secs = self.icon_rotation_secs.max(5);
         c.show_pace_marker = self.show_pace_marker;
+        c.check_for_updates = self.check_for_updates;
 
         c.anthropic = AnthropicConfig {
             enabled: self.anthropic_enabled,
@@ -293,6 +296,13 @@ impl ConfigDraft {
                 ui,
                 "1 px red line marking elapsed time in each window. Off keeps the icon \
                  as just the fill bars.",
+            );
+            ui.add_space(4.0);
+            ui.checkbox(&mut self.check_for_updates, "Check for new releases on GitHub");
+            help(
+                ui,
+                "Once a day the tray asks GitHub whether a newer version has been released \
+                 and surfaces a menu item if so. Off skips the check entirely.",
             );
         });
 

@@ -7,6 +7,7 @@ pub mod providers;
 pub mod quota;
 pub mod snapshots_io;
 pub mod storage;
+pub mod updates;
 
 pub use config::Config;
 pub use model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind, WindowUsage};

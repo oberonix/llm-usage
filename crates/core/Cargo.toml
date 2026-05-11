@@ -23,6 +23,7 @@ walkdir.workspace = true
 once_cell.workspace = true
 scraper.workspace = true
 regex.workspace = true
+semver.workspace = true
 async-trait = "0.1"
 
 [dev-dependencies]
