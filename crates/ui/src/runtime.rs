@@ -141,20 +141,3 @@ pub async fn run(
     }
 }
 
-pub fn render_label(snap: &UsageSnapshot) -> String {
-    use llm_usage_core::model::ProviderStatus::*;
-    let dot = match snap.status {
-        Ok => "●",
-        Degraded => "◐",
-        Unavailable => "○",
-    };
-    let main = snap
-        .headline
-        .clone()
-        .unwrap_or_else(|| match snap.status {
-            Ok => "no data".to_string(),
-            Degraded => snap.error.clone().unwrap_or_else(|| "degraded".into()),
-            Unavailable => snap.error.clone().unwrap_or_else(|| "unavailable".into()),
-        });
-    format!("{} {} — {}", dot, snap.provider.human(), main)
-}

@@ -814,7 +814,7 @@ fn header_row(
     // the plan portion. The left-edge accent stripe on the card already
     // identifies the provider by colour.
     let title = match plan_label {
-        Some(plan) => format!("{} · {}", provider.human(), title_case(plan)),
+        Some(plan) => format!("{} · {}", provider.human(), plan),
         None => provider.human().to_string(),
     };
     ui.horizontal(|ui| {
@@ -823,14 +823,6 @@ fn header_row(
             status_chip(ui, status);
         });
     });
-}
-
-fn title_case(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
-    }
 }
 
 fn status_chip(ui: &mut egui::Ui, status: ProviderStatus) {

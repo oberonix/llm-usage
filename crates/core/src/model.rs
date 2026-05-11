@@ -3,6 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
+/// Upper-case the first character of `s`, leave the rest untouched.
+/// Used to turn plan tags like "plus" / "pro" into "Plus" / "Pro" for
+/// display, shared by every provider that exposes a plan label.
+pub fn title_case_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {

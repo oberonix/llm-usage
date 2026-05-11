@@ -96,15 +96,7 @@ impl OAuthCredentials {
         }
         body.subscription_type
             .as_deref()
-            .map(title_case_first_char)
-    }
-}
-
-fn title_case_first_char(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) => c.to_uppercase().chain(chars).collect(),
-        None => String::new(),
+            .map(crate::model::title_case_first)
     }
 }
 

@@ -8,7 +8,7 @@ mod icon;
 mod runtime;
 
 use anyhow::Result;
-use llm_usage_core::model::{ProviderId, ProviderStatus, UsageSnapshot};
+use llm_usage_core::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowUsage};
 use llm_usage_core::Config;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::BTreeMap;
@@ -19,7 +19,7 @@ use tokio::sync::Notify;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-use crate::runtime::{render_label, RuntimeHandle, RuntimeMessage};
+use crate::runtime::{RuntimeHandle, RuntimeMessage};
 
 /// Order providers iterate in when the icon rotates. Matches the menu order.
 const PROVIDER_ORDER: [ProviderId; 3] = [
@@ -185,13 +185,17 @@ fn main() -> Result<()> {
     });
 }
 
-/// Rebuild the tray menu from the current snapshots. Providers with
-/// `status == Unavailable` are omitted entirely (the user asked for
-/// empty providers to be hidden by default). Static items keep stable
-/// MenuIds so menu events stay matchable across rebuilds.
+/// Rebuild the tray menu from the current snapshots. Each provider
+/// contributes one informational (disabled) row per quota-bearing
+/// window: `▰▰▰▱▱▱▱▱ 35% │ Anthropic · Max 5x — week (resets 2d)`.
+/// The first row of a provider carries the name + plan tag; subsequent
+/// rows just show the window label indented. Providers without any
+/// quota fractions are skipped — those have nothing to draw, and the
+/// "Open dashboard…" action below still exposes their activity counts.
 fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
     let menu = Menu::new();
-    let mut visible_count = 0usize;
+    let mut printed_a_provider = false;
+
     for id in PROVIDER_ORDER {
         let Some(snap) = snapshots.get(&id) else {
             continue;
@@ -199,14 +203,33 @@ fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
         if matches!(snap.status, ProviderStatus::Unavailable) {
             continue;
         }
-        let item = MenuItem::new(render_label(snap), false, None);
-        let _ = menu.append(&item);
-        visible_count += 1;
+        let mut quota_windows: Vec<(&String, &WindowUsage)> = snap
+            .windows
+            .iter()
+            .filter(|(_, w)| w.fraction_used.is_some())
+            .collect();
+        if quota_windows.is_empty() {
+            continue;
+        }
+        quota_windows.sort_by_key(|(label, _)| menu_window_order(label.as_str()));
+
+        if printed_a_provider {
+            let _ = menu.append(&PredefinedMenuItem::separator());
+        }
+        printed_a_provider = true;
+
+        for (i, (label, w)) in quota_windows.iter().enumerate() {
+            let text = format_quota_row(snap, label, w, i == 0);
+            let item = MenuItem::new(text, false, None);
+            let _ = menu.append(&item);
+        }
     }
-    if visible_count == 0 {
-        let placeholder = MenuItem::new("No provider data yet…", false, None);
+
+    if !printed_a_provider {
+        let placeholder = MenuItem::new("No quota data yet…", false, None);
         let _ = menu.append(&placeholder);
     }
+
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&MenuItem::with_id(
         MenuId::new(DASHBOARD_ID),
@@ -233,6 +256,82 @@ fn build_menu(snapshots: &BTreeMap<ProviderId, UsageSnapshot>) -> Menu {
         None,
     ));
     menu
+}
+
+/// Mirror of the dashboard's window_order so the menu rows and the
+/// dashboard cards present windows in the same order.
+fn menu_window_order(label: &str) -> u32 {
+    match label {
+        "5h" => 10,
+        "week" => 20,
+        "week (Sonnet)" => 21,
+        "week (Opus)" => 22,
+        _ => 50,
+    }
+}
+
+fn format_quota_row(
+    snap: &UsageSnapshot,
+    label: &str,
+    w: &WindowUsage,
+    is_first: bool,
+) -> String {
+    let frac = w.fraction_used.unwrap_or(0.0);
+    let bar = unicode_bar(frac, 8);
+    let pct = format!("{:>3.0}%", frac * 100.0);
+    let reset = w
+        .ends_at
+        .and_then(|t| {
+            let secs = (t - chrono::Utc::now()).num_seconds();
+            if secs > 0 {
+                Some(format_reset(secs))
+            } else {
+                None
+            }
+        })
+        .map(|s| format!(" ({})", s))
+        .unwrap_or_default();
+
+    if is_first {
+        let plan = snap
+            .plan_label
+            .as_deref()
+            .map(|p| format!(" · {}", p))
+            .unwrap_or_default();
+        format!(
+            "{} {} │ {}{} — {}{}",
+            bar,
+            pct,
+            snap.provider.human(),
+            plan,
+            label,
+            reset
+        )
+    } else {
+        format!("{} {} │   {}{}", bar, pct, label, reset)
+    }
+}
+
+fn unicode_bar(fraction: f64, cells: usize) -> String {
+    let filled = ((fraction.clamp(0.0, 1.0) * cells as f64).round() as usize).min(cells);
+    let mut s = String::with_capacity(cells * 3);
+    for _ in 0..filled {
+        s.push('▰');
+    }
+    for _ in filled..cells {
+        s.push('▱');
+    }
+    s
+}
+
+fn format_reset(secs: i64) -> String {
+    if secs < 3600 {
+        format!("resets {}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("resets {}h", secs / 3600)
+    } else {
+        format!("resets {}d", secs / 86_400)
+    }
 }
 
 /// Watch the config file for writes and signal the runtime to reload.

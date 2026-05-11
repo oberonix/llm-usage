@@ -214,7 +214,9 @@ impl Provider for CodexCliProvider {
             }
         }
 
-        snap.plan_label = plan_label.clone();
+        snap.plan_label = plan_label
+            .as_deref()
+            .map(crate::model::title_case_first);
         snap.headline = Some(build_headline(
             plan_label.as_deref(),
             snap.window(WindowKind::FiveHourRolling),

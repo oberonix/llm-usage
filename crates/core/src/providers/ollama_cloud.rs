@@ -141,7 +141,10 @@ impl Provider for OllamaCloudProvider {
             error: None,
             windows: Default::default(),
             headline: None,
-            plan_label: parsed.plan.clone(),
+            plan_label: parsed
+                .plan
+                .as_deref()
+                .map(crate::model::title_case_first),
         };
 
         for row in &parsed.rows {
