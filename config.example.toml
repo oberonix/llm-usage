@@ -1,0 +1,75 @@
+# Copy to:
+#   Linux:   ~/.config/llm-usage/config.toml
+#   macOS:   ~/Library/Application Support/dev.buffbit.llm-usage/config.toml
+
+# How often to refresh every provider. 15 minutes by default.
+# Anthropic's /api/oauth/usage rate-limits aggressive polling; bumping this
+# below ~5 minutes risks 429s and the tray will back off automatically.
+poll_interval_secs = 900
+
+[anthropic]
+enabled = true
+# When false (default), only quota usage is shown. Flip to true to display
+# dollar spend, the weekly $ budget bar, and the 14-day spend chart.
+show_spend = false
+# Defaults to ~/.claude/projects
+# claude_projects_dir = "/path/to/.claude/projects"
+weekly_budget_usd = 50.0
+# daily_budget_usd  = 10.0
+warn_at = [0.5, 0.75, 0.9]
+
+# Override per-model pricing if Anthropic's prices change. Key matches a
+# substring of the model id.
+# [anthropic.model_rates."opus"]
+# input_per_mtok = 15.0
+# output_per_mtok = 75.0
+# cache_write_5m_mult = 1.25
+# cache_write_1h_mult = 2.0
+# cache_read_mult = 0.10
+
+[openai]
+enabled = false
+# OpenAI exposes only spend data, no separate quota — leaving show_spend
+# at false will hide the provider entirely.
+show_spend = false
+# api_key = "sk-..."
+# Or set the OPENAI_API_KEY environment variable.
+# organization = "org-..."
+monthly_budget_usd = 30.0
+warn_at = [0.75, 0.9]
+
+[codex_cli]
+enabled = true
+# When false (default) only turn counts and tokens are shown; flip to true
+# to also display the reverse-engineered $ estimate.
+show_spend = false
+# Defaults to ~/.codex
+# codex_dir = "/path/to/.codex"
+five_hour_warn = 0.8
+weekly_warn = 0.85
+
+[gemini_cli]
+enabled = true
+# When false (default) only turn counts and tokens are shown.
+show_spend = false
+# Defaults to ~/.gemini
+# gemini_dir = "/path/to/.gemini"
+# monthly_budget_usd = 20.0
+warn_at = [0.75, 0.9]
+
+[ollama_local]
+enabled = true
+base_url = "http://localhost:11434"
+
+[ollama_cloud]
+enabled = false
+# Session cookie copied out of your browser's devtools (Network → any
+# request to ollama.com → Request Headers → Cookie). Paste the entire
+# cookie string. Re-paste when you log out / rotate.
+# session_cookie = "session=…; csrf=…"
+# api_key = "..."  # currently unused; kept for if/when Ollama ships a usage API
+base_url = "https://ollama.com"
+
+[alerts]
+debounce_secs = 3600
+disabled = false

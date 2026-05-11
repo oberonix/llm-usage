@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=LLM Usage
+Comment=Menu bar widget for LLM account usage and spend
+Exec=llm-usage
+Icon=llm-usage
+Terminal=false
+Categories=Utility;Development;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true

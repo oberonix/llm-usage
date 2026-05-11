@@ -1,0 +1,605 @@
+//! Dashboard window — invoked on demand from the tray's "Open dashboard…" menu.
+//! Tabs: Status (live snapshots + history) and Settings (config form).
+//!
+//! Runs as a separate binary so the always-resident tray doesn't carry the
+//! egui/eframe dependency footprint.
+
+mod history;
+mod settings;
+
+use anyhow::Result;
+use eframe::egui::{self, Color32, RichText};
+use llm_usage_core::config::Config;
+use llm_usage_core::model::{ProviderId, ProviderStatus, UsageSnapshot};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crate::settings::{ConfigDraft, SaveOutcome};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Status,
+    Settings,
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let config = Config::load_or_default()?;
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([760.0, 580.0])
+            .with_title("LLM Usage"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "llm-usage-dashboard",
+        options,
+        Box::new(move |cc| {
+            // The egui Context is owned by eframe — we hold a clone in
+            // the watcher so it can `request_repaint` from a background
+            // thread when the snapshot file changes.
+            Ok(Box::new(DashboardApp::new(config, cc.egui_ctx.clone())))
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe: {}", e))?;
+    Ok(())
+}
+
+struct DashboardApp {
+    config: Config,
+    snapshots: Arc<Mutex<BTreeMap<ProviderId, UsageSnapshot>>>,
+    last_updated: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    daily_history: Arc<Mutex<Vec<(chrono::NaiveDate, f64)>>>,
+    /// Marker set when we've asked the tray to poll; cleared once the
+    /// shared snapshot file's `updated_at` moves past the moment we
+    /// touched the trigger. Drives the "polling…" spinner.
+    refresh_pending: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    tab: Tab,
+    draft: ConfigDraft,
+    /// Toast-style status message after a save attempt; clears after a few seconds.
+    save_status: Option<(Instant, SaveOutcome)>,
+    /// Held for the app's lifetime so notify keeps delivering events.
+    _snapshots_watcher: Option<RecommendedWatcher>,
+}
+
+impl DashboardApp {
+    fn new(config: Config, ctx: egui::Context) -> Self {
+        let snapshots = Arc::new(Mutex::new(BTreeMap::new()));
+        let last_updated = Arc::new(Mutex::new(None));
+        let daily_history = Arc::new(Mutex::new(Vec::new()));
+        let refresh_pending = Arc::new(Mutex::new(None));
+        let draft = ConfigDraft::from_config(&config);
+
+        // Initial load from the tray's shared file. If the tray hasn't
+        // written one yet (fresh install), the map stays empty and the
+        // UI shows "loading…" placeholders until the first poll lands.
+        reload_snapshots(&snapshots, &last_updated, &refresh_pending);
+
+        // Watch the file for changes so background polls show up
+        // without the user having to click anything.
+        let watcher = spawn_snapshots_watcher(
+            snapshots.clone(),
+            last_updated.clone(),
+            refresh_pending.clone(),
+            ctx,
+        );
+
+        if config.anthropic.enabled && config.anthropic.show_spend {
+            kick_daily_history(&config.anthropic, daily_history.clone());
+        }
+
+        Self {
+            config,
+            snapshots,
+            last_updated,
+            daily_history,
+            refresh_pending,
+            tab: Tab::Status,
+            draft,
+            save_status: None,
+            _snapshots_watcher: watcher,
+        }
+    }
+}
+
+impl eframe::App for DashboardApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("LLM Usage");
+                ui.add_space(20.0);
+                ui.selectable_value(&mut self.tab, Tab::Status, "Status");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+                ui.add_space(20.0);
+                if self.tab == Tab::Status {
+                    if ui.button("Refresh").clicked() {
+                        self.request_refresh();
+                    }
+                    if self.refresh_pending.lock().unwrap().is_some() {
+                        ui.spinner();
+                        ui.label("polling…");
+                    } else if let Some(at) = *self.last_updated.lock().unwrap() {
+                        let age = chrono::Utc::now() - at;
+                        let label = fmt_age(age);
+                        ui.weak(format!("updated {}", label));
+                    }
+                }
+                if let Some((at, outcome)) = &self.save_status {
+                    if at.elapsed().as_secs() < 6 {
+                        let (text, color) = match outcome {
+                            SaveOutcome::Saved(path) => (
+                                format!("Saved → {}", path.display()),
+                                Color32::from_rgb(0x4C, 0xAF, 0x50),
+                            ),
+                            SaveOutcome::Error(e) => {
+                                (format!("Save failed: {}", e), Color32::from_rgb(0xC6, 0x28, 0x28))
+                            }
+                        };
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.colored_label(color, text);
+                            },
+                        );
+                    }
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            match self.tab {
+                Tab::Status => self.render_status(ui),
+                Tab::Settings => self.render_settings(ui),
+            }
+        });
+    }
+}
+
+impl DashboardApp {
+    fn render_status(&self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                let snaps = self.snapshots.lock().unwrap().clone();
+                for id in [
+                    ProviderId::Anthropic,
+                    ProviderId::OllamaCloud,
+                    ProviderId::OpenAi,
+                    ProviderId::CodexCli,
+                    ProviderId::GeminiCli,
+                    ProviderId::OllamaLocal,
+                ] {
+                    if let Some(snap) = snaps.get(&id) {
+                        render_provider_card(ui, snap);
+                        if id == ProviderId::Anthropic && self.config.anthropic.show_spend {
+                            let history = self.daily_history.lock().unwrap().clone();
+                            if !history.is_empty() {
+                                render_daily_history_card(ui, &history);
+                            }
+                        }
+                    } else {
+                        render_loading_card(ui, id);
+                    }
+                    ui.add_space(10.0);
+                }
+            });
+    }
+
+    fn render_settings(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                self.draft.render(ui);
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let save_btn = egui::Button::new(
+                        RichText::new("Save")
+                            .strong()
+                            .color(Color32::WHITE)
+                            .size(13.0),
+                    )
+                    .fill(Color32::from_rgb(0x4C, 0xAF, 0x50))
+                    .min_size(egui::vec2(80.0, 26.0));
+                    if ui.add(save_btn).clicked() {
+                        let outcome = self.draft.save();
+                        if let SaveOutcome::Saved(_) = &outcome {
+                            self.config = self.draft.to_config();
+                        }
+                        self.save_status = Some((Instant::now(), outcome));
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new("Reset").size(13.0))
+                                .min_size(egui::vec2(80.0, 26.0)),
+                        )
+                        .clicked()
+                    {
+                        self.draft = ConfigDraft::from_config(&self.config);
+                    }
+                    ui.add_space(12.0);
+                    ui.weak("Tray and dashboard auto-reload when config.toml changes.");
+                });
+            });
+    }
+}
+
+fn render_provider_card(ui: &mut egui::Ui, snap: &UsageSnapshot) {
+    let tint_rgb = snap.provider.tint_rgb();
+    let tint = Color32::from_rgb(tint_rgb.0, tint_rgb.1, tint_rgb.2);
+    card_frame(ui, tint, |ui| {
+        header_row(ui, snap.provider, snap.status, tint);
+        if let Some(h) = &snap.headline {
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(h)
+                    .color(Color32::from_gray(180))
+                    .size(13.0),
+            );
+        }
+        if let Some(err) = &snap.error {
+            ui.add_space(2.0);
+            ui.colored_label(Color32::from_rgb(0xE5, 0x39, 0x35), err);
+        }
+        if !snap.windows.is_empty() {
+            ui.add_space(8.0);
+            for (label, w) in &snap.windows {
+                window_row(ui, label, w);
+            }
+        }
+    });
+}
+
+fn render_loading_card(ui: &mut egui::Ui, id: ProviderId) {
+    let tint_rgb = id.tint_rgb();
+    let tint = Color32::from_rgb(tint_rgb.0, tint_rgb.1, tint_rgb.2);
+    card_frame(ui, tint, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(id.human())
+                    .strong()
+                    .size(15.0)
+                    .color(Color32::from_gray(180)),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak("waiting for first poll…");
+            });
+        });
+    });
+}
+
+/// Draw a card with a 4 px provider-coloured accent on the left edge.
+/// Body is rendered inside `body` with consistent padding. Shared with
+/// the Settings tab so cards line up between Status and Settings.
+pub fn card_frame(ui: &mut egui::Ui, tint: Color32, body: impl FnOnce(&mut egui::Ui)) {
+    let body_fill = ui
+        .visuals()
+        .widgets
+        .noninteractive
+        .bg_fill
+        .gamma_multiply(1.05);
+    let stroke = egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let outer = egui::Frame::default()
+        .fill(body_fill)
+        .stroke(stroke)
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::ZERO);
+
+    outer.show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.horizontal(|ui| {
+            // Left accent stripe.
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(4.0, ui.available_height().max(64.0)),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect_filled(rect, 0.0, tint);
+            ui.add_space(4.0);
+            ui.vertical(|ui| {
+                ui.add_space(8.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(ui.available_width() - 12.0);
+                    body(ui);
+                });
+                ui.add_space(8.0);
+            });
+        });
+    });
+}
+
+fn header_row(ui: &mut egui::Ui, provider: ProviderId, status: ProviderStatus, tint: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("●").color(tint).size(14.0));
+        ui.label(RichText::new(provider.human()).strong().size(15.5));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            status_chip(ui, status);
+        });
+    });
+}
+
+fn status_chip(ui: &mut egui::Ui, status: ProviderStatus) {
+    let (text, base) = match status {
+        ProviderStatus::Ok => ("OK", Color32::from_rgb(0x4C, 0xAF, 0x50)),
+        ProviderStatus::Degraded => ("DEGRADED", Color32::from_rgb(0xFF, 0xB3, 0x00)),
+        ProviderStatus::Unavailable => ("UNAVAILABLE", Color32::from_gray(140)),
+    };
+    let bg = base.gamma_multiply(0.18);
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .color(base)
+                .size(10.5)
+                .strong()
+                .background_color(bg),
+        )
+        .selectable(false),
+    );
+}
+
+fn window_row(ui: &mut egui::Ui, label: &str, w: &llm_usage_core::model::WindowUsage) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [56.0, 18.0],
+            egui::Label::new(
+                RichText::new(label)
+                    .monospace()
+                    .color(Color32::from_gray(200))
+                    .size(12.5),
+            ),
+        );
+
+        match w.fraction_used {
+            Some(frac) => {
+                let f32_frac = frac.min(1.0) as f32;
+                let bar = egui::ProgressBar::new(f32_frac)
+                    .desired_width(220.0)
+                    .fill(fraction_color(frac))
+                    .text(
+                        RichText::new(format!("{:.0}%", frac * 100.0))
+                            .size(11.0)
+                            .strong(),
+                    );
+                ui.add(bar);
+                if let Some(limit) = w.limit_usd {
+                    ui.weak(format!("of ${:.0}", limit));
+                }
+            }
+            None => {
+                let mut shown = false;
+                if w.tokens_in + w.tokens_out > 0 {
+                    ui.weak(format!(
+                        "↑ {}  ↓ {}",
+                        fmt_tokens(w.tokens_in),
+                        fmt_tokens(w.tokens_out)
+                    ));
+                    shown = true;
+                }
+                if w.request_count > 0 {
+                    if shown {
+                        ui.weak("·");
+                    }
+                    ui.weak(format!("{} reqs", w.request_count));
+                    shown = true;
+                }
+                if !shown {
+                    ui.weak("no activity");
+                }
+            }
+        }
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(ends) = w.ends_at {
+                let secs = (ends - chrono::Utc::now()).num_seconds();
+                if secs > 0 {
+                    let txt = if secs < 3600 {
+                        format!("resets {}m", secs / 60)
+                    } else if secs < 86_400 {
+                        format!("resets {}h", secs / 3600)
+                    } else {
+                        format!("resets {}d", secs / 86_400)
+                    };
+                    ui.weak(txt);
+                }
+            }
+            if let Some(spend) = w.spend_usd {
+                ui.label(
+                    RichText::new(format!("${:.2}", spend))
+                        .color(Color32::from_gray(220))
+                        .strong(),
+                );
+            }
+        });
+    });
+}
+
+fn render_daily_history_card(ui: &mut egui::Ui, history: &[(chrono::NaiveDate, f64)]) {
+    let max = history
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(0f64, f64::max)
+        .max(0.01);
+    let tint_rgb = ProviderId::Anthropic.tint_rgb();
+    let tint = Color32::from_rgb(tint_rgb.0, tint_rgb.1, tint_rgb.2);
+    ui.add_space(6.0);
+    card_frame(ui, tint, |ui| {
+        ui.label(
+            RichText::new("Anthropic — daily spend (last 14 days)")
+                .strong()
+                .size(13.0),
+        );
+        ui.add_space(6.0);
+        for (date, spend) in history {
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [70.0, 18.0],
+                    egui::Label::new(
+                        RichText::new(date.format("%a %m-%d").to_string())
+                            .monospace()
+                            .size(12.0)
+                            .color(Color32::from_gray(180)),
+                    ),
+                );
+                let bar = egui::ProgressBar::new((spend / max) as f32)
+                    .desired_width(380.0)
+                    .fill(tint)
+                    .text(RichText::new(format!("${:.2}", spend)).size(11.0));
+                ui.add(bar);
+            });
+        }
+    });
+}
+
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn fraction_color(frac: f64) -> Color32 {
+    if frac < 0.60 {
+        Color32::from_rgb(0x4C, 0xAF, 0x50)
+    } else if frac < 0.85 {
+        Color32::from_rgb(0xFF, 0xB3, 0x00)
+    } else {
+        Color32::from_rgb(0xE5, 0x39, 0x35)
+    }
+}
+
+impl DashboardApp {
+    /// Ask the tray to poll right now and refresh the shared file.
+    /// The tray's `refresh.trigger` watcher picks this up; the file
+    /// watcher we spawned will re-load the result automatically when
+    /// the tray rewrites snapshots.json.
+    fn request_refresh(&mut self) {
+        let now = chrono::Utc::now();
+        if let Err(e) = llm_usage_core::touch_refresh_trigger() {
+            tracing::warn!(error = %e, "could not touch refresh trigger");
+            return;
+        }
+        *self.refresh_pending.lock().unwrap() = Some(now);
+        if self.config.anthropic.enabled && self.config.anthropic.show_spend {
+            kick_daily_history(&self.config.anthropic, self.daily_history.clone());
+        }
+    }
+}
+
+/// Re-read the shared snapshot file into the dashboard's maps.
+/// Resets the "polling…" pending marker if the file we just read is
+/// newer than the moment the user clicked Refresh.
+fn reload_snapshots(
+    snapshots: &Arc<Mutex<BTreeMap<ProviderId, UsageSnapshot>>>,
+    last_updated: &Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    refresh_pending: &Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+) {
+    let Ok(Some(file)) = llm_usage_core::read_snapshots() else {
+        return;
+    };
+    {
+        let mut guard = snapshots.lock().unwrap();
+        *guard = file.snapshots;
+    }
+    let updated_at = file.updated_at;
+    *last_updated.lock().unwrap() = Some(updated_at);
+    let mut pending = refresh_pending.lock().unwrap();
+    if let Some(asked_at) = *pending {
+        if updated_at >= asked_at {
+            *pending = None;
+        }
+    }
+}
+
+fn spawn_snapshots_watcher(
+    snapshots: Arc<Mutex<BTreeMap<ProviderId, UsageSnapshot>>>,
+    last_updated: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    refresh_pending: Arc<Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    ctx: egui::Context,
+) -> Option<RecommendedWatcher> {
+    let target = llm_usage_core::config::snapshots_path().ok()?;
+    let parent = target.parent()?.to_path_buf();
+    std::fs::create_dir_all(&parent).ok();
+
+    let last_fire = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60)));
+    let path_match = target.clone();
+    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let event = match res {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(error = %err, "snapshots watcher error");
+                return;
+            }
+        };
+        let interesting = matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_)
+        );
+        if !interesting {
+            return;
+        }
+        if !event.paths.iter().any(|p| p == &path_match) {
+            return;
+        }
+        let now = Instant::now();
+        let mut guard = last_fire.lock().expect("poisoned");
+        if now.duration_since(*guard) < Duration::from_millis(150) {
+            return;
+        }
+        *guard = now;
+        reload_snapshots(&snapshots, &last_updated, &refresh_pending);
+        ctx.request_repaint();
+    }) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not start snapshots watcher");
+            return None;
+        }
+    };
+    if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
+        tracing::warn!(error = %e, path = %parent.display(), "snapshots watcher subscribe failed");
+        return None;
+    }
+    tracing::info!(path = %target.display(), "snapshots watcher live");
+    Some(watcher)
+}
+
+/// Kick a one-shot JSONL walk to refresh the 14-day Anthropic spend
+/// chart. The chart is dashboard-local (the tray doesn't need it).
+fn kick_daily_history(
+    cfg: &llm_usage_core::config::AnthropicConfig,
+    history: Arc<Mutex<Vec<(chrono::NaiveDate, f64)>>>,
+) {
+    let cfg = cfg.clone();
+    std::thread::spawn(move || {
+        let computed = history::anthropic_daily_spend(&cfg, 14);
+        *history.lock().unwrap() = computed;
+    });
+}
+
+fn fmt_age(age: chrono::Duration) -> String {
+    let secs = age.num_seconds().max(0);
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}

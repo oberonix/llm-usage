@@ -1,0 +1,22 @@
+# Minimal config used by the CI smoke test of `print_snapshots`.
+# Disables every provider so the example exits cleanly without network/files.
+poll_interval_secs = 60
+
+[anthropic]
+enabled = false
+
+[openai]
+enabled = false
+
+[codex_cli]
+enabled = false
+
+[ollama_local]
+enabled = false
+
+[ollama_cloud]
+enabled = false
+
+[alerts]
+disabled = true
+debounce_secs = 3600

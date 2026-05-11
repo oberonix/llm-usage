@@ -1,0 +1,23 @@
+[package]
+name = "llm-usage-setup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "llm-usage-setup"
+path = "src/main.rs"
+
+[dependencies]
+llm-usage-core = { path = "../core" }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tao.workspace = true
+wry.workspace = true
+cookie.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
