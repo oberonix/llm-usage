@@ -19,8 +19,33 @@ pub enum SaveOutcome {
 /// Editable mirror of the user-facing parts of `Config`. Strings stay strings
 /// (text fields); numbers stay numbers (DragValue widgets); thresholds stay
 /// as a comma-separated string for ergonomic editing.
+/// Pre-baked dropdown options for the poll interval.
+/// Anthropic's OAuth endpoint rate-limits aggressive polling, so we
+/// start at 1 min and don't expose anything shorter. 1 hour is the
+/// top end — beyond that the menu feels broken.
+const POLL_OPTIONS: &[(u64, &str)] = &[
+    (60, "1 minute"),
+    (300, "5 minutes"),
+    (900, "15 minutes"),
+    (1800, "30 minutes"),
+    (3600, "1 hour"),
+];
+
+/// Tray-icon rotation cadence. Goes down to 5 s for a "live carousel"
+/// feel; the top end is mostly there for users who'd rather pick a
+/// favourite provider manually.
+const ROTATION_OPTIONS: &[(u64, &str)] = &[
+    (5, "5 seconds"),
+    (10, "10 seconds"),
+    (15, "15 seconds"),
+    (30, "30 seconds"),
+    (60, "1 minute"),
+    (300, "5 minutes"),
+];
+
 pub struct ConfigDraft {
     pub poll_interval_secs: u64,
+    pub icon_rotation_secs: u64,
 
     pub anthropic_enabled: bool,
     pub anthropic_show_spend: bool,
@@ -70,6 +95,7 @@ impl ConfigDraft {
     pub fn from_config(c: &Config) -> Self {
         Self {
             poll_interval_secs: c.poll_interval_secs,
+            icon_rotation_secs: c.icon_rotation_secs,
 
             anthropic_enabled: c.anthropic.enabled,
             anthropic_show_spend: c.anthropic.show_spend,
@@ -119,6 +145,7 @@ impl ConfigDraft {
     pub fn to_config(&self) -> Config {
         let mut c = Config::load_or_default().unwrap_or_default();
         c.poll_interval_secs = self.poll_interval_secs.max(60);
+        c.icon_rotation_secs = self.icon_rotation_secs.max(5);
 
         c.anthropic = AnthropicConfig {
             enabled: self.anthropic_enabled,
@@ -314,21 +341,34 @@ impl ConfigDraft {
     pub fn render(&mut self, ui: &mut egui::Ui) {
         self.poll_setup_result();
 
-        section_header(ui, "Polling");
+        section_header(ui, "Polling & display");
         provider_card(ui, neutral_tint(), |ui| {
-            section_header_row(ui, "Refresh interval", None);
-            field_row(ui, "Every", |ui| {
-                ui.add(
-                    egui::DragValue::new(&mut self.poll_interval_secs)
-                        .speed(60.0)
-                        .range(60..=86_400)
-                        .suffix(" sec"),
+            field_row(ui, "Refresh every", |ui| {
+                interval_combo(
+                    ui,
+                    "poll_interval",
+                    &mut self.poll_interval_secs,
+                    POLL_OPTIONS,
                 );
-                ui.weak(format!(
-                    "≈ {} min (minimum 60 s, default 900)",
-                    (self.poll_interval_secs as f64 / 60.0).round() as u64
-                ));
             });
+            help(
+                ui,
+                "How often providers are polled. Anthropic's OAuth endpoint \
+                 rate-limits aggressive polling \u{2014} short intervals back off automatically.",
+            );
+            field_row(ui, "Tray rotates every", |ui| {
+                interval_combo(
+                    ui,
+                    "icon_rotation",
+                    &mut self.icon_rotation_secs,
+                    ROTATION_OPTIONS,
+                );
+            });
+            help(
+                ui,
+                "How often the tray icon swaps to the next quota-bearing provider's \
+                 gauge. Shorter feels live; longer is calmer.",
+            );
         });
 
         ui.add_space(14.0);
@@ -664,6 +704,41 @@ fn field_row(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
         );
         body(ui);
     });
+}
+
+/// A dropdown over a fixed set of `(seconds, human label)` options.
+/// If the current value isn't in the list (e.g. someone hand-edited
+/// the TOML to 173 seconds), we still show it as a "Custom (Ns)"
+/// row at the top so the form round-trips without silently losing it.
+fn interval_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut u64,
+    options: &[(u64, &str)],
+) {
+    let in_list = options.iter().any(|(v, _)| *v == *value);
+    let selected_label = options
+        .iter()
+        .find(|(v, _)| *v == *value)
+        .map(|(_, l)| (*l).to_string())
+        .unwrap_or_else(|| format!("Custom ({} s)", value));
+
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_label)
+        .width(160.0)
+        .show_ui(ui, |ui| {
+            if !in_list {
+                ui.selectable_value(
+                    value,
+                    *value,
+                    format!("Custom ({} s)", value),
+                );
+                ui.separator();
+            }
+            for (secs, label) in options {
+                ui.selectable_value(value, *secs, *label);
+            }
+        });
 }
 
 fn help(ui: &mut egui::Ui, text: &str) {

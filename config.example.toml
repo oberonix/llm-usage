@@ -7,6 +7,10 @@
 # below ~5 minutes risks 429s and the tray will back off automatically.
 poll_interval_secs = 900
 
+# How often the tray icon swaps to the next quota-bearing provider's gauge.
+# Default 15 s; clamps to a minimum of 5 s.
+icon_rotation_secs = 15
+
 [anthropic]
 enabled = true
 # When false (default), only quota usage is shown. Flip to true to display

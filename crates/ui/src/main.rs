@@ -31,8 +31,12 @@ const PROVIDER_ORDER: [ProviderId; 6] = [
     ProviderId::OllamaCloud,
 ];
 
-/// How often the icon advances to the next quota-bearing provider.
-const ROTATION_INTERVAL: Duration = Duration::from_secs(60);
+/// Lower bound to keep a hand-edited config from making the icon flicker.
+const MIN_ROTATION_SECS: u64 = 5;
+
+fn rotation_interval_from(cfg: &Config) -> Duration {
+    Duration::from_secs(cfg.icon_rotation_secs.max(MIN_ROTATION_SECS))
+}
 
 const DASHBOARD_ID: &str = "dashboard";
 const REFRESH_ID: &str = "refresh";
@@ -99,16 +103,18 @@ fn main() -> Result<()> {
     let mut current_snapshots: BTreeMap<ProviderId, UsageSnapshot> = BTreeMap::new();
     let mut active_idx: usize = 0;
     let mut last_rotation = Instant::now();
+    let mut rotation_interval = rotation_interval_from(&config);
 
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(250),
         );
 
-        // Rotate to the next quota-bearing provider once a minute. If
-        // there's only one (or none) eligible, this is a no-op aside
-        // from a re-render against whatever fresh data we have.
-        if last_rotation.elapsed() >= ROTATION_INTERVAL {
+        // Rotate to the next quota-bearing provider on the configured
+        // cadence. If there's only one (or none) eligible, this is a
+        // no-op aside from a re-render against whatever fresh data we
+        // have.
+        if last_rotation.elapsed() >= rotation_interval {
             active_idx = active_idx.wrapping_add(1);
             last_rotation = Instant::now();
             refresh_icon(&tray, &current_snapshots, &mut active_idx);
@@ -131,6 +137,12 @@ fn main() -> Result<()> {
                         .show();
                 }
                 RuntimeMessage::ConfigReloaded => {
+                    // Pick up the rotation interval the user may have
+                    // changed in Settings. Falls back to the in-flight
+                    // value if the file can't be re-read.
+                    if let Ok(new_cfg) = Config::load_or_default() {
+                        rotation_interval = rotation_interval_from(&new_cfg);
+                    }
                     let _ = notify_rust::Notification::new()
                         .summary("llm-usage")
                         .body("Config reloaded")

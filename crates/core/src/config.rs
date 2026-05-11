@@ -10,6 +10,10 @@ use crate::pricing::ModelRate;
 #[serde(default)]
 pub struct Config {
     pub poll_interval_secs: u64,
+    /// How often the tray icon swaps to the next quota-bearing provider.
+    /// Stored in seconds; clamped to a minimum of 5 at read time so a
+    /// hand-edited config can't make the icon flicker.
+    pub icon_rotation_secs: u64,
     pub anthropic: AnthropicConfig,
     pub openai: OpenAiConfig,
     pub codex_cli: CodexCliConfig,
@@ -27,6 +31,7 @@ impl Default for Config {
             // OAuth /usage endpoint rate-limits aggressive polling, so we
             // bias the whole loop towards "informative, not chatty".
             poll_interval_secs: 900,
+            icon_rotation_secs: 15,
             anthropic: AnthropicConfig::default(),
             openai: OpenAiConfig::default(),
             codex_cli: CodexCliConfig::default(),
