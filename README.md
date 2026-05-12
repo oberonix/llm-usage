@@ -186,15 +186,20 @@ in SQLite so restarts don't re-fire.
   OAuth token in `~/.claude/.credentials.json`. If you've never logged
   into Claude Code on this machine, the quota line will be blank — set
   `enabled = false` for `[anthropic]` if that's permanent for you.
-- **Anthropic dollar spend** is still computed from Claude Code's local
+- **Anthropic dollar spend** is computed from Claude Code's local
   JSONL × per-model pricing. Raw API usage made via other clients is
-  not visible.
-- **OpenAI's `/dashboard/billing/usage` is unofficial** and has been broken
-  by OpenAI before. The widget shows "billing endpoint unavailable" if it
-  returns non-2xx — usage will reappear when OpenAI fixes the endpoint.
-- **Codex CLI on the ChatGPT plan has no public API.** We read the local
-  `~/.codex/sessions/` rollouts; the schema is reverse-engineered and may
-  break across Codex CLI releases.
+  visible only if you point opencode at the API (we read opencode's
+  SQLite store too, filtered to the `anthropic` providerID).
+- **Codex CLI on the ChatGPT plan has no public API.** We read the
+  local `~/.codex/sessions/` rollouts; the schema is reverse-engineered
+  and may break across Codex CLI releases. opencode's per-message
+  store is also folded in for users who drive OpenAI through opencode
+  rather than the codex CLI directly.
+- **Ollama Cloud** has no usage API either; we scrape the logged-in
+  `/settings` page using a session cookie captured by
+  `llm-usage-setup`. Cookie expires every few weeks — the dashboard
+  surfaces a "session cookie likely expired" hint when that happens
+  so you can re-run the setup capture.
 - **GNOME** users will need the `AppIndicator and KStatusNotifierItem
   Support` extension. Pop!_OS COSMIC and most other desktops work out of
   the box.
