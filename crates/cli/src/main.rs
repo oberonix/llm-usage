@@ -324,16 +324,76 @@ async fn poll_fresh() -> Result<BTreeMap<ProviderId, UsageSnapshot>> {
 }
 
 fn format_quota_row(label: &str, w: &WindowUsage, use_color: bool) -> String {
+    let now = chrono::Utc::now();
     let frac = w.fraction_used.unwrap_or(0.0);
-    let bar = unicode_bar(frac, 10);
+    let pace_idx = pace_index(label, w, now, 10);
+    let bar = colored_bar(frac, 10, pace_idx, use_color);
     let pct_raw = format!("{:>3.0}%", frac * 100.0);
     let pct = if use_color {
         format!("{}{}\x1b[0m", color_for(frac), pct_raw)
     } else {
         pct_raw
     };
-    let suffix = quota_suffix(w, chrono::Utc::now());
+    let suffix = quota_suffix(w, now);
     format!("{} {} · {}{}", bar, pct, label, suffix)
+}
+
+// Cell index (0..cells) of the pacing marker, given how much of the
+// underlying window has elapsed. Mirrors the tray icon's pace logic
+// in `crates/ui/src/icon.rs` — only labels with a known total
+// duration get a marker. Returns `None` for labels we can't
+// confidently size (1h / today / month: the renderer would have
+// nothing to compare elapsed-vs-total against).
+fn pace_index(
+    label: &str,
+    w: &WindowUsage,
+    now: chrono::DateTime<chrono::Utc>,
+    cells: usize,
+) -> Option<usize> {
+    let window_secs: i64 = match label {
+        "5h" => 5 * 3600,
+        "week" | "week (Sonnet)" | "week (Opus)" => 7 * 86_400,
+        _ => return None,
+    };
+    let ends = w.ends_at?;
+    let remaining = (ends - now).num_seconds().max(0).min(window_secs);
+    let elapsed = (window_secs - remaining) as f64 / window_secs as f64;
+    Some(((elapsed * (cells - 1) as f64).round() as usize).min(cells - 1))
+}
+
+// 10-cell bar with two layers of colour when `use_color`:
+//   - filled pips get the same green/amber/red ramp as the % text
+//   - one pip (at `pace_idx`) is painted purple to mark where the
+//     time window itself currently sits.
+// In plain-text mode (output piped, NO_COLOR set, redirect, etc.)
+// we return the unstyled `▰`/`▱` glyphs and drop the pace marker —
+// a purple `▰` would otherwise look like an extra unit of usage.
+fn colored_bar(fraction: f64, cells: usize, pace_idx: Option<usize>, use_color: bool) -> String {
+    let frac = fraction.clamp(0.0, 1.0);
+    let filled = ((frac * cells as f64).round() as usize).min(cells);
+    if !use_color {
+        return unicode_bar(fraction, cells);
+    }
+    const PACE: &str = "\x1b[35m"; // magenta — distinct from green/amber/red
+    const RESET: &str = "\x1b[0m";
+    let fill_color = color_for(frac);
+    let mut s = String::with_capacity(cells * 8);
+    for i in 0..cells {
+        if pace_idx == Some(i) {
+            // Pace marker is always visible regardless of fill state;
+            // glyph stays `▰` so it pops against `▱` background.
+            s.push_str(PACE);
+            s.push('▰');
+            s.push_str(RESET);
+        } else if i < filled {
+            s.push_str(fill_color);
+            s.push('▰');
+            s.push_str(RESET);
+        } else {
+            s.push('▱');
+        }
+    }
+    s
 }
 
 // Mirrors `quota_suffix` in the tray crate — see the comment there.
@@ -453,6 +513,100 @@ mod tests {
         assert!(quota_suffix(&w, now).contains("⚠"));
         // Stale wins over countdown.
         assert!(!quota_suffix(&w, now).contains("2h"));
+    }
+
+    #[test]
+    fn colored_bar_plain_mode_matches_unicode_bar() {
+        // No-color output must match the original plain ▰/▱ shape so
+        // anyone piping to grep / a file isn't surprised by escape
+        // codes — and a purple pace marker would just look like an
+        // extra unit of usage.
+        let plain = colored_bar(0.4, 10, Some(7), /*use_color*/ false);
+        assert_eq!(plain, unicode_bar(0.4, 10));
+    }
+
+    #[test]
+    fn colored_bar_paints_fill_with_threshold_color() {
+        // 40 % usage → green ramp. ANSI green is \x1b[32m.
+        let s = colored_bar(0.4, 10, None, true);
+        assert!(s.contains("\x1b[32m"), "expected green: {:?}", s);
+        // 70 % → amber.
+        let s = colored_bar(0.7, 10, None, true);
+        assert!(s.contains("\x1b[33m"), "expected amber: {:?}", s);
+        // 95 % → red.
+        let s = colored_bar(0.95, 10, None, true);
+        assert!(s.contains("\x1b[31m"), "expected red: {:?}", s);
+    }
+
+    #[test]
+    fn colored_bar_paints_pace_index_in_purple() {
+        // A 40 % bar with pace at index 7 should have one purple pip
+        // beyond the filled region.
+        let s = colored_bar(0.4, 10, Some(7), true);
+        assert!(s.contains("\x1b[35m"), "expected magenta pace marker: {:?}", s);
+        // Pace pip in unfilled region keeps the `▰` glyph so it's
+        // visible against the `▱` background — and the unfilled
+        // count is one less than it would be without pace.
+        assert_eq!(s.matches('▰').count(), 4 + 1, "got {:?}", s);
+        assert_eq!(s.matches('▱').count(), 10 - 4 - 1, "got {:?}", s);
+    }
+
+    #[test]
+    fn colored_bar_pace_inside_fill_region_still_renders_purple() {
+        // When pace is below the fill level, the marker still wins:
+        // we want the user to see "here's where time says you'd be"
+        // even when they're ahead of pace.
+        let s = colored_bar(0.8, 10, Some(3), true);
+        assert!(s.contains("\x1b[35m"));
+        // Pip count is unchanged because the marker swaps for a
+        // would-be fill pip.
+        assert_eq!(s.matches('▰').count(), 8);
+    }
+
+    #[test]
+    fn pace_index_unknown_label_returns_none() {
+        let mut w = WindowUsage::default();
+        w.ends_at = Some(chrono::Utc::now() + chrono::Duration::hours(2));
+        assert!(pace_index("today", &w, chrono::Utc::now(), 10).is_none());
+        assert!(pace_index("month", &w, chrono::Utc::now(), 10).is_none());
+        assert!(pace_index("1h", &w, chrono::Utc::now(), 10).is_none());
+    }
+
+    #[test]
+    fn pace_index_5h_window_maps_elapsed_fraction_to_cell() {
+        // ends_at = now + 1h means 4h of the 5h window have elapsed →
+        // pace fraction 0.8 → cell index 7 in a 10-cell bar.
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        w.ends_at = Some(now + chrono::Duration::hours(1));
+        let idx = pace_index("5h", &w, now, 10).unwrap();
+        assert_eq!(idx, 7, "got {idx}");
+    }
+
+    #[test]
+    fn pace_index_week_variants_all_use_seven_day_window() {
+        // The Sonnet- and Opus-specific weekly windows share the same
+        // duration as plain "week"; if a refactor accidentally drops
+        // one of them we want a test failure, not a silent missing
+        // pace marker.
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        w.ends_at = Some(now + chrono::Duration::days(2));
+        for label in ["week", "week (Sonnet)", "week (Opus)"] {
+            let idx = pace_index(label, &w, now, 10).expect(label);
+            // 5 of 7 days elapsed → ~0.71 → cell 6.
+            assert_eq!(idx, 6, "{label}: got {idx}");
+        }
+    }
+
+    #[test]
+    fn pace_index_past_ends_at_pins_to_last_cell() {
+        // Stale snapshot (resets_at lapsed). The pace marker should
+        // sit at cell `cells - 1`, not wrap or panic.
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        w.ends_at = Some(now - chrono::Duration::hours(1));
+        assert_eq!(pace_index("5h", &w, now, 10).unwrap(), 9);
     }
 
     #[test]
