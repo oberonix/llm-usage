@@ -1,4 +1,10 @@
 use chrono::{DateTime, Duration, Utc};
+
+/// Symbol displayed next to a stale `WindowUsage` in any text-based
+/// renderer (tray menu, CLI bars, dashboard quota row). Centralised
+/// so a future change ("⚠" not rendering in some user's terminal,
+/// swap to "(?)" or "stale") is a one-line edit.
+pub const STALE_MARKER: &str = "⚠";
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;

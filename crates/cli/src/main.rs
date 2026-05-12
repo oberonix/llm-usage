@@ -306,7 +306,7 @@ fn format_quota_row(label: &str, w: &WindowUsage, use_color: bool) -> String {
 //   otherwise  → ""
 fn quota_suffix(w: &WindowUsage, now: chrono::DateTime<chrono::Utc>) -> String {
     if w.stale {
-        return " · ⚠".to_string();
+        return format!(" · {}", llm_usage_core::model::STALE_MARKER);
     }
     match w.ends_at {
         Some(t) if t > now => format!(" · {}", format_reset((t - now).num_seconds())),

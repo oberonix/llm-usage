@@ -688,9 +688,12 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
                 // reset countdown — the countdown would be misleading
                 // since the underlying data is the previous window's.
                 ui.label(
-                    RichText::new("⚠ stale")
-                        .color(Color32::from_rgb(240, 180, 60))
-                        .strong(),
+                    RichText::new(format!(
+                        "{} stale",
+                        llm_usage_core::model::STALE_MARKER
+                    ))
+                    .color(Color32::from_rgb(240, 180, 60))
+                    .strong(),
                 );
             } else if let Some(ends) = w.ends_at {
                 let secs = (ends - chrono::Utc::now()).num_seconds();
