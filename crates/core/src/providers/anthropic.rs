@@ -420,11 +420,11 @@ fn apply_oauth_usage(
     // display labels match the all-models "week" window so users can read
     // them as siblings of it.
     if let Some(b) = &usage.seven_day_sonnet {
-        let w = snap.windows.entry("week (Sonnet)".to_string()).or_default();
+        let w = snap.windows.entry("Sonnet".to_string()).or_default();
         fill_quota_window(w, b, now);
     }
     if let Some(b) = &usage.seven_day_opus {
-        let w = snap.windows.entry("week (Opus)".to_string()).or_default();
+        let w = snap.windows.entry("Opus".to_string()).or_default();
         fill_quota_window(w, b, now);
     }
 }
@@ -445,8 +445,8 @@ fn mark_oauth_windows_stale(snap: &mut UsageSnapshot) {
     let labels = [
         WindowKind::FiveHourRolling.label(),
         WindowKind::ThisWeek.label(),
-        "week (Sonnet)",
-        "week (Opus)",
+        "Sonnet",
+        "Opus",
     ];
     for label in labels {
         if let Some(w) = snap.windows.get_mut(label) {
@@ -756,10 +756,10 @@ mod tests {
         let week = snap.window(WindowKind::ThisWeek).expect("week present");
         assert!((week.fraction_used.unwrap() - 0.58).abs() < 1e-9);
         // Sonnet-specific weekly stashed as its own labelled window.
-        let sonnet = snap.windows.get("week (Sonnet)").expect("sonnet present");
+        let sonnet = snap.windows.get("Sonnet").expect("sonnet present");
         assert!((sonnet.fraction_used.unwrap() - 0.31).abs() < 1e-9);
         // Opus absent from response → window not created.
-        assert!(!snap.windows.contains_key("week (Opus)"));
+        assert!(!snap.windows.contains_key("Opus"));
         // Compact headline includes 5h and 7d but not the per-model
         // breakdown (those would make it too noisy).
         assert!(headline.contains("5h 55%"), "got: {headline}");
@@ -801,10 +801,10 @@ mod tests {
 
         assert!(snap.window(WindowKind::FiveHourRolling).unwrap().stale);
         assert!(snap.window(WindowKind::ThisWeek).unwrap().stale);
-        assert!(snap.windows.get("week (Sonnet)").unwrap().stale);
+        assert!(snap.windows.get("Sonnet").unwrap().stale);
         // week (Opus) wasn't populated → no entry to mark, but the
         // helper must not panic on the missing key.
-        assert!(!snap.windows.contains_key("week (Opus)"));
+        assert!(!snap.windows.contains_key("Opus"));
     }
 
     #[test]

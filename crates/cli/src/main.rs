@@ -34,8 +34,8 @@ fn window_order(label: &str) -> u32 {
     match label {
         "5h" => 10,
         "week" => 20,
-        "week (Sonnet)" => 21,
-        "week (Opus)" => 22,
+        "Sonnet" => 21,
+        "Opus" => 22,
         "1h" => 100,
         "today" => 101,
         "month" => 102,
@@ -274,11 +274,27 @@ fn build_screen(
             .as_deref()
             .map(|p| format!(" · {}", p))
             .unwrap_or_default();
+        // Single ⚠ next to the provider name when any of its windows
+        // are showing cached data — replaces the per-row markers so
+        // the user reads "Anthropic is disconnected" instead of
+        // scanning four identical warnings next to each fraction.
+        let any_stale = snap.windows.values().any(|w| w.stale);
         let header = format!("{}{}", id.human(), plan);
         if use_color {
-            s.push_str(&format!("\x1b[1m{}\x1b[0m\n", header));
+            s.push_str(&format!("\x1b[1m{}\x1b[0m", header));
+            if any_stale {
+                s.push_str(&format!(
+                    " \x1b[31m{}\x1b[0m",
+                    llm_usage_core::model::STALE_MARKER
+                ));
+            }
+            s.push('\n');
         } else {
             s.push_str(&header);
+            if any_stale {
+                s.push(' ');
+                s.push_str(llm_usage_core::model::STALE_MARKER);
+            }
             s.push('\n');
         }
 
@@ -393,7 +409,7 @@ fn format_quota_row(label: &str, w: &WindowUsage, use_color: bool) -> String {
     } else {
         pct_raw
     };
-    let suffix = quota_suffix(w, now, use_color);
+    let suffix = quota_suffix(w, now);
     format!("{} {} · {}{}", bar, pct, label, suffix)
 }
 
@@ -413,7 +429,7 @@ fn pace_index(
 ) -> Option<usize> {
     let window_secs: i64 = match label {
         "5h" => 5 * 3600,
-        "week" | "week (Sonnet)" | "week (Opus)" => 7 * 86_400,
+        "week" | "Sonnet" | "Opus" => 7 * 86_400,
         _ => return None,
     };
     let ends = w.ends_at?;
@@ -468,51 +484,27 @@ fn colored_bar(
     s
 }
 
-// Trailing tokens on a quota row.
+// Trailing tokens on a quota row. Just the reset countdown — the
+// "this provider has cached data" signal lives on the header now,
+// so per-row warnings would be redundant noise.
 //
 //   fresh + future ends_at → " · 2h"
-//   stale + future ends_at → " · 2h · ⚠"        (we still know when
-//                                                  fresh data is due,
-//                                                  the ⚠ just says
-//                                                  "we don't have it
-//                                                  yet")
-//   stale + past   ends_at → " · 0m · ⚠"        (should-have-rolled,
-//                                                  no fresh poll)
-//   stale + no ends_at     → " · ⚠"
+//   stale + future ends_at → " · 2h"   (gray colour + header ⚠ are
+//                                        the staleness cue)
+//   stale + past   ends_at → " · 0m"   (should-have-rolled, fresh
+//                                        data due any moment)
 //   otherwise              → ""
-//
-// The ⚠ is wrapped in ANSI red when `use_color` is on — distinct
-// from the fill colours so it draws the eye to the disconnected
-// state independent of the percentage tier.
-fn quota_suffix(
-    w: &WindowUsage,
-    now: chrono::DateTime<chrono::Utc>,
-    use_color: bool,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(t) = w.ends_at {
-        let secs = (t - now).num_seconds().max(0);
-        // For fresh rows, skip the countdown when it would be 0
-        // (window literally just rolled); for stale rows, show 0m
-        // because "0 minutes to reset" is the user's signal that
-        // fresh data should be arriving any moment.
-        if secs > 0 || w.stale {
-            parts.push(format_reset(secs));
-        }
+fn quota_suffix(w: &WindowUsage, now: chrono::DateTime<chrono::Utc>) -> String {
+    let Some(t) = w.ends_at else {
+        return String::new();
+    };
+    let secs = (t - now).num_seconds().max(0);
+    // Fresh row hides a "just rolled, 0m" suffix; stale row shows
+    // it so the user reads "fresh data expected any moment".
+    if secs == 0 && !w.stale {
+        return String::new();
     }
-    if w.stale {
-        let mark = llm_usage_core::model::STALE_MARKER;
-        parts.push(if use_color {
-            format!("\x1b[31m{}\x1b[0m", mark)
-        } else {
-            mark.to_string()
-        });
-    }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" · {}", parts.join(" · "))
-    }
+    format!(" · {}", format_reset(secs))
 }
 
 fn unicode_bar(fraction: f64, cells: usize) -> String {
@@ -610,62 +602,49 @@ mod tests {
     }
 
     #[test]
-    fn quota_suffix_fresh_shows_only_countdown() {
+    fn quota_suffix_fresh_shows_countdown_only() {
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
         w.ends_at = Some(now + chrono::Duration::hours(2));
-        let s = quota_suffix(&w, now, false);
+        let s = quota_suffix(&w, now);
         assert!(s.contains("2h"), "got {:?}", s);
-        assert!(!s.contains("⚠"), "got {:?}", s);
+        assert!(!s.contains("⚠"), "no per-row warning: {:?}", s);
     }
 
     #[test]
-    fn quota_suffix_stale_with_future_ends_at_shows_both() {
-        // The whole point of the stale rework: even when we don't
-        // have fresh data, the recorded reset time tells the user
-        // when to expect a refresh. Show both the countdown and the
-        // ⚠ together, separated by " · ".
+    fn quota_suffix_stale_still_shows_countdown() {
+        // Same countdown shape as fresh — the staleness cue is the
+        // grey bar + the provider-header ⚠, not anything in the
+        // suffix.
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
         w.ends_at = Some(now + chrono::Duration::hours(1));
         w.stale = true;
-        let s = quota_suffix(&w, now, false);
-        assert!(s.contains("1h"), "expected countdown: {:?}", s);
-        assert!(s.contains("⚠"), "expected warning: {:?}", s);
+        let s = quota_suffix(&w, now);
+        assert!(s.contains("1h"), "got {:?}", s);
+        assert!(!s.contains("⚠"), "no per-row warning: {:?}", s);
     }
 
     #[test]
-    fn quota_suffix_stale_with_past_ends_at_shows_zero_minute_floor() {
+    fn quota_suffix_stale_past_ends_at_floors_to_zero_minutes() {
         // Past resets_at + stale → "0m" floor so the user reads
-        // "should have reset by now, no fresh data" rather than
-        // a negative or hidden countdown.
+        // "should have reset by now, fresh data is due any moment".
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
         w.ends_at = Some(now - chrono::Duration::minutes(10));
         w.stale = true;
-        let s = quota_suffix(&w, now, false);
+        let s = quota_suffix(&w, now);
         assert!(s.contains("0m"), "expected 0m floor: {:?}", s);
-        assert!(s.contains("⚠"), "got {:?}", s);
     }
 
     #[test]
-    fn quota_suffix_stale_no_ends_at_shows_only_warning() {
+    fn quota_suffix_no_ends_at_returns_empty() {
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
         w.stale = true;
-        let s = quota_suffix(&w, now, false);
-        assert_eq!(s, " · ⚠");
-    }
-
-    #[test]
-    fn quota_suffix_colors_warning_red_under_use_color() {
-        let now = chrono::Utc::now();
-        let mut w = WindowUsage::default();
-        w.stale = true;
-        let s = quota_suffix(&w, now, /*use_color*/ true);
-        // ANSI red is \x1b[31m. Surrounded by reset to avoid
-        // bleed into the trailing layout.
-        assert!(s.contains("\x1b[31m") && s.contains("\x1b[0m"), "got {:?}", s);
+        // Without an ends_at there's nothing to count down to. The
+        // user still sees the gray bar + header ⚠.
+        assert_eq!(quota_suffix(&w, now), "");
     }
 
     #[test]
@@ -778,7 +757,7 @@ mod tests {
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
         w.ends_at = Some(now + chrono::Duration::days(2));
-        for label in ["week", "week (Sonnet)", "week (Opus)"] {
+        for label in ["week", "Sonnet", "Opus"] {
             let idx = pace_index(label, &w, now, 10).expect(label);
             // 5 of 7 days elapsed → ~0.71 → cell 6.
             assert_eq!(idx, 6, "{label}: got {idx}");
@@ -796,14 +775,44 @@ mod tests {
     }
 
     #[test]
-    fn format_quota_row_keeps_fraction_and_warns_when_stale() {
+    fn format_quota_row_keeps_fraction_and_countdown_when_stale() {
+        // Per-row no longer carries the ⚠. The fraction stays
+        // (so the user sees what we last knew) and the countdown
+        // stays (so they know when fresh data should arrive). The
+        // stale call-out moved to the provider header at the
+        // `build_screen` level.
         let mut w = WindowUsage::default();
         w.fraction_used = Some(1.0);
-        w.ends_at = Some(chrono::Utc::now() + chrono::Duration::hours(2));
+        w.ends_at = Some(chrono::Utc::now() + chrono::Duration::minutes(125));
         w.stale = true;
         let s = format_quota_row("5h", &w, /*use_color*/ false);
-        assert!(s.contains("100%"), "expected fraction kept: {}", s);
-        assert!(s.contains("⚠"), "expected stale marker: {}", s);
+        assert!(s.contains("100%"), "got: {}", s);
+        assert!(s.contains("2h"), "got: {}", s);
+        assert!(!s.contains("⚠"), "row should not carry per-row marker: {}", s);
+    }
+
+    #[test]
+    fn build_screen_puts_stale_marker_next_to_provider_name() {
+        // Provider-level ⚠ when any of its windows are stale.
+        let mut snap = make_snapshot(ProviderId::Anthropic);
+        snap.windows.get_mut("5h").unwrap().stale = true;
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::Anthropic, snap);
+        let s = build_screen(&snaps, None, /*use_color*/ false, false);
+        // First non-empty line is the header: "Anthropic · Plus ⚠".
+        let header = s.lines().next().unwrap_or("");
+        assert!(header.contains("Anthropic"), "got: {}", header);
+        assert!(header.contains("⚠"), "header missing marker: {}", header);
+    }
+
+    #[test]
+    fn build_screen_omits_stale_marker_when_no_window_is_stale() {
+        let snap = make_snapshot(ProviderId::Anthropic);
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::Anthropic, snap);
+        let s = build_screen(&snaps, None, false, false);
+        let header = s.lines().next().unwrap_or("");
+        assert!(!header.contains("⚠"), "got: {}", header);
     }
 
     #[test]

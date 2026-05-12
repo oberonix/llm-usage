@@ -48,9 +48,39 @@ pub fn read_snapshots() -> Result<Option<SnapshotsFile>> {
         return Ok(None);
     }
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-    let parsed: SnapshotsFile =
+    let mut parsed: SnapshotsFile =
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+    migrate_legacy_labels(&mut parsed);
     Ok(Some(parsed))
+}
+
+/// Rewrite renamed window labels in place so a tray upgrade doesn't
+/// show duplicate rows when `UsageSnapshot::merge_stale_from` grafts
+/// the old key back from cache. Migrations live here rather than in
+/// the provider so they apply uniformly to every reader (tray
+/// seed-on-startup, dashboard, CLI cache).
+///
+/// History so far:
+/// - 2026-05-12: Anthropic `week (Sonnet)` → `Sonnet`,
+///   `week (Opus)` → `Opus`.
+fn migrate_legacy_labels(file: &mut SnapshotsFile) {
+    for snap in file.snapshots.values_mut() {
+        if !matches!(snap.provider, ProviderId::Anthropic) {
+            continue;
+        }
+        for (legacy, current) in [
+            ("week (Sonnet)", "Sonnet"),
+            ("week (Opus)", "Opus"),
+        ] {
+            if let Some(w) = snap.windows.remove(legacy) {
+                // `or_insert` rather than overwrite — a successful
+                // post-rename poll may have already populated the
+                // new key with fresher data; don't clobber it with
+                // a cached legacy row.
+                snap.windows.entry(current.to_string()).or_insert(w);
+            }
+        }
+    }
 }
 
 /// Touch the refresh trigger so the tray's watcher fires and the
@@ -280,6 +310,126 @@ mod tests {
             !p.as_os_str().is_empty(),
             "refresh_trigger_path must yield something"
         );
+    }
+
+    #[test]
+    fn migrate_legacy_labels_renames_sonnet_and_opus() {
+        // Hand-build a SnapshotsFile that still uses the old keys
+        // (as pre-rename writes would leave on disk). After the
+        // migration both should appear under the new keys with the
+        // same fractions.
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: chrono::Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        snap.windows.insert(
+            "week (Sonnet)".into(),
+            WindowUsage {
+                fraction_used: Some(0.31),
+                ..Default::default()
+            },
+        );
+        snap.windows.insert(
+            "week (Opus)".into(),
+            WindowUsage {
+                fraction_used: Some(0.05),
+                ..Default::default()
+            },
+        );
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::Anthropic, snap);
+        let mut file = SnapshotsFile::new(snaps);
+        migrate_legacy_labels(&mut file);
+
+        let anth = file.snapshots.get(&ProviderId::Anthropic).unwrap();
+        assert!(!anth.windows.contains_key("week (Sonnet)"));
+        assert!(!anth.windows.contains_key("week (Opus)"));
+        assert_eq!(
+            anth.windows.get("Sonnet").and_then(|w| w.fraction_used),
+            Some(0.31)
+        );
+        assert_eq!(
+            anth.windows.get("Opus").and_then(|w| w.fraction_used),
+            Some(0.05)
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_labels_does_not_overwrite_fresh_key() {
+        // Post-rename poll already populated the new `Sonnet` key
+        // with a fresh fraction (0.42); a stale legacy entry from
+        // disk shouldn't clobber it.
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: chrono::Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        snap.windows.insert(
+            "Sonnet".into(),
+            WindowUsage {
+                fraction_used: Some(0.42),
+                ..Default::default()
+            },
+        );
+        snap.windows.insert(
+            "week (Sonnet)".into(),
+            WindowUsage {
+                fraction_used: Some(0.99),
+                stale: true,
+                ..Default::default()
+            },
+        );
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::Anthropic, snap);
+        let mut file = SnapshotsFile::new(snaps);
+        migrate_legacy_labels(&mut file);
+
+        let anth = file.snapshots.get(&ProviderId::Anthropic).unwrap();
+        assert!(!anth.windows.contains_key("week (Sonnet)"));
+        assert_eq!(
+            anth.windows.get("Sonnet").and_then(|w| w.fraction_used),
+            Some(0.42),
+            "fresh key must survive — legacy migration must not clobber it"
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_labels_skips_non_anthropic_snapshots() {
+        // If the Codex provider ever had a window literally named
+        // "week (Sonnet)" (it doesn't, but defensively), it should
+        // NOT be renamed — the migration is Anthropic-scoped.
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::CodexCli,
+            timestamp: chrono::Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        snap.windows.insert(
+            "week (Sonnet)".into(),
+            WindowUsage::default(),
+        );
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::CodexCli, snap);
+        let mut file = SnapshotsFile::new(snaps);
+        migrate_legacy_labels(&mut file);
+        assert!(file
+            .snapshots
+            .get(&ProviderId::CodexCli)
+            .unwrap()
+            .windows
+            .contains_key("week (Sonnet)"));
     }
 
     #[test]

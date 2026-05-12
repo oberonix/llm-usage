@@ -286,7 +286,16 @@ fn build_menu(
             .as_deref()
             .map(|p| format!(" · {}", p))
             .unwrap_or_default();
-        let header = format!("{}{}", snap.provider.human(), plan);
+        // Single ⚠ next to the provider name when any window is
+        // showing cached data — replaces the per-row markers. The
+        // gray-shifted bars below still tell the user which rows
+        // specifically are stale.
+        let stale_mark = if snap.windows.values().any(|w| w.stale) {
+            format!(" {}", llm_usage_core::model::STALE_MARKER)
+        } else {
+            String::new()
+        };
+        let header = format!("{}{}{}", snap.provider.human(), plan, stale_mark);
         let _ = menu.append(&MenuItem::new(header, false, None));
 
         if !quota_windows.is_empty() {
@@ -342,8 +351,8 @@ fn menu_window_order(label: &str) -> u32 {
     match label {
         "5h" => 10,
         "week" => 20,
-        "week (Sonnet)" => 21,
-        "week (Opus)" => 22,
+        "Sonnet" => 21,
+        "Opus" => 22,
         _ => 50,
     }
 }
@@ -358,37 +367,25 @@ fn format_quota_row(label: &str, w: &WindowUsage) -> String {
     format!("{} {} · {}{}", bar, pct, label, suffix)
 }
 
-// Pick the trailing tokens on a quota row.
+// Pick the trailing tokens on a quota row. Just the reset
+// countdown — the staleness ⚠ lives on the provider header now,
+// so per-row markers would just clutter.
 //
 //   fresh + future ends_at  → " · 2h"
-//   stale + future ends_at  → " · 2h · ⚠"   (we still know when fresh
-//                                              data is expected; ⚠
-//                                              just flags that we
-//                                              don't currently have
-//                                              it)
-//   stale + past   ends_at  → " · 0m · ⚠"   (should-have-rolled, no
-//                                              refresh yet)
-//   stale + no ends_at      → " · ⚠"
+//   stale + future ends_at  → " · 2h"
+//   stale + past   ends_at  → " · 0m"   (should-have-rolled,
+//                                          fresh data due
+//                                          any moment)
 //   otherwise               → ""
 fn quota_suffix(w: &WindowUsage, now: DateTime<Utc>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(t) = w.ends_at {
-        let secs = (t - now).num_seconds().max(0);
-        // Fresh row hides a "just rolled, 0m" suffix; stale row
-        // shows it so the user reads "fresh data expected any
-        // moment but hasn't arrived".
-        if secs > 0 || w.stale {
-            parts.push(format_reset(secs));
-        }
+    let Some(t) = w.ends_at else {
+        return String::new();
+    };
+    let secs = (t - now).num_seconds().max(0);
+    if secs == 0 && !w.stale {
+        return String::new();
     }
-    if w.stale {
-        parts.push(llm_usage_core::model::STALE_MARKER.to_string());
-    }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!(" · {}", parts.join(" · "))
-    }
+    format!(" · {}", format_reset(secs))
 }
 
 fn unicode_bar(fraction: f64, cells: usize) -> String {
@@ -434,10 +431,10 @@ mod tests {
 
     #[test]
     fn menu_window_order_lifts_quota_above_activity() {
-        let mut labels = vec!["week (Sonnet)", "5h", "month", "week"];
+        let mut labels = vec!["Sonnet", "5h", "month", "week"];
         labels.sort_by_key(|l| menu_window_order(l));
         // Unknown labels (50) come AFTER quota but BEFORE activity (100+).
-        assert_eq!(labels, vec!["5h", "week", "week (Sonnet)", "month"]);
+        assert_eq!(labels, vec!["5h", "week", "Sonnet", "month"]);
     }
 
     #[test]
@@ -454,19 +451,18 @@ mod tests {
     }
 
     #[test]
-    fn format_quota_row_stale_shows_countdown_alongside_marker() {
-        // Stale rows still show the countdown — the user wants to
-        // know when fresh data is expected, not just that we don't
-        // have it now.
+    fn format_quota_row_stale_keeps_countdown_no_per_row_marker() {
+        // Stale rows show fraction + countdown like fresh rows. The
+        // provider-header ⚠ (added in `build_menu`) is the
+        // disconnected-state cue; per-row markers would clutter.
         let mut w = WindowUsage::default();
         w.fraction_used = Some(1.0);
-        // 3h05m → "3h" cleanly without flake.
         w.ends_at = Some(chrono::Utc::now() + chrono::Duration::minutes(185));
         w.stale = true;
         let s = format_quota_row("5h", &w);
-        assert!(s.contains("100%"), "expected fraction kept: {}", s);
-        assert!(s.contains("3h"), "stale should keep countdown: {}", s);
-        assert!(s.contains("⚠"), "expected stale marker: {}", s);
+        assert!(s.contains("100%"), "got: {}", s);
+        assert!(s.contains("3h"), "got: {}", s);
+        assert!(!s.contains("⚠"), "row should not carry marker: {}", s);
     }
 
     #[test]
@@ -475,36 +471,33 @@ mod tests {
         w.fraction_used = Some(0.75);
         w.ends_at = Some(chrono::Utc::now() + chrono::Duration::minutes(185));
         let s = format_quota_row("5h", &w);
-        assert!(!s.contains("⚠"), "fresh row must not warn: {}", s);
-        assert!(s.contains("3h"), "fresh row shows countdown: {}", s);
+        assert!(!s.contains("⚠"), "got: {}", s);
+        assert!(s.contains("3h"), "got: {}", s);
     }
 
     #[test]
-    fn quota_suffix_dispatches_on_stale_flag_and_ends_at() {
+    fn quota_suffix_countdown_only_no_per_row_marker() {
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
-        // Fresh, future ends_at → countdown only.
+        // Fresh, future ends_at → countdown.
         w.ends_at = Some(now + chrono::Duration::hours(2));
         let s = quota_suffix(&w, now);
-        assert!(s.contains("2h") && !s.contains("⚠"), "got {:?}", s);
-        // Stale + future ends_at → countdown AND marker.
+        assert!(s.contains("2h") && !s.contains("⚠"), "got: {:?}", s);
+        // Stale + future ends_at → still just countdown.
         w.stale = true;
         let s = quota_suffix(&w, now);
-        assert!(s.contains("2h"), "got {:?}", s);
-        assert!(s.contains("⚠"), "got {:?}", s);
-        // Stale + past ends_at → "0m" floor + marker.
+        assert!(s.contains("2h") && !s.contains("⚠"), "got: {:?}", s);
+        // Stale + past ends_at → "0m" floor (fresh data expected).
         w.ends_at = Some(now - chrono::Duration::hours(1));
         let s = quota_suffix(&w, now);
-        assert!(s.contains("0m"), "got {:?}", s);
-        assert!(s.contains("⚠"), "got {:?}", s);
-        // Stale + no ends_at → marker alone.
+        assert!(s.contains("0m") && !s.contains("⚠"), "got: {:?}", s);
+        // No ends_at → empty (whether stale or not).
         w.ends_at = None;
-        assert_eq!(quota_suffix(&w, now), " · ⚠");
-        // Fresh + no ends_at → empty.
+        assert_eq!(quota_suffix(&w, now), "");
         w.stale = false;
         assert_eq!(quota_suffix(&w, now), "");
-        // Fresh + past ends_at → still empty (we don't second-guess
-        // a fresh poll's reset time; providers explicitly mark stale).
+        // Fresh + past ends_at → empty (we don't second-guess a
+        // fresh poll's reset time).
         w.ends_at = Some(now - chrono::Duration::hours(1));
         assert_eq!(quota_suffix(&w, now), "");
     }

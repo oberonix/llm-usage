@@ -618,8 +618,16 @@ impl DashboardApp {
 fn render_provider_card(ui: &mut egui::Ui, snap: &UsageSnapshot) {
     let tint_rgb = snap.provider.tint_rgb();
     let tint = Color32::from_rgb(tint_rgb.0, tint_rgb.1, tint_rgb.2);
+    let any_stale = snap.windows.values().any(|w| w.stale);
     card_frame(ui, tint, |ui| {
-        header_row(ui, snap.provider, snap.plan_label.as_deref(), snap.status, tint);
+        header_row(
+            ui,
+            snap.provider,
+            snap.plan_label.as_deref(),
+            snap.status,
+            tint,
+            any_stale,
+        );
         // Headline removed: the window grid below already shows the
         // same percentages and reset times; the headline duplicated
         // them and felt like a "subtitle line" the user didn't want.
@@ -694,24 +702,15 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
             // Reset countdown still shows when we know it, even for
             // stale rows — the user wants to know when fresh data
             // should be arriving. `secs.max(0)` clamps a lapsed
-            // resets_at to "0m" rather than going negative.
+            // resets_at to "0m" rather than going negative. The
+            // ⚠ "stale" call-out moved to the provider header so
+            // the user reads "this provider is disconnected" once
+            // per card, not once per bar.
             if let Some(ends) = w.ends_at {
                 let secs = (ends - chrono::Utc::now()).num_seconds();
                 if secs > 0 || w.stale {
                     ui.weak(reset_label(secs.max(0)));
                 }
-            }
-            if w.stale {
-                // Red warning marker draws the eye to the
-                // disconnected state independent of the bar tier.
-                ui.label(
-                    RichText::new(format!(
-                        "{} stale",
-                        llm_usage_core::model::STALE_MARKER
-                    ))
-                    .color(Color32::from_rgb(220, 60, 60))
-                    .strong(),
-                );
             }
             if let Some(spend) = w.spend_usd {
                 ui.label(
@@ -772,8 +771,8 @@ fn window_order(label: &str) -> u32 {
         // Quota windows — short rolling first, then weekly.
         "5h" => 10,
         "week" => 20,
-        "week (Sonnet)" => 21,
-        "week (Opus)" => 22,
+        "Sonnet" => 21,
+        "Opus" => 22,
         // Activity windows
         "1h" => 100,
         "today" => 101,
@@ -841,16 +840,29 @@ fn header_row(
     plan_label: Option<&str>,
     _status: ProviderStatus,
     _tint: Color32,
+    any_stale: bool,
 ) {
     // Provider name and plan tag share one bold label so the dash sits
     // mid-line in the same style. The left-edge accent stripe on the
-    // card already identifies the provider by colour. No status chip —
-    // the error line below (if any) is the only indicator of a problem.
+    // card already identifies the provider by colour. A trailing red ⚠
+    // appears when any window is showing cached data so the user can
+    // tell "this provider is disconnected" at a glance without scanning
+    // each bar's tier.
     let title = match plan_label {
         Some(plan) => format!("{} · {}", provider.human(), plan),
         None => provider.human().to_string(),
     };
-    ui.label(RichText::new(title).strong().size(15.5));
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).strong().size(15.5));
+        if any_stale {
+            ui.label(
+                RichText::new(llm_usage_core::model::STALE_MARKER)
+                    .color(Color32::from_rgb(220, 60, 60))
+                    .strong()
+                    .size(15.5),
+            );
+        }
+    });
 }
 
 fn render_daily_history_card(ui: &mut egui::Ui, history: &[(chrono::NaiveDate, f64)]) {
@@ -1029,10 +1041,10 @@ mod tests {
             "month",
             "today",
             "1h",
-            "week (Sonnet)",
+            "Sonnet",
             "5h",
             "week",
-            "week (Opus)",
+            "Opus",
             "unknown",
         ];
         labels.sort_by_key(|l| window_order(l));
@@ -1041,8 +1053,8 @@ mod tests {
             vec![
                 "5h",
                 "week",
-                "week (Sonnet)",
-                "week (Opus)",
+                "Sonnet",
+                "Opus",
                 "unknown",   // bucketed between quota & activity (50)
                 "1h",
                 "today",
