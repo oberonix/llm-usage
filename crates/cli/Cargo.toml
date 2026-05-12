@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# Binary-only crate — distributed as a built artifact, not via
+# crates.io. Marking unpublishable also lets cargo-deny accept
+# the path-deps below without insisting on explicit versions.
+publish = false
 
 [[bin]]
 name = "llm-usage"

@@ -1,0 +1,110 @@
+# cargo-deny configuration.
+#
+# Run locally with `cargo deny check` (install via `cargo install
+# cargo-deny --locked`). CI runs this on every push and PR via
+# `.github/workflows/ci.yml`.
+#
+# The three things this guards against:
+#   - **Advisories**: a transitive dep getting a CVE filed against it.
+#   - **Licenses**: a dep slipping in under GPL / AGPL / similar copyleft
+#     that would be incompatible with our MIT shipping plan.
+#   - **Sources**: a dep moving from crates.io to an arbitrary git
+#     fork without us noticing.
+#
+# Tune carefully — overly strict bans force a CI tantrum on every
+# patch-level reqwest bump.
+
+[graph]
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "aarch64-apple-darwin" },
+  { triple = "x86_64-apple-darwin" },
+]
+all-features = false
+no-default-features = false
+
+[advisories]
+# https://github.com/rustsec/advisory-db
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+# All of these are RustSec *unmaintained* advisories — informational
+# notes that a transitive crate's upstream has gone dormant, not
+# actual vulnerabilities. They're pulled in via tao/wry/gtk, which
+# is the standard GUI stack for tray apps on Linux; there's no
+# drop-in replacement available today. We pin them here so a real
+# CVE filed against any of them surfaces as a NEW (unignored)
+# advisory ID and fails CI.
+ignore = [
+  # gtk-rs GTK3 bindings (gtk, atk, gdk, gdk-pixbuf, gdkx11, gio, glib,
+  # gobject-sys, pango, etc.) — upstream pivoted to GTK4.
+  "RUSTSEC-2024-0411", "RUSTSEC-2024-0412", "RUSTSEC-2024-0413",
+  "RUSTSEC-2024-0414", "RUSTSEC-2024-0415", "RUSTSEC-2024-0416",
+  "RUSTSEC-2024-0417", "RUSTSEC-2024-0418", "RUSTSEC-2024-0419",
+  "RUSTSEC-2024-0420",
+  # derivative (no longer maintained, alternatives exist)
+  "RUSTSEC-2024-0388",
+  # fxhash (no longer maintained — rustc_hash is the replacement,
+  # but it's a transitive dep of egui/eframe; out of our hands).
+  "RUSTSEC-2025-0057",
+  # proc-macro-error (unmaintained — pulled in by some derive macros).
+  "RUSTSEC-2024-0370",
+  # instant (unmaintained, replaced by `web-time` for WASM; we're
+  # not WASM so the impact is nil).
+  "RUSTSEC-2024-0384",
+]
+
+[licenses]
+# Permissive licenses we're willing to ship. Anything outside this
+# set requires explicit triage. CC0-1.0 covers a few utility crates
+# in the ecosystem; Zlib is needed by `tinyvec_macros`.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "ISC",
+  "Unicode-3.0",
+  "CC0-1.0",
+  "Zlib",
+  "MPL-2.0",
+  "0BSD",
+  "Unlicense",
+  # webpki-roots ships the Mozilla CA bundle under CDLA-2.0.
+  "CDLA-Permissive-2.0",
+  # `epaint_default_fonts` ships Inter + Ubuntu Mono + similar under
+  # the standard font licenses. Both are permissive for redistribution.
+  "OFL-1.1",
+  "LicenseRef-UFL-1.0",
+]
+# `rookie` ships its MIT license via `license-file = "MIT-LICENSE.txt"`
+# rather than the SPDX `license = "MIT"` field, which cargo-deny
+# can't auto-resolve. Clarify here so we're explicit about what
+# we're shipping.
+[[licenses.clarify]]
+name = "rookie"
+expression = "MIT"
+license-files = [{ path = "MIT-LICENSE.txt", hash = 0xfe25c4f9 }]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+# Wildcards in *external* deps (e.g. `serde = "*"`) are a footgun;
+# path-deps inside the workspace are normal and explicit version
+# fields would be churn-for-no-benefit.
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+# Crates we never want pulled in (large, abandoned, or already
+# superseded). Add with a `reason` so future contributors understand.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

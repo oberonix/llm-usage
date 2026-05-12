@@ -75,6 +75,19 @@ jobs:
       - run: cargo install cargo-llvm-cov --locked
       - run: cargo llvm-cov --workspace --fail-under-lines $LINE_COVERAGE_FLOOR --summary-only
 
+  deps:
+    name: dep audit (licences / advisories / sources)
+    runs-on: ubuntu-latest
+    # cargo-deny is a single static binary; no GUI deps needed.
+    # Pins the action's release tag so a malicious tag move can't
+    # silently rewrite the audit step.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features --workspace
+
   build-macos:
     name: build (macos)
     runs-on: macos-latest
