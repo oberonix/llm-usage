@@ -287,6 +287,7 @@ impl Provider for AnthropicProvider {
                 .and_then(|b| b.last_good.clone());
             if let Some(usage) = snapshot_data {
                 apply_oauth_usage(&mut snap, &usage, now, &mut quota_headline);
+                mark_oauth_windows_stale(&mut snap);
                 serving_stale = true;
             }
             let remaining = self
@@ -313,6 +314,7 @@ impl Provider for AnthropicProvider {
                         // Serve last-good if any while we're in cooldown.
                         if let Some(usage) = b.last_good.clone() {
                             apply_oauth_usage(&mut snap, &usage, now, &mut quota_headline);
+                            mark_oauth_windows_stale(&mut snap);
                             serving_stale = true;
                         }
                     }
@@ -406,6 +408,26 @@ fn fill_quota_window(window: &mut WindowUsage, q: &QuotaBucket, now: DateTime<Ut
     window.fraction_used = Some(q.utilization / 100.0);
     window.ends_at = q.resets_at_utc();
     window.started_at = Some(now);
+}
+
+/// After `apply_oauth_usage` has populated the canonical quota windows
+/// from a backoff-cached response, mark them `stale = true` so the
+/// tray / CLI render a ⚠ marker — same channel as the merge-from-cache
+/// fallback in `UsageSnapshot::merge_stale_from`. Without this, a
+/// rate-limited 429 cooldown would surface the old fractions with a
+/// normal countdown, hiding from the user that the data is cached.
+fn mark_oauth_windows_stale(snap: &mut UsageSnapshot) {
+    let labels = [
+        WindowKind::FiveHourRolling.label(),
+        WindowKind::ThisWeek.label(),
+        "week (Sonnet)",
+        "week (Opus)",
+    ];
+    for label in labels {
+        if let Some(w) = snap.windows.get_mut(label) {
+            w.stale = true;
+        }
+    }
 }
 
 fn format_quota(label: &str, q: &QuotaBucket, now: DateTime<Utc>) -> String {
@@ -723,6 +745,46 @@ mod tests {
         assert!(headline.contains("5h 55%"), "got: {headline}");
         assert!(headline.contains("7d 58%"), "got: {headline}");
         assert!(!headline.contains("Sonnet"), "got: {headline}");
+    }
+
+    #[test]
+    fn mark_oauth_windows_stale_flags_canonical_labels() {
+        use crate::anthropic_oauth::{OAuthUsageResponse, QuotaBucket};
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        let usage = OAuthUsageResponse {
+            five_hour: Some(QuotaBucket {
+                utilization: 50.0,
+                resets_at: None,
+            }),
+            seven_day: Some(QuotaBucket {
+                utilization: 75.0,
+                resets_at: None,
+            }),
+            seven_day_sonnet: Some(QuotaBucket {
+                utilization: 20.0,
+                resets_at: None,
+            }),
+            seven_day_opus: None,
+            extra_usage: None,
+        };
+        let mut headline = String::new();
+        apply_oauth_usage(&mut snap, &usage, Utc::now(), &mut headline);
+        mark_oauth_windows_stale(&mut snap);
+
+        assert!(snap.window(WindowKind::FiveHourRolling).unwrap().stale);
+        assert!(snap.window(WindowKind::ThisWeek).unwrap().stale);
+        assert!(snap.windows.get("week (Sonnet)").unwrap().stale);
+        // week (Opus) wasn't populated → no entry to mark, but the
+        // helper must not panic on the missing key.
+        assert!(!snap.windows.contains_key("week (Opus)"));
     }
 
     #[test]
