@@ -673,33 +673,45 @@ fn render_windows_table(
 fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage) {
     match w.fraction_used {
         Some(frac) => {
+            // Disconnected-state recolour: a stale red-tier fill
+            // collapses to grey so the bar reads "we know it was
+            // exhausted, we just don't have fresh data" rather than
+            // "currently in the red right now".
+            let fill = if w.stale && frac >= 0.85 {
+                Color32::from_gray(120)
+            } else {
+                fraction_color(frac)
+            };
             let bar = egui::ProgressBar::new(frac.min(1.0) as f32)
                 .desired_width(220.0)
-                .fill(fraction_color(frac))
+                .fill(fill)
                 .text(
                     RichText::new(format!("{:.0}%", frac * 100.0))
                         .size(11.0)
                         .strong(),
                 );
             ui.add(bar);
+            // Reset countdown still shows when we know it, even for
+            // stale rows — the user wants to know when fresh data
+            // should be arriving. `secs.max(0)` clamps a lapsed
+            // resets_at to "0m" rather than going negative.
+            if let Some(ends) = w.ends_at {
+                let secs = (ends - chrono::Utc::now()).num_seconds();
+                if secs > 0 || w.stale {
+                    ui.weak(reset_label(secs.max(0)));
+                }
+            }
             if w.stale {
-                // Fraction came from a cached snapshot rather than the
-                // current poll. Surface the warning in place of the
-                // reset countdown — the countdown would be misleading
-                // since the underlying data is the previous window's.
+                // Red warning marker draws the eye to the
+                // disconnected state independent of the bar tier.
                 ui.label(
                     RichText::new(format!(
                         "{} stale",
                         llm_usage_core::model::STALE_MARKER
                     ))
-                    .color(Color32::from_rgb(240, 180, 60))
+                    .color(Color32::from_rgb(220, 60, 60))
                     .strong(),
                 );
-            } else if let Some(ends) = w.ends_at {
-                let secs = (ends - chrono::Utc::now()).num_seconds();
-                if secs > 0 {
-                    ui.weak(reset_label(secs));
-                }
             }
             if let Some(spend) = w.spend_usd {
                 ui.label(

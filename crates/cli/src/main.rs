@@ -318,8 +318,7 @@ fn format_footer(
     let body = match updated_at {
         Some(t) => {
             let updated = t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string();
-            let age = (now.with_timezone(&chrono::Utc) - t).num_seconds().max(0);
-            format!("updated {} ({}) · refreshed {}", updated, format_age(age), refreshed)
+            format!("updated {} · refreshed {}", updated, refreshed)
         }
         // First paint with no snapshot file on disk: the previous
         // "last refreshed" phrasing is still the right thing to show
@@ -330,18 +329,6 @@ fn format_footer(
         format!("\x1b[90m{}\x1b[0m", body)
     } else {
         body
-    }
-}
-
-fn format_age(secs: i64) -> String {
-    if secs < 60 {
-        format!("{}s ago", secs)
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86_400)
     }
 }
 
@@ -393,16 +380,32 @@ fn format_quota_row(label: &str, w: &WindowUsage, use_color: bool) -> String {
     let now = chrono::Utc::now();
     let frac = w.fraction_used.unwrap_or(0.0);
     let pace_idx = pace_index(label, w, now, 10);
-    let bar = colored_bar(frac, 10, pace_idx, use_color);
+    let bar = colored_bar(frac, 10, pace_idx, w.stale, use_color);
     let pct_raw = format!("{:>3.0}%", frac * 100.0);
     let pct = if use_color {
-        format!("{}{}\x1b[0m", color_for(frac), pct_raw)
+        // Disconnected-state recolour: a stale red-tier reading
+        // (the typical Codex "quota was exhausted at last poll"
+        // case) drops to grey so the row reads "we know it was
+        // hit, we just don't have fresh data" rather than
+        // "currently red-alarm right now".
+        let col = if w.stale && frac >= RED_THRESHOLD {
+            DIM_GRAY
+        } else {
+            color_for(frac)
+        };
+        format!("{}{}\x1b[0m", col, pct_raw)
     } else {
         pct_raw
     };
-    let suffix = quota_suffix(w, now);
+    let suffix = quota_suffix(w, now, use_color);
     format!("{} {} · {}{}", bar, pct, label, suffix)
 }
+
+/// Threshold above which a fraction is in the red-tier of the
+/// green/amber/red ramp. Kept as a const so `colored_bar` and
+/// `format_quota_row` agree on the boundary.
+const RED_THRESHOLD: f64 = 0.85;
+const DIM_GRAY: &str = "\x1b[90m";
 
 // Cell index (0..cells) of the pacing marker, given how much of the
 // underlying window has elapsed. Mirrors the tray icon's pace logic
@@ -428,7 +431,9 @@ fn pace_index(
 }
 
 // 10-cell bar with two layers of colour when `use_color`:
-//   - filled pips get the same green/amber/red ramp as the % text
+//   - filled pips get the same green/amber/red ramp as the % text,
+//     EXCEPT a stale red-tier reading drops to grey so the bar reads
+//     "known-disconnected" rather than "currently in the red"
 //   - one pip (at `pace_idx`) is painted magenta to mark where the
 //     time window currently sits. Glyph follows the underlying
 //     fill: a `▰` when the marker overlaps the filled region (so
@@ -438,7 +443,13 @@ fn pace_index(
 // In plain-text mode (output piped, NO_COLOR set, redirect, etc.)
 // we return the unstyled `▰`/`▱` glyphs and drop the pace marker
 // — a magenta cell-shape would otherwise be invisible.
-fn colored_bar(fraction: f64, cells: usize, pace_idx: Option<usize>, use_color: bool) -> String {
+fn colored_bar(
+    fraction: f64,
+    cells: usize,
+    pace_idx: Option<usize>,
+    stale: bool,
+    use_color: bool,
+) -> String {
     let frac = fraction.clamp(0.0, 1.0);
     let filled = ((frac * cells as f64).round() as usize).min(cells);
     if !use_color {
@@ -446,7 +457,11 @@ fn colored_bar(fraction: f64, cells: usize, pace_idx: Option<usize>, use_color: 
     }
     const PACE: &str = "\x1b[35m"; // magenta — distinct from green/amber/red
     const RESET: &str = "\x1b[0m";
-    let fill_color = color_for(frac);
+    let fill_color = if stale && frac >= RED_THRESHOLD {
+        DIM_GRAY
+    } else {
+        color_for(frac)
+    };
     let mut s = String::with_capacity(cells * 8);
     for i in 0..cells {
         if pace_idx == Some(i) {
@@ -465,17 +480,50 @@ fn colored_bar(fraction: f64, cells: usize, pace_idx: Option<usize>, use_color: 
     s
 }
 
-// Mirrors `quota_suffix` in the tray crate — see the comment there.
-//   stale flag → " · ⚠"
-//   future     → " · 2h"
-//   otherwise  → ""
-fn quota_suffix(w: &WindowUsage, now: chrono::DateTime<chrono::Utc>) -> String {
-    if w.stale {
-        return format!(" · {}", llm_usage_core::model::STALE_MARKER);
+// Trailing tokens on a quota row.
+//
+//   fresh + future ends_at → " · 2h"
+//   stale + future ends_at → " · 2h · ⚠"        (we still know when
+//                                                  fresh data is due,
+//                                                  the ⚠ just says
+//                                                  "we don't have it
+//                                                  yet")
+//   stale + past   ends_at → " · 0m · ⚠"        (should-have-rolled,
+//                                                  no fresh poll)
+//   stale + no ends_at     → " · ⚠"
+//   otherwise              → ""
+//
+// The ⚠ is wrapped in ANSI red when `use_color` is on — distinct
+// from the fill colours so it draws the eye to the disconnected
+// state independent of the percentage tier.
+fn quota_suffix(
+    w: &WindowUsage,
+    now: chrono::DateTime<chrono::Utc>,
+    use_color: bool,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = w.ends_at {
+        let secs = (t - now).num_seconds().max(0);
+        // For fresh rows, skip the countdown when it would be 0
+        // (window literally just rolled); for stale rows, show 0m
+        // because "0 minutes to reset" is the user's signal that
+        // fresh data should be arriving any moment.
+        if secs > 0 || w.stale {
+            parts.push(format_reset(secs));
+        }
     }
-    match w.ends_at {
-        Some(t) if t > now => format!(" · {}", format_reset((t - now).num_seconds())),
-        _ => String::new(),
+    if w.stale {
+        let mark = llm_usage_core::model::STALE_MARKER;
+        parts.push(if use_color {
+            format!("\x1b[31m{}\x1b[0m", mark)
+        } else {
+            mark.to_string()
+        });
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
     }
 }
 
@@ -574,15 +622,62 @@ mod tests {
     }
 
     #[test]
-    fn quota_suffix_dispatches_on_stale_flag() {
+    fn quota_suffix_fresh_shows_only_countdown() {
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
         w.ends_at = Some(now + chrono::Duration::hours(2));
-        assert!(quota_suffix(&w, now).contains("2h"));
+        let s = quota_suffix(&w, now, false);
+        assert!(s.contains("2h"), "got {:?}", s);
+        assert!(!s.contains("⚠"), "got {:?}", s);
+    }
+
+    #[test]
+    fn quota_suffix_stale_with_future_ends_at_shows_both() {
+        // The whole point of the stale rework: even when we don't
+        // have fresh data, the recorded reset time tells the user
+        // when to expect a refresh. Show both the countdown and the
+        // ⚠ together, separated by " · ".
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        w.ends_at = Some(now + chrono::Duration::hours(1));
         w.stale = true;
-        assert!(quota_suffix(&w, now).contains("⚠"));
-        // Stale wins over countdown.
-        assert!(!quota_suffix(&w, now).contains("2h"));
+        let s = quota_suffix(&w, now, false);
+        assert!(s.contains("1h"), "expected countdown: {:?}", s);
+        assert!(s.contains("⚠"), "expected warning: {:?}", s);
+    }
+
+    #[test]
+    fn quota_suffix_stale_with_past_ends_at_shows_zero_minute_floor() {
+        // Past resets_at + stale → "0m" floor so the user reads
+        // "should have reset by now, no fresh data" rather than
+        // a negative or hidden countdown.
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        w.ends_at = Some(now - chrono::Duration::minutes(10));
+        w.stale = true;
+        let s = quota_suffix(&w, now, false);
+        assert!(s.contains("0m"), "expected 0m floor: {:?}", s);
+        assert!(s.contains("⚠"), "got {:?}", s);
+    }
+
+    #[test]
+    fn quota_suffix_stale_no_ends_at_shows_only_warning() {
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        w.stale = true;
+        let s = quota_suffix(&w, now, false);
+        assert_eq!(s, " · ⚠");
+    }
+
+    #[test]
+    fn quota_suffix_colors_warning_red_under_use_color() {
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        w.stale = true;
+        let s = quota_suffix(&w, now, /*use_color*/ true);
+        // ANSI red is \x1b[31m. Surrounded by reset to avoid
+        // bleed into the trailing layout.
+        assert!(s.contains("\x1b[31m") && s.contains("\x1b[0m"), "got {:?}", s);
     }
 
     #[test]
@@ -591,21 +686,43 @@ mod tests {
         // anyone piping to grep / a file isn't surprised by escape
         // codes — and a purple pace marker would just look like an
         // extra unit of usage.
-        let plain = colored_bar(0.4, 10, Some(7), /*use_color*/ false);
+        let plain = colored_bar(0.4, 10, Some(7), /*stale*/ false, /*use_color*/ false);
         assert_eq!(plain, unicode_bar(0.4, 10));
     }
 
     #[test]
     fn colored_bar_paints_fill_with_threshold_color() {
         // 40 % usage → green ramp. ANSI green is \x1b[32m.
-        let s = colored_bar(0.4, 10, None, true);
+        let s = colored_bar(0.4, 10, None, false, true);
         assert!(s.contains("\x1b[32m"), "expected green: {:?}", s);
         // 70 % → amber.
-        let s = colored_bar(0.7, 10, None, true);
+        let s = colored_bar(0.7, 10, None, false, true);
         assert!(s.contains("\x1b[33m"), "expected amber: {:?}", s);
         // 95 % → red.
-        let s = colored_bar(0.95, 10, None, true);
+        let s = colored_bar(0.95, 10, None, false, true);
         assert!(s.contains("\x1b[31m"), "expected red: {:?}", s);
+    }
+
+    #[test]
+    fn colored_bar_stale_red_tier_drops_to_grey() {
+        // A stale ≥85 % reading is the disconnected-Codex case —
+        // gray out the fill so the row reads "known-old" instead
+        // of "currently in the red".
+        let s = colored_bar(0.95, 10, None, /*stale*/ true, true);
+        assert!(s.contains("\x1b[90m"), "expected dim grey: {:?}", s);
+        // Original red ANSI must not appear.
+        assert!(!s.contains("\x1b[31m"), "red leaked through: {:?}", s);
+    }
+
+    #[test]
+    fn colored_bar_stale_green_and_amber_keep_their_colour() {
+        // Only the red tier collapses to grey when stale. A 30 %
+        // reading that's gone stale (rare but possible) still shows
+        // green — graying everything would lose the threshold signal.
+        let s = colored_bar(0.30, 10, None, /*stale*/ true, true);
+        assert!(s.contains("\x1b[32m"), "expected green retained: {:?}", s);
+        let s = colored_bar(0.70, 10, None, /*stale*/ true, true);
+        assert!(s.contains("\x1b[33m"), "expected amber retained: {:?}", s);
     }
 
     #[test]
@@ -614,7 +731,7 @@ mod tests {
         // takes the outline `▱` shape so a glance reads "still
         // empty, but here's where time says you should be" rather
         // than "extra unit of usage in a different colour."
-        let s = colored_bar(0.4, 10, Some(7), true);
+        let s = colored_bar(0.4, 10, Some(7), false, true);
         assert!(s.contains("\x1b[35m"), "expected magenta pace marker: {:?}", s);
         assert_eq!(s.matches('▰').count(), 4, "got {:?}", s);
         assert_eq!(s.matches('▱').count(), 6, "got {:?}", s);
@@ -626,7 +743,7 @@ mod tests {
         // filled `▰` so it stays visible against the surrounding
         // ▰ pips (a magenta `▱` would visually punch a hole in the
         // fill, misreading as "this cell isn't actually used").
-        let s = colored_bar(0.8, 10, Some(3), true);
+        let s = colored_bar(0.8, 10, Some(3), false, true);
         assert!(s.contains("\x1b[35m"));
         assert_eq!(s.matches('▰').count(), 8, "got {:?}", s);
         assert_eq!(s.matches('▱').count(), 2, "got {:?}", s);
@@ -638,7 +755,7 @@ mod tests {
         // *unfilled* cell, so it should render as the outline `▱`.
         // 40 % fill (4 cells) with pace at idx 4 → that one cell is
         // a magenta `▱`.
-        let s = colored_bar(0.4, 10, Some(4), true);
+        let s = colored_bar(0.4, 10, Some(4), false, true);
         assert!(s.contains("\x1b[35m"));
         assert_eq!(s.matches('▰').count(), 4);
         assert_eq!(s.matches('▱').count(), 6);
@@ -811,12 +928,13 @@ mod tests {
         snaps.insert(ProviderId::CodexCli, make_snapshot(ProviderId::CodexCli));
         let upstream = chrono::Utc::now() - chrono::Duration::seconds(45);
         let s = build_screen(&snaps, Some(upstream), false, false);
-        // "updated HH:MM:SS (45s ago) · refreshed HH:MM:SS"
+        // "updated HH:MM:SS · refreshed HH:MM:SS"
         assert!(s.contains("updated "), "got: {}", s);
         assert!(s.contains("refreshed "), "got: {}", s);
+        // No (Ns ago) chip — the two timestamps are enough.
         assert!(
-            s.contains("ago)"),
-            "expected relative-age annotation: {}",
+            !s.contains(" ago"),
+            "footer should no longer carry the relative-age chip: {}",
             s
         );
         assert!(
@@ -835,11 +953,12 @@ mod tests {
         let upstream = now_local.with_timezone(&chrono::Utc) - chrono::Duration::seconds(52);
         let out = format_footer(Some(upstream), now_local, /*use_color*/ false);
         assert!(out.contains("updated "), "got: {}", out);
-        assert!(out.contains("(52s ago)"), "got: {}", out);
         assert!(out.contains("refreshed 09:43:01"), "got: {}", out);
-        // Em-mid separator between the two timestamps so it scans as
+        // Mid-dot separator between the two timestamps so it scans as
         // a single "data freshness vs display freshness" line.
         assert!(out.contains(" · "), "got: {}", out);
+        // No more "ago" annotation.
+        assert!(!out.contains("ago"), "got: {}", out);
     }
 
     #[test]
@@ -859,18 +978,4 @@ mod tests {
         assert!(out.contains("\x1b[90m") && out.ends_with("\x1b[0m"), "got: {}", out);
     }
 
-    #[test]
-    fn format_age_buckets_match_short_scales() {
-        assert_eq!(format_age(0), "0s ago");
-        assert_eq!(format_age(45), "45s ago");
-        assert_eq!(format_age(60), "1m ago");
-        assert_eq!(format_age(3599), "59m ago");
-        assert_eq!(format_age(3600), "1h ago");
-        assert_eq!(format_age(86_399), "23h ago");
-        assert_eq!(format_age(86_400), "1d ago");
-        // Negative values should never appear, but if they do (clock
-        // skew) the caller clamps to 0 before calling here. Confirm
-        // the helper itself doesn't panic on a stray negative.
-        assert_eq!(format_age(-30), "-30s ago");
-    }
 }
