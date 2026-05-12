@@ -264,7 +264,7 @@ impl ConfigDraft {
 
         section_header(ui, "Polling & display");
         provider_card(ui, neutral_tint(), |ui| {
-            field_row(ui, "Refresh every", |ui| {
+            field_row(ui, "Max refresh every", |ui| {
                 interval_combo(
                     ui,
                     "poll_interval",
@@ -274,8 +274,12 @@ impl ConfigDraft {
             });
             help(
                 ui,
-                "How often providers are polled. Anthropic's OAuth endpoint \
-                 rate-limits aggressive polling \u{2014} short intervals back off automatically.",
+                "Upper bound on how often providers are polled when nothing else \
+                 has changed. The tray watches Claude Code / Codex / opencode \
+                 data files and refreshes within ~1\u{00A0}second of writes, so \
+                 this interval mostly applies during idle periods. HTTP endpoints \
+                 (Anthropic OAuth, Ollama Cloud) are throttled to one call per \
+                 minute regardless to avoid rate limits.",
             );
             field_row(ui, "Tray rotates every", |ui| {
                 interval_combo(
