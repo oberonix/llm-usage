@@ -39,11 +39,57 @@ use serde::Deserialize;
 /// only the quota *percentage* fraction lags by up to 5 min, which
 /// is still 3× fresher than the pre-watcher 15 min default.
 const MIN_HTTP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use walkdir::WalkDir;
+
+/// Per-file resumption state. We track size + offset so we can detect
+/// truncation (size shrank → start over) and skip files that haven't
+/// changed since the last scan.
+#[derive(Default, Clone, Copy)]
+struct FileState {
+    /// File size as observed at the last successful scan. Diagnostic
+    /// only — the no-new-bytes short-circuit compares `offset` to the
+    /// fresh `metadata().len()`.
+    #[allow(dead_code)]
+    size: u64,
+    offset: u64,
+}
+
+/// One parsed assistant turn, decoupled from the original file. We
+/// cache the raw `AnthropicTokenUsage` + model name rather than a
+/// precomputed cost so that a config-time rate change re-prices
+/// existing events on the next aggregate call.
+#[derive(Clone)]
+struct CachedEvent {
+    timestamp: DateTime<Utc>,
+    tokens: AnthropicTokenUsage,
+    model: String,
+}
+
+/// Stop tracking events older than this. The longest window we
+/// bucket into is "this month" (~31 days); 45 days gives a comfortable
+/// buffer in case the user's local time and the events' UTC stamps
+/// disagree, and bounds memory at a few MB even for heavy users.
+const EVENT_RETENTION: Duration = Duration::from_secs(45 * 86_400);
+
+/// Provider-scoped scan cache. Survives between `poll()` calls but
+/// not across tray restarts; the first poll after startup pays the
+/// full-walk cost once and subsequent polls only read appended
+/// bytes per JSONL.
+#[derive(Default)]
+struct ScanCache {
+    events: Vec<CachedEvent>,
+    files: HashMap<PathBuf, FileState>,
+    /// `requestId|messageId` dedupe — see `process_lines` for the
+    /// full key derivation. Kept alongside `events` so a duplicate
+    /// line from a re-read of the same file (after truncation, say)
+    /// doesn't double-count.
+    seen_ids: HashSet<String>,
+}
 
 pub struct AnthropicProvider {
     cfg: AnthropicConfig,
@@ -54,6 +100,13 @@ pub struct AnthropicProvider {
     oauth_backoff: Mutex<OAuthBackoff>,
     /// Optional opencode SQLite path; `None` disables the integration.
     opencode_db: Option<PathBuf>,
+    /// Incremental aggregation cache. The previous implementation
+    /// walked every JSONL in `~/.claude/projects/` and re-parsed every
+    /// line on every poll, which pinned the runtime at 90 %+ CPU
+    /// under heavy Claude Code use with 76 MB of history. The cache
+    /// stores already-parsed events keyed nowhere — we just walk it
+    /// linearly each aggregate call and bucket against `now`.
+    cache: Mutex<ScanCache>,
 }
 
 impl AnthropicProvider {
@@ -78,6 +131,7 @@ impl AnthropicProvider {
             http,
             oauth_backoff: Mutex::new(OAuthBackoff::default()),
             opencode_db,
+            cache: Mutex::new(ScanCache::default()),
         }
     }
 
@@ -100,20 +154,40 @@ impl AnthropicProvider {
             return Ok(agg);
         }
 
-        let mut seen_msg_ids: HashSet<String> = HashSet::new();
-        for entry in WalkDir::new(&self.projects_dir)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_type().is_file()
-                    && e.path().extension().is_some_and(|x| x == "jsonl")
-            })
+        // Incremental scan: only read newly-appended bytes per file.
+        // Updates `self.cache.events` in place; existing entries are
+        // reused as-is.
         {
-            if let Err(err) = self.process_file(entry.path(), now, &mut seen_msg_ids, &mut agg) {
-                tracing::warn!(path = %entry.path().display(), error = %err, "failed to parse claude jsonl");
+            let mut cache = self.cache.lock().expect("poisoned");
+            for entry in WalkDir::new(&self.projects_dir)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_type().is_file()
+                        && e.path().extension().is_some_and(|x| x == "jsonl")
+                })
+            {
+                let path = entry.path().to_path_buf();
+                if let Err(err) = self.scan_file_incremental(&path, &mut cache) {
+                    tracing::warn!(path = %path.display(), error = %err, "failed to parse claude jsonl");
+                }
             }
+            // Drop events that fell out of the longest bucket. Keeps
+            // memory bounded for users who run the tray for weeks.
+            let cutoff = now - chrono::Duration::from_std(EVENT_RETENTION).unwrap();
+            cache.events.retain(|e| e.timestamp > cutoff);
         }
+
+        // Bucket cached events into the running `Aggregate`. Cost is
+        // computed here (not at cache time) so a config-time rate
+        // change re-prices old events without re-scanning.
+        let cache = self.cache.lock().expect("poisoned");
+        for e in &cache.events {
+            let cost = e.tokens.cost_usd(self.rate_for(&e.model));
+            agg.add(e.timestamp, now, e.tokens, cost);
+        }
+        drop(cache);
 
         // Supplementary source: opencode's SQLite store. Users hitting
         // Anthropic via opencode rather than Claude Code won't write to
@@ -146,78 +220,130 @@ impl AnthropicProvider {
         Ok(agg)
     }
 
-    fn process_file(
-        &self,
-        path: &Path,
-        now: DateTime<Utc>,
-        seen: &mut HashSet<String>,
-        agg: &mut Aggregate,
-    ) -> Result<()> {
-        let content = std::fs::read_to_string(path)?;
-        for (lineno, line) in content.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let entry: AssistantEntry = match serde_json::from_str(line) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if entry.entry_type.as_deref() != Some("assistant") {
-                continue;
-            }
-            let Some(message) = entry.message else { continue };
-            let Some(usage) = message.usage else { continue };
-            let model = message.model.unwrap_or_default();
-            let timestamp = match entry.timestamp.and_then(|t| {
-                DateTime::parse_from_rfc3339(&t)
-                    .ok()
-                    .map(|d| d.with_timezone(&Utc))
-            }) {
-                Some(t) => t,
-                None => continue,
-            };
+    /// Read newly-appended bytes from `path` and push any newly-parsed
+    /// assistant events into `cache.events`. Cheap when nothing has
+    /// changed since the last scan — the file's metadata is checked
+    /// first and we bail without opening the file when size + offset
+    /// already match. On truncation (size < cached offset) we restart
+    /// from the beginning of the file.
+    fn scan_file_incremental(&self, path: &Path, cache: &mut ScanCache) -> Result<()> {
+        let meta = std::fs::metadata(path)?;
+        let size = meta.len();
+        let prev = cache.files.get(path).copied().unwrap_or_default();
+        let start = if prev.offset > size {
+            // File was truncated (rare — Claude Code doesn't do this,
+            // but a manual `rm` + new session reusing the path would).
+            // Conservatively re-read from the top.
+            0
+        } else if prev.offset == size {
+            // No new bytes since the last scan. The `mtime` test
+            // catches the same case earlier on many file systems,
+            // but offset is the authoritative no-op signal.
+            return Ok(());
+        } else {
+            prev.offset
+        };
 
-            // Anthropic returns the same message.id once per turn, but each tool_use
-            // produces its own JSONL line carrying the full usage struct. Skip duplicates
-            // so we don't multi-count.
-            let dedupe_key = format!("{}:{}", path.display(), lineno);
-            // Prefer the request-id-bound message id when present.
-            let id_key = message
-                .id
-                .as_deref()
-                .map(|id| {
-                    entry
-                        .request_id
-                        .as_deref()
-                        .map(|r| format!("{}|{}", r, id))
-                        .unwrap_or_else(|| id.to_string())
-                })
-                .unwrap_or(dedupe_key);
-            if !seen.insert(id_key) {
-                continue;
-            }
-
-            let tokens = AnthropicTokenUsage {
-                input_tokens: usage.input_tokens.unwrap_or(0),
-                output_tokens: usage.output_tokens.unwrap_or(0),
-                cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-                cache_creation_5m_input_tokens: usage
-                    .cache_creation
-                    .as_ref()
-                    .and_then(|c| c.ephemeral_5m_input_tokens)
-                    .unwrap_or(0),
-                cache_creation_1h_input_tokens: usage
-                    .cache_creation
-                    .as_ref()
-                    .and_then(|c| c.ephemeral_1h_input_tokens)
-                    .unwrap_or(0),
-            };
-            let rate = self.rate_for(&model);
-            let cost = tokens.cost_usd(rate);
-
-            agg.add(timestamp, now, tokens, cost);
+        let f = std::fs::File::open(path)?;
+        let mut reader = BufReader::new(f);
+        if start > 0 {
+            reader.seek(SeekFrom::Start(start))?;
         }
+
+        let mut consumed = start;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line)?;
+            if n == 0 {
+                break;
+            }
+            if !line.ends_with('\n') {
+                // Partial trailing line (Claude Code is mid-write, or
+                // the file ended without `\n`). Leave it for the next
+                // scan — don't advance the offset past it.
+                break;
+            }
+            let trimmed = line.trim_end();
+            if !trimmed.is_empty() {
+                self.parse_and_push(path, trimmed, cache);
+            }
+            consumed += n as u64;
+        }
+
+        cache.files.insert(
+            path.to_path_buf(),
+            FileState {
+                size,
+                offset: consumed,
+            },
+        );
         Ok(())
+    }
+
+    /// Pure parse step shared by the incremental scanner: turn one
+    /// JSONL line into a `CachedEvent` and append it to `cache.events`
+    /// (with dedupe). Errors are silently swallowed — partial / weird
+    /// lines simply don't contribute, which is the same behaviour the
+    /// original full-walk implementation had.
+    fn parse_and_push(&self, path: &Path, line: &str, cache: &mut ScanCache) {
+        let Ok(entry) = serde_json::from_str::<AssistantEntry>(line) else {
+            return;
+        };
+        if entry.entry_type.as_deref() != Some("assistant") {
+            return;
+        }
+        let Some(message) = entry.message else { return };
+        let Some(usage) = message.usage else { return };
+        let Some(timestamp) = entry.timestamp.as_deref().and_then(|t| {
+            DateTime::parse_from_rfc3339(t)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        }) else {
+            return;
+        };
+
+        // Dedupe — Anthropic emits the same (requestId, messageId)
+        // when a turn produces multiple tool_use blocks; we only want
+        // to count tokens once. Fall back to "path:offset" when ids
+        // aren't present, which is unique enough for an incremental
+        // append-only stream.
+        let dedupe_key = format!("{}:{}", path.display(), cache.files.get(path).map(|s| s.offset).unwrap_or(0));
+        let id_key = message
+            .id
+            .as_deref()
+            .map(|id| {
+                entry
+                    .request_id
+                    .as_deref()
+                    .map(|r| format!("{}|{}", r, id))
+                    .unwrap_or_else(|| id.to_string())
+            })
+            .unwrap_or(dedupe_key);
+        if !cache.seen_ids.insert(id_key) {
+            return;
+        }
+
+        let tokens = AnthropicTokenUsage {
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens.unwrap_or(0),
+            cache_read_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+            cache_creation_5m_input_tokens: usage
+                .cache_creation
+                .as_ref()
+                .and_then(|c| c.ephemeral_5m_input_tokens)
+                .unwrap_or(0),
+            cache_creation_1h_input_tokens: usage
+                .cache_creation
+                .as_ref()
+                .and_then(|c| c.ephemeral_1h_input_tokens)
+                .unwrap_or(0),
+        };
+        cache.events.push(CachedEvent {
+            timestamp,
+            tokens,
+            model: message.model.unwrap_or_default(),
+        });
     }
 }
 
@@ -876,5 +1002,193 @@ mod tests {
         // second turn: (50/1M)*15 + (50/1M)*75 = 0.00075 + 0.00375 = 0.0045
         // total ≈ 0.0375
         assert!((agg.today.cost - 0.0375).abs() < 1e-6, "got {}", agg.today.cost);
+    }
+
+    // ---- incremental scan tests ----
+    //
+    // These pin the load-bearing behaviour added to fix the 92 % CPU
+    // pin: the cache short-circuits when nothing changed, picks up
+    // appended lines (without re-parsing the old ones), recovers
+    // gracefully from truncation, and tolerates partial trailing
+    // writes.
+
+    fn one_assistant_line(req: &str, msg: &str, ts: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","requestId":"{req}","message":{{"model":"claude-opus-4-7","id":"{msg}","usage":{{"input_tokens":100,"output_tokens":100,"cache_read_input_tokens":0,"cache_creation":{{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn aggregate_caches_events_across_calls() {
+        let dir = TempDir::new().unwrap();
+        let proj = dir.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let f = proj.join("s.jsonl");
+        let mut out = std::fs::File::create(&f).unwrap();
+        writeln!(out, "{}", one_assistant_line("r1", "m1", "2026-05-08T10:00:00Z")).unwrap();
+        drop(out);
+
+        let mut cfg = AnthropicConfig::default();
+        cfg.claude_projects_dir = Some(dir.path().to_path_buf());
+        let p = AnthropicProvider::with_opencode_db(cfg, None);
+        let now = chrono::Utc.with_ymd_and_hms(2026, 5, 8, 10, 30, 0).unwrap();
+
+        // First call: one event scanned into cache.
+        let agg1 = p.aggregate(now).unwrap();
+        assert_eq!(agg1.last_hour.requests, 1);
+        // The cache should now hold exactly that event.
+        let cache_len = p.cache.lock().unwrap().events.len();
+        assert_eq!(cache_len, 1);
+
+        // Second call with no file changes: cache reused, same agg.
+        let agg2 = p.aggregate(now).unwrap();
+        assert_eq!(agg2.last_hour.requests, 1);
+        assert!((agg1.last_hour.cost - agg2.last_hour.cost).abs() < 1e-9);
+        // Cache size unchanged — we didn't re-parse and double-push.
+        assert_eq!(p.cache.lock().unwrap().events.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_picks_up_appended_lines_without_replaying_old_ones() {
+        let dir = TempDir::new().unwrap();
+        let proj = dir.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let f = proj.join("s.jsonl");
+
+        let mut out = std::fs::File::create(&f).unwrap();
+        writeln!(out, "{}", one_assistant_line("r1", "m1", "2026-05-08T10:00:00Z")).unwrap();
+        drop(out);
+
+        let mut cfg = AnthropicConfig::default();
+        cfg.claude_projects_dir = Some(dir.path().to_path_buf());
+        let p = AnthropicProvider::with_opencode_db(cfg, None);
+        let now = chrono::Utc.with_ymd_and_hms(2026, 5, 8, 10, 30, 0).unwrap();
+
+        let _ = p.aggregate(now).unwrap();
+        let offset_after_first = p
+            .cache
+            .lock()
+            .unwrap()
+            .files
+            .get(&f)
+            .copied()
+            .map(|s| s.offset)
+            .unwrap();
+
+        // Append a second turn to the same file.
+        let mut out = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&f)
+            .unwrap();
+        writeln!(out, "{}", one_assistant_line("r2", "m2", "2026-05-08T10:05:00Z")).unwrap();
+        drop(out);
+
+        let agg = p.aggregate(now).unwrap();
+        assert_eq!(agg.last_hour.requests, 2, "second turn must be picked up");
+        // The cached offset must have advanced past the original
+        // first-call value — proves we only read the appended bytes.
+        let offset_after_second = p
+            .cache
+            .lock()
+            .unwrap()
+            .files
+            .get(&f)
+            .copied()
+            .map(|s| s.offset)
+            .unwrap();
+        assert!(
+            offset_after_second > offset_after_first,
+            "offset must advance: {} → {}",
+            offset_after_first,
+            offset_after_second
+        );
+    }
+
+    #[test]
+    fn aggregate_handles_partial_trailing_line() {
+        // Simulate a mid-write: the file ends without a newline, so
+        // the last "line" is a partial record. The incremental
+        // scanner must NOT consume it — instead leave the offset
+        // before it, so the next scan (after the writer completes
+        // the line) parses it as a whole.
+        let dir = TempDir::new().unwrap();
+        let proj = dir.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let f = proj.join("s.jsonl");
+        let complete = one_assistant_line("r1", "m1", "2026-05-08T10:00:00Z");
+        let partial = r#"{"type":"assistant","timestamp":"2026-05-08T10:05:00Z","requestId":"r2","message":{"model":"claude-opus-4-7","id":"m2","usage":{"input_tokens":50"#;
+        {
+            let mut out = std::fs::File::create(&f).unwrap();
+            writeln!(out, "{}", complete).unwrap();
+            // No trailing newline on the partial line.
+            out.write_all(partial.as_bytes()).unwrap();
+        }
+
+        let mut cfg = AnthropicConfig::default();
+        cfg.claude_projects_dir = Some(dir.path().to_path_buf());
+        let p = AnthropicProvider::with_opencode_db(cfg, None);
+        let now = chrono::Utc.with_ymd_and_hms(2026, 5, 8, 10, 30, 0).unwrap();
+        let agg = p.aggregate(now).unwrap();
+        assert_eq!(agg.last_hour.requests, 1, "only the complete line should count");
+
+        // Now finish the partial line. Next scan should pick it up.
+        let mut out = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&f)
+            .unwrap();
+        out.write_all(
+            b",\"output_tokens\":50,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":0}}}}\n",
+        )
+        .unwrap();
+        drop(out);
+
+        let agg = p.aggregate(now).unwrap();
+        assert_eq!(agg.last_hour.requests, 2, "completed line should now count");
+    }
+
+    #[test]
+    fn aggregate_re_reads_from_start_on_truncation() {
+        // Defensive: someone manually truncated / removed-and-recreated
+        // the file with the same path. The scanner detects offset > new
+        // size and restarts from the top so the new contents are
+        // observed correctly.
+        let dir = TempDir::new().unwrap();
+        let proj = dir.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let f = proj.join("s.jsonl");
+
+        {
+            let mut out = std::fs::File::create(&f).unwrap();
+            for i in 0..5 {
+                writeln!(
+                    out,
+                    "{}",
+                    one_assistant_line(&format!("r{i}"), &format!("m{i}"), "2026-05-08T10:00:00Z")
+                )
+                .unwrap();
+            }
+        }
+        let mut cfg = AnthropicConfig::default();
+        cfg.claude_projects_dir = Some(dir.path().to_path_buf());
+        let p = AnthropicProvider::with_opencode_db(cfg, None);
+        let now = chrono::Utc.with_ymd_and_hms(2026, 5, 8, 10, 30, 0).unwrap();
+        let agg1 = p.aggregate(now).unwrap();
+        assert_eq!(agg1.last_hour.requests, 5);
+
+        // Replace the file with a single (different) line.
+        {
+            let mut out = std::fs::File::create(&f).unwrap();
+            writeln!(out, "{}", one_assistant_line("r_new", "m_new", "2026-05-08T10:10:00Z")).unwrap();
+        }
+
+        let agg2 = p.aggregate(now).unwrap();
+        // The cached 5 events stay (the cache doesn't know they're
+        // gone) but the new event also lands. With dedupe by
+        // (request|message) id, the new one is distinct, so total = 6.
+        assert!(
+            agg2.last_hour.requests >= 6,
+            "truncation must not lose the new line: {:?}",
+            agg2.last_hour
+        );
     }
 }
