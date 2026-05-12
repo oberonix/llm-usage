@@ -377,11 +377,15 @@ fn pace_index(
 
 // 10-cell bar with two layers of colour when `use_color`:
 //   - filled pips get the same green/amber/red ramp as the % text
-//   - one pip (at `pace_idx`) is painted purple to mark where the
-//     time window itself currently sits.
+//   - one pip (at `pace_idx`) is painted magenta to mark where the
+//     time window currently sits. Glyph follows the underlying
+//     fill: a `▰` when the marker overlaps the filled region (so
+//     it stays distinguishable from `▱`), and a `▱` outline when
+//     past the fill — that way a marker just-beyond-usage doesn't
+//     look like an extra unit of consumption.
 // In plain-text mode (output piped, NO_COLOR set, redirect, etc.)
-// we return the unstyled `▰`/`▱` glyphs and drop the pace marker —
-// a purple `▰` would otherwise look like an extra unit of usage.
+// we return the unstyled `▰`/`▱` glyphs and drop the pace marker
+// — a magenta cell-shape would otherwise be invisible.
 fn colored_bar(fraction: f64, cells: usize, pace_idx: Option<usize>, use_color: bool) -> String {
     let frac = fraction.clamp(0.0, 1.0);
     let filled = ((frac * cells as f64).round() as usize).min(cells);
@@ -394,10 +398,9 @@ fn colored_bar(fraction: f64, cells: usize, pace_idx: Option<usize>, use_color: 
     let mut s = String::with_capacity(cells * 8);
     for i in 0..cells {
         if pace_idx == Some(i) {
-            // Pace marker is always visible regardless of fill state;
-            // glyph stays `▰` so it pops against `▱` background.
+            let glyph = if i < filled { '▰' } else { '▱' };
             s.push_str(PACE);
-            s.push('▰');
+            s.push(glyph);
             s.push_str(RESET);
         } else if i < filled {
             s.push_str(fill_color);
@@ -553,28 +556,39 @@ mod tests {
     }
 
     #[test]
-    fn colored_bar_paints_pace_index_in_purple() {
-        // A 40 % bar with pace at index 7 should have one purple pip
-        // beyond the filled region.
+    fn colored_bar_pace_past_fill_keeps_outline_glyph() {
+        // 40 % usage, pace at index 7 (beyond fill): the marker
+        // takes the outline `▱` shape so a glance reads "still
+        // empty, but here's where time says you should be" rather
+        // than "extra unit of usage in a different colour."
         let s = colored_bar(0.4, 10, Some(7), true);
         assert!(s.contains("\x1b[35m"), "expected magenta pace marker: {:?}", s);
-        // Pace pip in unfilled region keeps the `▰` glyph so it's
-        // visible against the `▱` background — and the unfilled
-        // count is one less than it would be without pace.
-        assert_eq!(s.matches('▰').count(), 4 + 1, "got {:?}", s);
-        assert_eq!(s.matches('▱').count(), 10 - 4 - 1, "got {:?}", s);
+        assert_eq!(s.matches('▰').count(), 4, "got {:?}", s);
+        assert_eq!(s.matches('▱').count(), 6, "got {:?}", s);
     }
 
     #[test]
-    fn colored_bar_pace_inside_fill_region_still_renders_purple() {
-        // When pace is below the fill level, the marker still wins:
-        // we want the user to see "here's where time says you'd be"
-        // even when they're ahead of pace.
+    fn colored_bar_pace_inside_fill_keeps_filled_glyph() {
+        // When pace is below the fill level we want it to remain a
+        // filled `▰` so it stays visible against the surrounding
+        // ▰ pips (a magenta `▱` would visually punch a hole in the
+        // fill, misreading as "this cell isn't actually used").
         let s = colored_bar(0.8, 10, Some(3), true);
         assert!(s.contains("\x1b[35m"));
-        // Pip count is unchanged because the marker swaps for a
-        // would-be fill pip.
-        assert_eq!(s.matches('▰').count(), 8);
+        assert_eq!(s.matches('▰').count(), 8, "got {:?}", s);
+        assert_eq!(s.matches('▱').count(), 2, "got {:?}", s);
+    }
+
+    #[test]
+    fn colored_bar_pace_at_fill_boundary_uses_outline() {
+        // Edge case: pace_idx == filled. That position is the first
+        // *unfilled* cell, so it should render as the outline `▱`.
+        // 40 % fill (4 cells) with pace at idx 4 → that one cell is
+        // a magenta `▱`.
+        let s = colored_bar(0.4, 10, Some(4), true);
+        assert!(s.contains("\x1b[35m"));
+        assert_eq!(s.matches('▰').count(), 4);
+        assert_eq!(s.matches('▱').count(), 6);
     }
 
     #[test]
