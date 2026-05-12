@@ -58,14 +58,50 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use walkdir::WalkDir;
+
+/// Per-file resumption state for the Codex rollouts incremental
+/// scanner. Mirrors the Anthropic provider's `FileState` but also
+/// carries the stateful per-file parser context (`current_model`
+/// from the running `turn_context`, last seen token snapshot for the
+/// "no progress this turn" filter).
+#[derive(Default, Clone)]
+struct FileState {
+    #[allow(dead_code)]
+    size: u64,
+    offset: u64,
+    current_model: String,
+    prev_snapshot: Option<(u64, u64, u64)>,
+}
+
+/// Stop tracking events older than this. The longest Codex bucket is
+/// "this week" (7 d) so a comfortable retention buffer keeps the
+/// trim cheap without losing in-window data.
+const EVENT_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 86_400);
+
+#[derive(Default)]
+struct ScanCache {
+    events: Vec<TokenEvent>,
+    files: HashMap<PathBuf, FileState>,
+    latest_rate_limits: Option<RateLimitsRecord>,
+}
 
 pub struct CodexCliProvider {
     cfg: CodexCliConfig,
     codex_dir: PathBuf,
     /// Resolved opencode SQLite path; `None` when explicitly disabled.
     opencode_db: Option<PathBuf>,
+    /// Incremental scan cache — same rationale as the Anthropic
+    /// provider. The old `collect_events` walked every rollout and
+    /// re-parsed every line on every poll, which the file-watcher
+    /// firing on every assistant turn turned into a tight re-walk
+    /// loop. Cache stores TokenEvents + latest rate_limits + per-file
+    /// offsets so subsequent polls only read appended bytes.
+    cache: Mutex<ScanCache>,
 }
 
 impl CodexCliProvider {
@@ -75,7 +111,12 @@ impl CodexCliProvider {
     pub fn new(cfg: CodexCliConfig) -> Self {
         let codex_dir = cfg.codex_dir.clone().unwrap_or_else(default_codex_dir);
         let opencode_db = Some(crate::opencode::default_db_path());
-        Self { cfg, codex_dir, opencode_db }
+        Self {
+            cfg,
+            codex_dir,
+            opencode_db,
+            cache: Mutex::new(ScanCache::default()),
+        }
     }
 
     /// Construct with an explicit opencode override:
@@ -84,12 +125,18 @@ impl CodexCliProvider {
     pub fn with_opencode_db(cfg: CodexCliConfig, opencode_db: Option<PathBuf>) -> Self {
         let codex_dir = cfg.codex_dir.clone().unwrap_or_else(default_codex_dir);
         let opencode_db = opencode_db.filter(|p| !p.as_os_str().is_empty());
-        Self { cfg, codex_dir, opencode_db }
+        Self {
+            cfg,
+            codex_dir,
+            opencode_db,
+            cache: Mutex::new(ScanCache::default()),
+        }
     }
 
     fn collect_events(&self) -> Result<Collected> {
         let mut out = Collected::default();
         if self.codex_dir.exists() {
+            let mut cache = self.cache.lock().expect("poisoned");
             // Only the active sessions dir matters for rolling windows up to 7d;
             // we walk archived_sessions too in case ours is configured oddly.
             for sub in ["sessions", "archived_sessions"] {
@@ -102,11 +149,19 @@ impl CodexCliProvider {
                     .filter_map(|e| e.ok())
                     .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
                 {
-                    if let Err(e) = parse_session_file(entry.path(), &mut out) {
-                        tracing::warn!(path = %entry.path().display(), error = %e, "codex parse failed");
+                    let path = entry.path().to_path_buf();
+                    if let Err(e) = scan_codex_file_incremental(&path, &mut cache) {
+                        tracing::warn!(path = %path.display(), error = %e, "codex parse failed");
                     }
                 }
             }
+            // Trim out-of-window events so the cache doesn't grow
+            // unboundedly across long tray sessions.
+            let cutoff = Utc::now() - chrono::Duration::from_std(EVENT_RETENTION).unwrap();
+            cache.events.retain(|e| e.timestamp > cutoff);
+            // Clone the cached state into the outbound `Collected`.
+            out.events.extend(cache.events.iter().cloned());
+            out.latest_rate_limits = cache.latest_rate_limits.clone();
         }
 
         // Supplementary source: opencode's SQLite store. Users who hit
@@ -404,93 +459,142 @@ struct OuterEntry {
     payload: Option<Value>,
 }
 
-fn parse_session_file(path: &std::path::Path, out: &mut Collected) -> Result<()> {
-    let content = std::fs::read_to_string(path)?;
-    let mut current_model = String::new();
-    let mut prev_snapshot: Option<(u64, u64, u64)> = None;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
+fn scan_codex_file_incremental(
+    path: &std::path::Path,
+    cache: &mut ScanCache,
+) -> Result<()> {
+    let meta = std::fs::metadata(path)?;
+    let size = meta.len();
+    let prev = cache.files.get(path).cloned().unwrap_or_default();
+    let start = if prev.offset > size {
+        // File was rotated / truncated — restart from the top and
+        // drop the carried-over per-file parser state.
+        FileState::default().offset
+    } else if prev.offset == size {
+        return Ok(());
+    } else {
+        prev.offset
+    };
+
+    // If we're restarting from 0 we need fresh per-file state; if
+    // we're resuming we carry the previous `current_model` and
+    // `prev_snapshot` so deduplication stays correct across calls.
+    let mut state = if start == 0 {
+        FileState { size, offset: 0, ..Default::default() }
+    } else {
+        let mut s = prev.clone();
+        s.size = size;
+        s
+    };
+
+    let f = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(f);
+    if start > 0 {
+        reader.seek(SeekFrom::Start(start))?;
+    }
+
+    let mut consumed = start;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
         }
-        let entry: OuterEntry = match serde_json::from_str(line) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let payload = match entry.payload {
-            Some(p) => p,
-            None => continue,
-        };
-        let record_ts = entry
-            .timestamp
-            .as_deref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc)));
+        if !line.ends_with('\n') {
+            // Partial trailing line — leave offset before it so the
+            // next scan picks the line up once Codex finishes
+            // writing it.
+            break;
+        }
+        let trimmed = line.trim_end();
+        if !trimmed.is_empty() {
+            process_codex_line(trimmed, &mut state, cache);
+        }
+        consumed += n as u64;
+    }
+    state.offset = consumed;
+    cache.files.insert(path.to_path_buf(), state);
+    Ok(())
+}
 
-        match entry.entry_type.as_deref() {
-            Some("turn_context") => {
-                if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
-                    current_model = m.to_string();
-                }
+/// Per-line parser. Pure (no I/O) so we can fuzz it in tests later.
+/// Updates `state.current_model` on `turn_context`, dedupes
+/// consecutive identical `token_count` snapshots, and pushes
+/// `TokenEvent` / updates `latest_rate_limits` on the cache.
+fn process_codex_line(line: &str, state: &mut FileState, cache: &mut ScanCache) {
+    let Ok(entry) = serde_json::from_str::<OuterEntry>(line) else {
+        return;
+    };
+    let Some(payload) = entry.payload else { return };
+    let record_ts = entry
+        .timestamp
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc)));
+
+    match entry.entry_type.as_deref() {
+        Some("turn_context") => {
+            if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
+                state.current_model = m.to_string();
             }
-            Some("event_msg") => {
-                if payload.get("type").and_then(|v| v.as_str()) != Some("token_count") {
-                    continue;
-                }
+        }
+        Some("event_msg") => {
+            if payload.get("type").and_then(|v| v.as_str()) != Some("token_count") {
+                return;
+            }
 
-                // Rate-limit snapshot, if present. Lives on the
-                // event_msg payload itself, not under `info`.
-                if let Some(rl) = payload.get("rate_limits") {
-                    if let (Some(ts), Some(record)) =
-                        (record_ts, parse_rate_limits(rl, record_ts))
-                    {
-                        let take = match &out.latest_rate_limits {
-                            None => true,
-                            Some(prev) => ts > prev.record_at,
-                        };
-                        if take {
-                            let _ = ts; // satisfy clippy's unused warning when feature gating
-                            out.latest_rate_limits = Some(record);
-                        }
+            // Rate-limit snapshot, if present. Lives on the
+            // event_msg payload itself, not under `info`.
+            if let Some(rl) = payload.get("rate_limits") {
+                if let (Some(ts), Some(record)) =
+                    (record_ts, parse_rate_limits(rl, record_ts))
+                {
+                    let take = match &cache.latest_rate_limits {
+                        None => true,
+                        Some(prev) => ts > prev.record_at,
+                    };
+                    if take {
+                        cache.latest_rate_limits = Some(record);
                     }
                 }
-
-                let info = payload.get("info");
-                let usage = info
-                    .filter(|v| !v.is_null())
-                    .and_then(|i| i.get("last_token_usage").or_else(|| i.get("total_token_usage")));
-                let Some(u) = usage else { continue };
-                let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                let cached = u.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                if input == 0 && output == 0 && cached == 0 {
-                    continue;
-                }
-                // Skip duplicate consecutive snapshots — Codex emits cumulative
-                // total_token_usage on each event so identical snapshots in a row
-                // mean "no progress this turn".
-                let snap = (input, output, cached);
-                if prev_snapshot == Some(snap) {
-                    continue;
-                }
-                prev_snapshot = Some(snap);
-
-                let Some(ts) = record_ts else { continue };
-
-                out.events.push(TokenEvent {
-                    timestamp: ts,
-                    model: if current_model.is_empty() {
-                        "gpt-5-codex".into()
-                    } else {
-                        current_model.clone()
-                    },
-                    input_tokens: input,
-                    output_tokens: output,
-                    cached_tokens: cached,
-                });
             }
-            _ => {}
+
+            let info = payload.get("info");
+            let usage = info
+                .filter(|v| !v.is_null())
+                .and_then(|i| i.get("last_token_usage").or_else(|| i.get("total_token_usage")));
+            let Some(u) = usage else { return };
+            let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cached = u.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            if input == 0 && output == 0 && cached == 0 {
+                return;
+            }
+            // Skip duplicate consecutive snapshots — Codex emits cumulative
+            // total_token_usage on each event so identical snapshots in a row
+            // mean "no progress this turn".
+            let snap = (input, output, cached);
+            if state.prev_snapshot == Some(snap) {
+                return;
+            }
+            state.prev_snapshot = Some(snap);
+
+            let Some(ts) = record_ts else { return };
+
+            cache.events.push(TokenEvent {
+                timestamp: ts,
+                model: if state.current_model.is_empty() {
+                    "gpt-5-codex".into()
+                } else {
+                    state.current_model.clone()
+                },
+                input_tokens: input,
+                output_tokens: output,
+                cached_tokens: cached,
+            });
         }
+        _ => {}
     }
-    Ok(())
 }
 
 fn parse_rate_limits(v: &Value, record_at: Option<DateTime<Utc>>) -> Option<RateLimitsRecord> {
