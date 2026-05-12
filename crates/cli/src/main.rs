@@ -111,15 +111,19 @@ fn print_usage() {
 /// One-shot mode — render the current data and exit. Reads
 /// `snapshots.json` if fresh; otherwise polls providers directly.
 async fn run_once(use_color: bool) -> Result<()> {
-    let snapshots = match cached_snapshots() {
-        Some(s) => s,
-        None => poll_fresh().await?,
+    let (snapshots, updated_at) = match cached_snapshots() {
+        Some((s, t)) => (s, Some(t)),
+        // No cache → fresh poll. The "updated" timestamp is now.
+        None => (poll_fresh().await?, Some(chrono::Utc::now())),
     };
     if snapshots.is_empty() {
         eprintln!("No provider data. Enable a provider in the dashboard's Settings tab.");
         std::process::exit(1);
     }
-    print!("{}", build_screen(&snapshots, use_color, /*clear*/ false));
+    print!(
+        "{}",
+        build_screen(&snapshots, updated_at, use_color, /*clear*/ false)
+    );
     let _ = std::io::stdout().flush();
     Ok(())
 }
@@ -140,11 +144,11 @@ async fn run_live(use_color: bool) -> Result<()> {
 
     // Initial paint — try cache first; fall back to a live poll so the
     // user isn't staring at "no data" while the tray's first poll runs.
-    let mut latest = match cached_snapshots() {
-        Some(s) => s,
-        None => poll_fresh().await.unwrap_or_default(),
+    let (mut latest, mut updated_at) = match cached_snapshots() {
+        Some((s, t)) => (s, Some(t)),
+        None => (poll_fresh().await.unwrap_or_default(), Some(chrono::Utc::now())),
     };
-    render_screen(&latest, use_color);
+    render_screen(&latest, updated_at, use_color);
 
     let snap_path = llm_usage_core::config::snapshots_path()?;
     let parent = snap_path
@@ -181,13 +185,14 @@ async fn run_live(use_color: bool) -> Result<()> {
                 }
                 if let Ok(Some(file)) = llm_usage_core::read_snapshots() {
                     latest = file.snapshots;
+                    updated_at = Some(file.updated_at);
                 }
-                render_screen(&latest, use_color);
+                render_screen(&latest, updated_at, use_color);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Periodic tick — same data, fresh `now`. Cheap: one
                 // ANSI clear + ~30 lines of stdout.
-                render_screen(&latest, use_color);
+                render_screen(&latest, updated_at, use_color);
             }
             Err(_) => break,
         }
@@ -195,17 +200,28 @@ async fn run_live(use_color: bool) -> Result<()> {
     Ok(())
 }
 
-fn render_screen(snapshots: &BTreeMap<ProviderId, UsageSnapshot>, use_color: bool) {
+fn render_screen(
+    snapshots: &BTreeMap<ProviderId, UsageSnapshot>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    use_color: bool,
+) {
     let mut out = std::io::stdout().lock();
-    let _ = out.write_all(build_screen(snapshots, use_color, true).as_bytes());
+    let _ = out.write_all(build_screen(snapshots, updated_at, use_color, true).as_bytes());
     let _ = out.flush();
 }
 
 /// Build the rendered text. When `clear` is true (live mode on a TTY),
 /// the output starts with an ANSI clear-screen + home-cursor sequence
 /// so each redraw replaces the previous frame in place.
+///
+/// `updated_at` is the timestamp the tray (or `poll_fresh`) recorded
+/// when the snapshot was last refreshed from upstream. The footer
+/// surfaces it alongside the current paint time so the user can tell
+/// "data freshness" from "display freshness" — the latter ticks every
+/// 30 s in live mode regardless of when the tray polled.
 fn build_screen(
     snapshots: &BTreeMap<ProviderId, UsageSnapshot>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
     use_color: bool,
     clear: bool,
 ) -> String {
@@ -283,21 +299,57 @@ fn build_screen(
         s.push_str("waiting for first snapshot…\n");
     }
 
-    // Footer: when this frame was rendered. Intentionally has no
-    // trailing newline — the cursor parks at the end of this line in
-    // live mode, which gives the window a calm "ready / idle" look
-    // until the next frame.
+    // Footer: paint-time clock alongside the upstream snapshot's
+    // `updated_at` so the user can tell live display refresh (every
+    // 30 s) from real data refresh (whenever the tray polls or a
+    // local file event fires). No trailing newline — the cursor
+    // parks at the end of this line in live mode.
     s.push('\n');
-    let now = chrono::Local::now().format("%H:%M:%S").to_string();
-    if use_color {
-        s.push_str(&format!("\x1b[90mlast refreshed {}\x1b[0m", now));
-    } else {
-        s.push_str(&format!("last refreshed {}", now));
-    }
+    s.push_str(&format_footer(updated_at, chrono::Local::now(), use_color));
     s
 }
 
-fn cached_snapshots() -> Option<BTreeMap<ProviderId, UsageSnapshot>> {
+fn format_footer(
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Local>,
+    use_color: bool,
+) -> String {
+    let refreshed = now.format("%H:%M:%S").to_string();
+    let body = match updated_at {
+        Some(t) => {
+            let updated = t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string();
+            let age = (now.with_timezone(&chrono::Utc) - t).num_seconds().max(0);
+            format!("updated {} ({}) · refreshed {}", updated, format_age(age), refreshed)
+        }
+        // First paint with no snapshot file on disk: the previous
+        // "last refreshed" phrasing is still the right thing to show
+        // — there's no upstream timestamp to compare against yet.
+        None => format!("last refreshed {}", refreshed),
+    };
+    if use_color {
+        format!("\x1b[90m{}\x1b[0m", body)
+    } else {
+        body
+    }
+}
+
+fn format_age(secs: i64) -> String {
+    if secs < 60 {
+        format!("{}s ago", secs)
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Returns the snapshot map AND the upstream `updated_at` so the
+/// renderer can show "data is from X, display refreshed at Y". A
+/// cache older than `STALE_AFTER` is treated as missing — the caller
+/// should fall back to `poll_fresh()`.
+fn cached_snapshots() -> Option<(BTreeMap<ProviderId, UsageSnapshot>, chrono::DateTime<chrono::Utc>)> {
     let file = llm_usage_core::read_snapshots().ok().flatten()?;
     let age = (chrono::Utc::now() - file.updated_at)
         .to_std()
@@ -305,7 +357,7 @@ fn cached_snapshots() -> Option<BTreeMap<ProviderId, UsageSnapshot>> {
     if age > STALE_AFTER {
         return None;
     }
-    Some(file.snapshots)
+    Some((file.snapshots, file.updated_at))
 }
 
 async fn poll_fresh() -> Result<BTreeMap<ProviderId, UsageSnapshot>> {
@@ -462,6 +514,7 @@ fn format_reset(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn unicode_bar_zero_is_all_empty() {
@@ -688,11 +741,13 @@ mod tests {
     fn build_screen_includes_header_bars_and_footer() {
         let mut snaps = BTreeMap::new();
         snaps.insert(ProviderId::CodexCli, make_snapshot(ProviderId::CodexCli));
-        let s = build_screen(&snaps, /*use_color*/ false, /*clear*/ false);
+        let s = build_screen(&snaps, None, /*use_color*/ false, /*clear*/ false);
         assert!(s.contains("Codex"), "expected provider name in: {}", s);
         assert!(s.contains("Plus"), "expected plan tag in: {}", s);
         assert!(s.contains("5h"), "expected window label in: {}", s);
         assert!(s.contains("week"), "expected weekly label in: {}", s);
+        // No updated_at supplied → footer falls back to legacy
+        // "last refreshed HH:MM:SS" phrasing.
         assert!(s.contains("last refreshed"), "expected footer in: {}", s);
         // No trailing newline (cursor parks on the footer line).
         assert!(!s.ends_with('\n'), "got trailing newline in: {:?}", s.chars().last());
@@ -701,7 +756,7 @@ mod tests {
     #[test]
     fn build_screen_empty_shows_waiting() {
         let snaps: BTreeMap<ProviderId, UsageSnapshot> = BTreeMap::new();
-        let s = build_screen(&snaps, false, false);
+        let s = build_screen(&snaps, None, false, false);
         assert!(s.contains("waiting for first snapshot"));
     }
 
@@ -722,7 +777,7 @@ mod tests {
         snap.headline = Some("100 tokens in today".into());
         let mut snaps = BTreeMap::new();
         snaps.insert(ProviderId::Anthropic, snap);
-        let s = build_screen(&snaps, false, false);
+        let s = build_screen(&snaps, None, false, false);
         assert!(s.contains("Anthropic"), "got: {}", s);
         assert!(s.contains("100 tokens in today"), "got: {}", s);
         assert!(!s.contains("waiting for first snapshot"), "got: {}", s);
@@ -735,7 +790,7 @@ mod tests {
         snap.headline = None;
         let mut snaps = BTreeMap::new();
         snaps.insert(ProviderId::Anthropic, snap);
-        let s = build_screen(&snaps, false, false);
+        let s = build_screen(&snaps, None, false, false);
         assert!(s.contains("waiting for first snapshot"), "got: {}", s);
     }
 
@@ -743,10 +798,79 @@ mod tests {
     fn build_screen_with_color_includes_ansi_clear_when_requested() {
         let mut snaps = BTreeMap::new();
         snaps.insert(ProviderId::CodexCli, make_snapshot(ProviderId::CodexCli));
-        let with_clear = build_screen(&snaps, /*color*/ true, /*clear*/ true);
-        let without_clear = build_screen(&snaps, /*color*/ true, /*clear*/ false);
+        let with_clear = build_screen(&snaps, None, /*color*/ true, /*clear*/ true);
+        let without_clear = build_screen(&snaps, None, /*color*/ true, /*clear*/ false);
         // Clear sequence at the top of one but not the other.
         assert!(with_clear.starts_with("\x1b[2J\x1b[H"));
         assert!(!without_clear.starts_with("\x1b[2J\x1b[H"));
+    }
+
+    #[test]
+    fn build_screen_with_updated_at_uses_two_timestamp_footer() {
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::CodexCli, make_snapshot(ProviderId::CodexCli));
+        let upstream = chrono::Utc::now() - chrono::Duration::seconds(45);
+        let s = build_screen(&snaps, Some(upstream), false, false);
+        // "updated HH:MM:SS (45s ago) · refreshed HH:MM:SS"
+        assert!(s.contains("updated "), "got: {}", s);
+        assert!(s.contains("refreshed "), "got: {}", s);
+        assert!(
+            s.contains("ago)"),
+            "expected relative-age annotation: {}",
+            s
+        );
+        assert!(
+            !s.contains("last refreshed"),
+            "legacy footer must not appear when updated_at is supplied: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn format_footer_shape_with_upstream_timestamp() {
+        // Force a known clock so the test is deterministic.
+        let now_local = chrono::Local
+            .with_ymd_and_hms(2026, 5, 12, 9, 43, 1)
+            .unwrap();
+        let upstream = now_local.with_timezone(&chrono::Utc) - chrono::Duration::seconds(52);
+        let out = format_footer(Some(upstream), now_local, /*use_color*/ false);
+        assert!(out.contains("updated "), "got: {}", out);
+        assert!(out.contains("(52s ago)"), "got: {}", out);
+        assert!(out.contains("refreshed 09:43:01"), "got: {}", out);
+        // Em-mid separator between the two timestamps so it scans as
+        // a single "data freshness vs display freshness" line.
+        assert!(out.contains(" · "), "got: {}", out);
+    }
+
+    #[test]
+    fn format_footer_no_upstream_falls_back_to_legacy() {
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 5, 12, 9, 0, 0)
+            .unwrap();
+        let out = format_footer(None, now, false);
+        assert_eq!(out, "last refreshed 09:00:00");
+    }
+
+    #[test]
+    fn format_footer_emits_ansi_when_color_requested() {
+        let now = chrono::Local::now();
+        let out = format_footer(Some(chrono::Utc::now()), now, /*use_color*/ true);
+        // Dim grey is `\x1b[90m` per the existing palette.
+        assert!(out.contains("\x1b[90m") && out.ends_with("\x1b[0m"), "got: {}", out);
+    }
+
+    #[test]
+    fn format_age_buckets_match_short_scales() {
+        assert_eq!(format_age(0), "0s ago");
+        assert_eq!(format_age(45), "45s ago");
+        assert_eq!(format_age(60), "1m ago");
+        assert_eq!(format_age(3599), "59m ago");
+        assert_eq!(format_age(3600), "1h ago");
+        assert_eq!(format_age(86_399), "23h ago");
+        assert_eq!(format_age(86_400), "1d ago");
+        // Negative values should never appear, but if they do (clock
+        // skew) the caller clamps to 0 before calling here. Confirm
+        // the helper itself doesn't panic on a stray negative.
+        assert_eq!(format_age(-30), "-30s ago");
     }
 }

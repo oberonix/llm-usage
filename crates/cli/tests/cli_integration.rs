@@ -138,7 +138,10 @@ fn once_mode_renders_cached_snapshot_without_polling() {
         .success()
         .stdout(predicate::str::contains("Anthropic"))
         .stdout(predicate::str::contains("42%"))
-        .stdout(predicate::str::contains("last refreshed"));
+        // Footer carries both timestamps so the user can distinguish
+        // "tray polled at X" from "this frame was painted at Y".
+        .stdout(predicate::str::contains("updated "))
+        .stdout(predicate::str::contains("refreshed "));
 }
 
 #[test]
