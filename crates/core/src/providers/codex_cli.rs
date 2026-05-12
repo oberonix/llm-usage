@@ -440,9 +440,11 @@ fn parse_rate_limits(v: &Value, record_at: Option<DateTime<Utc>>) -> Option<Rate
     let record_at = record_at?;
     let primary = v.get("primary").and_then(parse_rate_limits_bucket);
     let secondary = v.get("secondary").and_then(parse_rate_limits_bucket);
-    if primary.is_none() && secondary.is_none() {
-        return None;
-    }
+    // Accept records even with null buckets — Codex CLI v0.129.0+ emits
+    // rate_limits with `primary:null, secondary:null` and a `credits`
+    // block. We must track these so the newest record correctly supersedes
+    // stale data from older sessions, otherwise we'd show phantom
+    // percentages from days ago.
     Some(RateLimitsRecord {
         record_at,
         primary,
