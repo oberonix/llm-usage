@@ -570,6 +570,55 @@ mod tests {
     }
 
     #[test]
+    fn is_meaningful_data_path_accepts_jsonl_and_opencode_db() {
+        use std::path::PathBuf;
+        assert!(is_meaningful_data_path(&PathBuf::from(
+            "/home/u/.claude/projects/foo/session-abc.jsonl"
+        )));
+        assert!(is_meaningful_data_path(&PathBuf::from(
+            "/home/u/.codex/sessions/2026/05/12/rollout-x.jsonl"
+        )));
+        assert!(is_meaningful_data_path(&PathBuf::from(
+            "/home/u/.local/share/opencode/opencode.db"
+        )));
+    }
+
+    #[test]
+    fn is_meaningful_data_path_rejects_sqlite_sidecars() {
+        // These are the events that caused the 92 % CPU pin: opencode
+        // commits its WAL several times per assistant turn, and a
+        // watcher that treats those as "interesting" feeds the
+        // runtime an event storm. The whole `-wal` + `-shm` family
+        // must filter out.
+        use std::path::PathBuf;
+        let sidecars = [
+            "/home/u/.local/share/opencode/opencode.db-wal",
+            "/home/u/.local/share/opencode/opencode.db-shm",
+            "/home/u/.local/share/opencode/opencode.db-journal",
+        ];
+        for p in sidecars {
+            assert!(
+                !is_meaningful_data_path(&PathBuf::from(p)),
+                "should reject {}",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn is_meaningful_data_path_rejects_misc_noise() {
+        use std::path::PathBuf;
+        // A vim swapfile next to a JSONL; an editor backup. Neither
+        // is upstream activity worth re-polling for.
+        assert!(!is_meaningful_data_path(&PathBuf::from(
+            "/home/u/.claude/projects/foo/.session-abc.jsonl.swp"
+        )));
+        assert!(!is_meaningful_data_path(&PathBuf::from(
+            "/home/u/.claude/projects/foo/session-abc.jsonl~"
+        )));
+    }
+
+    #[test]
     fn data_source_paths_uses_opencode_parent_dir() {
         // Watcher attaches to the *parent* of `opencode.db` so it
         // catches writes to `opencode.db`, `opencode.db-wal`, and
@@ -720,9 +769,16 @@ fn spawn_data_source_watchers(
 ) -> Vec<RecommendedWatcher> {
     let mut out = Vec::new();
     let paths = data_source_paths(config);
-    // Shared debounce: any source can fire it. 500ms covers the
-    // "Claude Code writes the same JSONL three times in a few hundred
-    // ms" case without making the tray feel laggy on the first event.
+    // Shared debounce: any source can fire it. 5 s is the floor we
+    // arrived at after a 92 % CPU pin in heavy Claude Code use —
+    // opencode's SQLite WAL writes constantly during an active
+    // session, and a tight debounce was kicking the runtime into a
+    // continuous poll → re-walk-76MB-of-JSONLs loop. The HTTP
+    // throttles in the providers add a second line of defence (5 min
+    // for Anthropic OAuth, 60 s for Ollama scrape) so this debounce
+    // can be relatively generous without making the UI feel laggy:
+    // the first event in a quiet period still fires immediately,
+    // we just coalesce bursts.
     let last_fire = Arc::new(std::sync::Mutex::new(Instant::now() - Duration::from_secs(60)));
     for (path, mode, label) in paths {
         if !path.exists() {
@@ -747,9 +803,18 @@ fn spawn_data_source_watchers(
                 if !interesting {
                     return;
                 }
+                // Filter the event paths to ones that actually
+                // signal "interesting upstream activity". The
+                // standout chatter source is opencode's SQLite
+                // sidecars — `.db-wal` and `.db-shm` get written on
+                // every transaction commit, far more often than the
+                // logical `opencode.db` rolls over.
+                if !event.paths.iter().any(|p| is_meaningful_data_path(p)) {
+                    return;
+                }
                 let now = Instant::now();
                 let mut guard = last_fire_.lock().expect("poisoned");
-                if now.duration_since(*guard) < Duration::from_millis(500) {
+                if now.duration_since(*guard) < Duration::from_secs(5) {
                     return;
                 }
                 *guard = now;
@@ -780,6 +845,23 @@ fn spawn_data_source_watchers(
         out.push(watcher);
     }
     out
+}
+
+/// True when a filesystem event path is one of the file types our
+/// providers actually consume — `*.jsonl` (Claude Code projects,
+/// Codex rollouts) or the literal `opencode.db`. SQLite's `-wal`
+/// and `-shm` sidecars and any other detritus in those dirs are
+/// excluded: opencode commits to its WAL many times per assistant
+/// turn, and a watcher that fires on every WAL write keeps the
+/// runtime in a constant re-poll → re-walk-JSONLs loop (92 % CPU
+/// observed under heavy Claude Code use).
+fn is_meaningful_data_path(p: &std::path::Path) -> bool {
+    if p.extension().is_some_and(|ext| ext == "jsonl") {
+        return true;
+    }
+    // The opencode SQLite file proper is interesting; its WAL /
+    // SHM siblings are not.
+    matches!(p.file_name().and_then(|n| n.to_str()), Some("opencode.db"))
 }
 
 /// The three (or fewer, depending on what's installed) local paths
