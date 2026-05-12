@@ -673,11 +673,11 @@ fn render_windows_table(
 fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage) {
     match w.fraction_used {
         Some(frac) => {
-            // Disconnected-state recolour: a stale red-tier fill
-            // collapses to grey so the bar reads "we know it was
-            // exhausted, we just don't have fresh data" rather than
-            // "currently in the red right now".
-            let fill = if w.stale && frac >= 0.85 {
+            // Stale rows drop to grey across all tiers — the colour
+            // ramp is reserved for live data so a glance can never
+            // mistake "known-old reading" for "currently at X %".
+            // The red `⚠ stale` label below is the call-to-attention.
+            let fill = if w.stale {
                 Color32::from_gray(120)
             } else {
                 fraction_color(frac)

@@ -383,16 +383,12 @@ fn format_quota_row(label: &str, w: &WindowUsage, use_color: bool) -> String {
     let bar = colored_bar(frac, 10, pace_idx, w.stale, use_color);
     let pct_raw = format!("{:>3.0}%", frac * 100.0);
     let pct = if use_color {
-        // Disconnected-state recolour: a stale red-tier reading
-        // (the typical Codex "quota was exhausted at last poll"
-        // case) drops to grey so the row reads "we know it was
-        // hit, we just don't have fresh data" rather than
-        // "currently red-alarm right now".
-        let col = if w.stale && frac >= RED_THRESHOLD {
-            DIM_GRAY
-        } else {
-            color_for(frac)
-        };
+        // Stale rows drop to grey across all tiers — green/amber/red
+        // all read as "live, trust this number"; grey reads as "this
+        // is what we last saw". The red `⚠` in the suffix is the
+        // call-to-attention; the colour change is the at-a-glance
+        // "don't react to this as if it were current" cue.
+        let col = if w.stale { DIM_GRAY } else { color_for(frac) };
         format!("{}{}\x1b[0m", col, pct_raw)
     } else {
         pct_raw
@@ -401,10 +397,6 @@ fn format_quota_row(label: &str, w: &WindowUsage, use_color: bool) -> String {
     format!("{} {} · {}{}", bar, pct, label, suffix)
 }
 
-/// Threshold above which a fraction is in the red-tier of the
-/// green/amber/red ramp. Kept as a const so `colored_bar` and
-/// `format_quota_row` agree on the boundary.
-const RED_THRESHOLD: f64 = 0.85;
 const DIM_GRAY: &str = "\x1b[90m";
 
 // Cell index (0..cells) of the pacing marker, given how much of the
@@ -432,8 +424,8 @@ fn pace_index(
 
 // 10-cell bar with two layers of colour when `use_color`:
 //   - filled pips get the same green/amber/red ramp as the % text,
-//     EXCEPT a stale red-tier reading drops to grey so the bar reads
-//     "known-disconnected" rather than "currently in the red"
+//     EXCEPT any stale reading drops to grey across all tiers so the
+//     bar reads "known-old" instead of "live"
 //   - one pip (at `pace_idx`) is painted magenta to mark where the
 //     time window currently sits. Glyph follows the underlying
 //     fill: a `▰` when the marker overlaps the filled region (so
@@ -457,11 +449,7 @@ fn colored_bar(
     }
     const PACE: &str = "\x1b[35m"; // magenta — distinct from green/amber/red
     const RESET: &str = "\x1b[0m";
-    let fill_color = if stale && frac >= RED_THRESHOLD {
-        DIM_GRAY
-    } else {
-        color_for(frac)
-    };
+    let fill_color = if stale { DIM_GRAY } else { color_for(frac) };
     let mut s = String::with_capacity(cells * 8);
     for i in 0..cells {
         if pace_idx == Some(i) {
@@ -704,25 +692,25 @@ mod tests {
     }
 
     #[test]
-    fn colored_bar_stale_red_tier_drops_to_grey() {
-        // A stale ≥85 % reading is the disconnected-Codex case —
-        // gray out the fill so the row reads "known-old" instead
-        // of "currently in the red".
-        let s = colored_bar(0.95, 10, None, /*stale*/ true, true);
-        assert!(s.contains("\x1b[90m"), "expected dim grey: {:?}", s);
-        // Original red ANSI must not appear.
-        assert!(!s.contains("\x1b[31m"), "red leaked through: {:?}", s);
-    }
-
-    #[test]
-    fn colored_bar_stale_green_and_amber_keep_their_colour() {
-        // Only the red tier collapses to grey when stale. A 30 %
-        // reading that's gone stale (rare but possible) still shows
-        // green — graying everything would lose the threshold signal.
-        let s = colored_bar(0.30, 10, None, /*stale*/ true, true);
-        assert!(s.contains("\x1b[32m"), "expected green retained: {:?}", s);
-        let s = colored_bar(0.70, 10, None, /*stale*/ true, true);
-        assert!(s.contains("\x1b[33m"), "expected amber retained: {:?}", s);
+    fn colored_bar_stale_drops_every_tier_to_grey() {
+        // Stale rows are grey at every tier — green/amber/red all
+        // signal "live, trust this number"; grey is the at-a-glance
+        // "this is what we last saw" cue. The red `⚠` in the suffix
+        // is the call-to-attention. Mirrors the dashboard's
+        // `Color32::from_gray(120)` fill.
+        for frac in [0.20, 0.50, 0.70, 0.95] {
+            let s = colored_bar(frac, 10, None, /*stale*/ true, true);
+            assert!(s.contains("\x1b[90m"), "frac={}: expected grey: {:?}", frac, s);
+            // None of the live-tier colours may appear.
+            for live in ["\x1b[31m", "\x1b[32m", "\x1b[33m"] {
+                assert!(
+                    !s.contains(live),
+                    "frac={}: live colour leaked through: {:?}",
+                    frac,
+                    s
+                );
+            }
+        }
     }
 
     #[test]
