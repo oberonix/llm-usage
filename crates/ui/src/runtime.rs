@@ -103,7 +103,14 @@ pub async fn run(
     let refresh = handle.refresh.clone();
     let reload = handle.reload.clone();
     let mut state = build_state(&initial_config, store.clone());
-    let mut snapshots: BTreeMap<ProviderId, UsageSnapshot> = BTreeMap::new();
+    // Seed the in-memory cache from disk so a freshly started tray has
+    // *something* to show before the first poll completes (and so the
+    // first poll has a cache to graft from if it fails).
+    let mut snapshots: BTreeMap<ProviderId, UsageSnapshot> = llm_usage_core::read_snapshots()
+        .ok()
+        .flatten()
+        .map(|f| f.snapshots)
+        .unwrap_or_default();
     // Set the next-check anchor in the past so the first iteration
     // through the loop fires the check immediately (subject to the
     // user's `check_for_updates` flag).
@@ -118,13 +125,27 @@ pub async fn run(
                 snapshots.remove(&provider.id());
                 continue;
             }
-            let snapshot = match provider.poll().await {
+            let mut snapshot = match provider.poll().await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(provider = %provider.id(), error = %e, "poll failed");
                     UsageSnapshot::unavailable(provider.id(), format!("poll error: {}", e))
                 }
             };
+            // Fill any holes from the last good snapshot so providers
+            // with intermittent endpoints (Anthropic OAuth, Ollama
+            // session-cookie scrape, etc.) keep showing their last
+            // known quotas with a ⚠ marker rather than vanishing.
+            if let Some(cached) = snapshots.get(&provider.id()) {
+                let n = snapshot.merge_stale_from(cached);
+                if n > 0 {
+                    tracing::debug!(
+                        provider = %provider.id(),
+                        windows = n,
+                        "served cached quota windows as stale",
+                    );
+                }
+            }
             let _ = store.record_provider_state(
                 &provider.id().to_string(),
                 &format!("{:?}", snapshot.status),

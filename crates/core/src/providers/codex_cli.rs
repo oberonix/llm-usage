@@ -225,10 +225,12 @@ impl Provider for CodexCliProvider {
         ww.spend_usd = Some(bucket_7d.cost_usd);
 
         // Apply the most recent rate-limit snapshot we observed. Codex
-        // emits these on every API turn; if the snapshot's window has
-        // already rolled over (resets_at < now), we clamp fraction to
-        // 0 — the user hasn't run Codex since the window reset, so
-        // there's no fresher number to fold in.
+        // emits these on every API turn; even when the snapshot's
+        // declared `resets_at` has already passed, we keep the last
+        // known fraction in place — the user can't run Codex if
+        // they're locked out, so the API never produces a fresher
+        // record. Renderers detect the stale state from `ends_at`
+        // and surface a warning marker after a short grace period.
         let mut plan_label: Option<String> = None;
         if let Some(rl) = &collected.latest_rate_limits {
             plan_label = rl.plan_type.clone();
@@ -274,25 +276,22 @@ fn apply_rate_limits(
     bucket: RateLimitsBucket,
     now: DateTime<Utc>,
 ) {
-    let raw_frac = bucket.used_percent / 100.0;
-    // If the snapshot's window has already rolled (resets_at < now),
-    // the percentage tells us nothing about the *current* window: it's
-    // a leftover from the last codex CLI run. Surface that as "unknown"
-    // (fraction_used = None) rather than "0%", which would visually
-    // claim the user has used nothing. Downstream renderers (tray
-    // icon rotation, dashboard cards, CLI bars) skip windows without
-    // a fraction, so the row simply disappears until fresh data lands.
-    let still_in_window = bucket.resets_at.is_some_and(|t| t > now);
-    if still_in_window {
-        w.fraction_used = Some(raw_frac);
-        w.ends_at = bucket.resets_at;
-        w.started_at = Some(now);
-    } else {
-        // Leave fraction_used = None. We still keep `ends_at` cleared
-        // so the row doesn't accidentally show a past reset time.
-        w.fraction_used = None;
-        w.ends_at = None;
-    }
+    // Always surface the last known fraction (clamped to 0..1). When
+    // resets_at is in the past the data is stale, but the most useful
+    // thing is still "this is what we last saw": a user who hit 100 %
+    // and is still locked out wants to see "100 %", not a blank row.
+    //
+    // The `stale` flag tells downstream renderers to swap the reset
+    // countdown for a ⚠ marker. A 5-minute grace covers the gap
+    // between the declared reset moment and the next time the user
+    // actually runs codex CLI (which is what refreshes the data).
+    let raw_frac = (bucket.used_percent / 100.0).clamp(0.0, 1.0);
+    w.fraction_used = Some(raw_frac);
+    w.ends_at = bucket.resets_at;
+    w.started_at = Some(now);
+    w.stale = bucket
+        .resets_at
+        .is_some_and(|t| (now - t).num_seconds() > 5 * 60);
     let _ = bucket.window_minutes; // kept for future labelling
 }
 
@@ -815,19 +814,61 @@ mod tests {
     }
 
     #[test]
-    fn apply_rate_limits_drops_fraction_when_stale() {
+    fn apply_rate_limits_keeps_fraction_and_flags_stale() {
+        // When `resets_at` is in the past we deliberately keep the
+        // last observed fraction in place: the API only writes a
+        // rate_limits payload when the user actually runs Codex, and
+        // a quota-exhausted user can't. The previous "blank it out"
+        // behaviour was misleading — it made the row vanish exactly
+        // when the user most wanted to see it. The `stale` flag tells
+        // renderers to swap the reset countdown for a ⚠ marker.
         use crate::model::WindowUsage;
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
         let stale_bucket = RateLimitsBucket {
-            used_percent: 42.0,
+            used_percent: 97.0,
             window_minutes: 300,
-            resets_at: Some(now - chrono::Duration::minutes(5)),
+            // Past the 5-minute grace window.
+            resets_at: Some(now - chrono::Duration::minutes(10)),
         };
         apply_rate_limits(&mut w, stale_bucket, now);
-        // Stale snapshot → fraction is unknown, not 0.
-        assert!(w.fraction_used.is_none(), "got {:?}", w.fraction_used);
-        assert!(w.ends_at.is_none(), "stale ends_at should be cleared");
+        assert!((w.fraction_used.unwrap() - 0.97).abs() < 1e-9);
+        assert_eq!(w.ends_at, stale_bucket.resets_at);
+        assert!(w.stale, "expected stale flag past grace period");
+    }
+
+    #[test]
+    fn apply_rate_limits_within_grace_is_not_stale() {
+        // Just-past resets_at is in the grace window — codex CLI may
+        // be polled again in seconds. Don't flag stale yet.
+        use crate::model::WindowUsage;
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        let bucket = RateLimitsBucket {
+            used_percent: 80.0,
+            window_minutes: 300,
+            resets_at: Some(now - chrono::Duration::seconds(30)),
+        };
+        apply_rate_limits(&mut w, bucket, now);
+        assert!(!w.stale);
+    }
+
+    #[test]
+    fn apply_rate_limits_clamps_over_one_hundred() {
+        // Defensive: OpenAI has been observed to occasionally emit
+        // used_percent values slightly above 100 (e.g. 100.1 once a
+        // burst pushes past the soft cap). The bar widget expects a
+        // 0..1 fraction, so we clamp.
+        use crate::model::WindowUsage;
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        let bucket = RateLimitsBucket {
+            used_percent: 137.5,
+            window_minutes: 300,
+            resets_at: Some(now + chrono::Duration::hours(2)),
+        };
+        apply_rate_limits(&mut w, bucket, now);
+        assert_eq!(w.fraction_used, Some(1.0));
     }
 
     #[test]

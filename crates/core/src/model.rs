@@ -98,6 +98,13 @@ pub struct WindowUsage {
     pub limit_tokens: Option<u64>,
     /// 0.0–1.0+ if a limit is known. >1.0 means over.
     pub fraction_used: Option<f64>,
+    /// True when this window's quota fields came from a cached
+    /// snapshot rather than the current poll. Renderers replace the
+    /// reset countdown with a warning marker so the user knows the
+    /// number may be out of date. `#[serde(default)]` keeps old
+    /// on-disk snapshot files (pre-stale) deserialising cleanly.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 impl WindowUsage {
@@ -169,11 +176,194 @@ impl UsageSnapshot {
             }
         }
     }
+
+    /// Graft cached quota state from a previous snapshot onto this one,
+    /// marking any borrowed window as `stale`. Renderers replace the
+    /// reset countdown with a ⚠ marker for stale windows so the user
+    /// can tell live data from cached data at a glance.
+    ///
+    /// Two cases are merged:
+    ///
+    /// 1. A window present in `cached` but absent (or quota-empty) here
+    ///    — happens when a provider's quota endpoint is down. We copy
+    ///    the whole window in and mark it stale.
+    /// 2. A window present in both, but with `fraction_used = None`
+    ///    here — happens when the local-activity path succeeded but
+    ///    the quota path failed. We graft just the quota fields
+    ///    (`fraction_used`, `ends_at`, `started_at`, `limit_*`) so the
+    ///    activity counters from the fresh poll stay authoritative.
+    ///
+    /// Returns the number of windows that ended up stale, so callers
+    /// can log "served 2 stale windows from cache" if useful.
+    pub fn merge_stale_from(&mut self, cached: &UsageSnapshot) -> usize {
+        if self.provider != cached.provider {
+            return 0;
+        }
+        let mut stale_count = 0;
+        for (label, cw) in &cached.windows {
+            if cw.fraction_used.is_none() {
+                continue; // cache has nothing useful to graft
+            }
+            match self.windows.get_mut(label) {
+                Some(nw) if nw.fraction_used.is_none() => {
+                    nw.fraction_used = cw.fraction_used;
+                    nw.ends_at = cw.ends_at;
+                    nw.started_at = cw.started_at;
+                    nw.limit_usd = nw.limit_usd.or(cw.limit_usd);
+                    nw.limit_tokens = nw.limit_tokens.or(cw.limit_tokens);
+                    nw.stale = true;
+                    stale_count += 1;
+                }
+                None => {
+                    // Window didn't exist on the new snapshot at all
+                    // — e.g. poll() returned Err and produced an
+                    // `unavailable` snapshot. Reinstate the cached
+                    // window verbatim, then mark it stale.
+                    let mut copied = cw.clone();
+                    copied.stale = true;
+                    self.windows.insert(label.clone(), copied);
+                    stale_count += 1;
+                }
+                _ => {} // fresh fraction wins
+            }
+        }
+        // If the new snapshot has no headline AND nothing else useful,
+        // fall back to the cached headline so the menu/CLI still show
+        // a one-liner. Don't overwrite a fresh headline — that's the
+        // poll's own report.
+        if self.headline.is_none() && self.windows.values().all(|w| w.stale) {
+            self.headline = cached.headline.clone();
+        }
+        // Same for plan label.
+        if self.plan_label.is_none() {
+            self.plan_label = cached.plan_label.clone();
+        }
+        stale_count
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cached_snapshot_with_fraction(provider: ProviderId) -> UsageSnapshot {
+        let mut s = UsageSnapshot {
+            provider,
+            timestamp: Utc::now() - chrono::Duration::hours(1),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: Some("cached headline".into()),
+            plan_label: Some("Plus".into()),
+        };
+        s.windows.insert(
+            "5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.65),
+                ends_at: Some(Utc::now() + chrono::Duration::hours(2)),
+                limit_usd: Some(50.0),
+                ..Default::default()
+            },
+        );
+        s.windows.insert(
+            "week".into(),
+            WindowUsage {
+                fraction_used: Some(0.40),
+                ..Default::default()
+            },
+        );
+        s
+    }
+
+    #[test]
+    fn merge_stale_from_grafts_missing_windows() {
+        // Fresh poll completely failed → "unavailable" snapshot has no
+        // windows. Merge should reinstate the cached ones as stale.
+        let cached = cached_snapshot_with_fraction(ProviderId::Anthropic);
+        let mut fresh = UsageSnapshot::unavailable(ProviderId::Anthropic, "boom");
+        let n = fresh.merge_stale_from(&cached);
+        assert_eq!(n, 2, "both cached windows should be reinstated");
+        assert!(fresh.windows.get("5h").unwrap().stale);
+        assert!(fresh.windows.get("week").unwrap().stale);
+        // Headline backfilled when nothing fresh was available.
+        assert_eq!(fresh.headline.as_deref(), Some("cached headline"));
+        assert_eq!(fresh.plan_label.as_deref(), Some("Plus"));
+    }
+
+    #[test]
+    fn merge_stale_from_grafts_quota_when_activity_is_fresh() {
+        // Anthropic-style partial failure: token aggregation worked
+        // (fresh windows with counts) but the OAuth /usage call
+        // failed (so fraction_used is None). Cache should fill in
+        // just the fraction without clobbering activity counters.
+        let cached = cached_snapshot_with_fraction(ProviderId::Anthropic);
+        let mut fresh = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: Utc::now(),
+            status: ProviderStatus::Degraded,
+            error: Some("oauth down".into()),
+            windows: BTreeMap::new(),
+            headline: Some("fresh headline".into()),
+            plan_label: None,
+        };
+        fresh.windows.insert(
+            "5h".into(),
+            WindowUsage {
+                tokens_in: 12345,
+                tokens_out: 678,
+                request_count: 9,
+                ..Default::default()
+            },
+        );
+        let n = fresh.merge_stale_from(&cached);
+        assert_eq!(n, 2);
+        let w5h = fresh.windows.get("5h").unwrap();
+        assert_eq!(w5h.fraction_used, Some(0.65), "fraction grafted from cache");
+        assert_eq!(w5h.tokens_in, 12345, "fresh activity counters preserved");
+        assert!(w5h.stale, "grafted window flagged stale");
+        // Fresh headline wins — cache must not overwrite.
+        assert_eq!(fresh.headline.as_deref(), Some("fresh headline"));
+    }
+
+    #[test]
+    fn merge_stale_from_leaves_fresh_fractions_alone() {
+        // If the poll DID return fractions, don't overwrite them with
+        // the cache. (And don't mark them stale.)
+        let cached = cached_snapshot_with_fraction(ProviderId::Anthropic);
+        let mut fresh = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        fresh.windows.insert(
+            "5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.10),
+                ..Default::default()
+            },
+        );
+        fresh.merge_stale_from(&cached);
+        let w = fresh.windows.get("5h").unwrap();
+        assert_eq!(w.fraction_used, Some(0.10));
+        assert!(!w.stale);
+    }
+
+    #[test]
+    fn merge_stale_from_rejects_cross_provider_graft() {
+        // Defensive: never accept a graft from a different provider's
+        // cached snapshot. (Should be unreachable in practice, but the
+        // map is keyed by provider and a refactor mistake here would
+        // be very confusing to debug.)
+        let cached = cached_snapshot_with_fraction(ProviderId::Anthropic);
+        let mut fresh = UsageSnapshot::unavailable(ProviderId::CodexCli, "x");
+        let n = fresh.merge_stale_from(&cached);
+        assert_eq!(n, 0);
+        assert!(fresh.windows.is_empty());
+    }
 
     #[test]
     fn title_case_first_handles_common_inputs() {

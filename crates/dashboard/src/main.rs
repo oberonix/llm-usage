@@ -669,7 +669,17 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
                         .strong(),
                 );
             ui.add(bar);
-            if let Some(ends) = w.ends_at {
+            if w.stale {
+                // Fraction came from a cached snapshot rather than the
+                // current poll. Surface the warning in place of the
+                // reset countdown — the countdown would be misleading
+                // since the underlying data is the previous window's.
+                ui.label(
+                    RichText::new("⚠ stale")
+                        .color(Color32::from_rgb(240, 180, 60))
+                        .strong(),
+                );
+            } else if let Some(ends) = w.ends_at {
                 let secs = (ends - chrono::Utc::now()).num_seconds();
                 if secs > 0 {
                     ui.weak(reset_label(secs));

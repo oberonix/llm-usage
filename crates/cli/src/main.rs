@@ -296,19 +296,22 @@ fn format_quota_row(label: &str, w: &WindowUsage, use_color: bool) -> String {
     } else {
         pct_raw
     };
-    let reset = w
-        .ends_at
-        .and_then(|t| {
-            let secs = (t - chrono::Utc::now()).num_seconds();
-            if secs > 0 {
-                Some(format_reset(secs))
-            } else {
-                None
-            }
-        })
-        .map(|s| format!(" · {}", s))
-        .unwrap_or_default();
-    format!("{} {} · {}{}", bar, pct, label, reset)
+    let suffix = quota_suffix(w, chrono::Utc::now());
+    format!("{} {} · {}{}", bar, pct, label, suffix)
+}
+
+// Mirrors `quota_suffix` in the tray crate — see the comment there.
+//   stale flag → " · ⚠"
+//   future     → " · 2h"
+//   otherwise  → ""
+fn quota_suffix(w: &WindowUsage, now: chrono::DateTime<chrono::Utc>) -> String {
+    if w.stale {
+        return " · ⚠".to_string();
+    }
+    match w.ends_at {
+        Some(t) if t > now => format!(" · {}", format_reset((t - now).num_seconds())),
+        _ => String::new(),
+    }
 }
 
 fn unicode_bar(fraction: f64, cells: usize) -> String {
@@ -402,6 +405,29 @@ mod tests {
         assert_eq!(format_reset(3600), "1h");
         assert_eq!(format_reset(86_400), "1d");
         assert_eq!(format_reset(2 * 86_400), "2d");
+    }
+
+    #[test]
+    fn quota_suffix_dispatches_on_stale_flag() {
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        w.ends_at = Some(now + chrono::Duration::hours(2));
+        assert!(quota_suffix(&w, now).contains("2h"));
+        w.stale = true;
+        assert!(quota_suffix(&w, now).contains("⚠"));
+        // Stale wins over countdown.
+        assert!(!quota_suffix(&w, now).contains("2h"));
+    }
+
+    #[test]
+    fn format_quota_row_keeps_fraction_and_warns_when_stale() {
+        let mut w = WindowUsage::default();
+        w.fraction_used = Some(1.0);
+        w.ends_at = Some(chrono::Utc::now() + chrono::Duration::hours(2));
+        w.stale = true;
+        let s = format_quota_row("5h", &w, /*use_color*/ false);
+        assert!(s.contains("100%"), "expected fraction kept: {}", s);
+        assert!(s.contains("⚠"), "expected stale marker: {}", s);
     }
 
     #[test]
