@@ -20,7 +20,9 @@ use crate::pricing::{anthropic_default, AnthropicTokenUsage, ModelRate};
 use crate::provider::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Utc};
+#[cfg(test)]
+use chrono::TimeZone;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -524,11 +526,6 @@ fn same_iso_week(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
 
 fn same_month(a: DateTime<Utc>, b: DateTime<Utc>) -> bool {
     a.year() == b.year() && a.month() == b.month()
-}
-
-#[allow(dead_code)]
-fn epoch_utc() -> DateTime<Utc> {
-    Utc.timestamp_opt(0, 0).unwrap()
 }
 
 #[derive(Debug, Deserialize)]
