@@ -123,22 +123,16 @@ coverage-per-effort" and re-stated in the form of concrete actions.
 
 - [x] **C5. Coverage gate in CI** — landed in `acf8775`. Floor 60 %.
 
-- [ ] **C6. `cargo deny` + `cargo audit` in CI**
-  - Helps catch licence drift and CVE'd deps pre-tag. Worth doing
-    pre-launch — separate PR.
+- [x] **C6. `cargo deny` in CI** — `bb6a487`.
+  cargo-deny covers advisories + licences + sources + bans in one
+  pass; redundant with cargo-audit (which only does advisories).
 
 - [ ] **C7. README "first run" walkthrough screenshot**
   - Out of scope for autonomous work — note for the maintainer.
 
-- [ ] **C8. clippy cleanup pass (NEW)**
-  - `cargo clippy --workspace --all-targets -- -D warnings` flags
-    ~17 nits in the test code I added (mostly
-    `field_reassign_with_default` patterns: building a struct via
-    `Default::default()` then assigning fields). Tidying them up
-    would let CI enforce `-D warnings` without false positives.
-    Also: `items after a test module` in `config.rs` (real code
-    comes after the `#[cfg(test)] mod tests` block) and one
-    `unnecessary use of get().is_none()` in `anthropic.rs:720`.
+- [x] **C8. clippy cleanup pass** — `40b12ef`. Real-bug-shaped issues
+  fixed inline; two pure-style lints opted out at workspace level
+  via `[workspace.lints.clippy]`. CI now enforces `-D warnings`.
 
 ---
 
@@ -158,7 +152,12 @@ coverage-per-effort" and re-stated in the form of concrete actions.
   at 7 days (`31d63ef`); tray tracing default aligned to `info`;
   full B-list audit (clean except B6 macOS opencode path needs
   manual check); CI gains workspace tests + 60 % coverage gate
-  (`acf8775`). C2/C4/C5 done. New item C8 captures clippy nits.
+  (`acf8775`). C2/C4/C5 done.
+- 2026-05-12 — third iteration: clippy workspace clean and
+  `-D warnings` enforced in CI (`40b12ef`); cargo-deny job added
+  with licences / advisories / sources / bans all passing
+  (`bb6a487`). C8/C6 done; only B6 (macOS manual check), C1, C3,
+  C7 remain.
 
 ---
 
@@ -166,4 +165,6 @@ coverage-per-effort" and re-stated in the form of concrete actions.
 
 - Latest cargo test workspace: **224 passed, 0 failed.**
 - Latest coverage: **~67.7 % lines.**
-- Open items: 5 (A: 0, B: 1 [B6 macOS manual check], C: 4 — C1, C3, C6, C7, C8).
+- Latest cargo deny: **all four checks green** (with documented
+  ignores for transitive gtk-rs / fxhash unmaintained advisories).
+- Open items: 4 (A: 0, B: 1 [B6 macOS manual check], C: 3 — C1, C3, C7).
