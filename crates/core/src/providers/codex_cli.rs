@@ -702,6 +702,123 @@ mod tests {
         assert_eq!(secondary.window_minutes, 10080);
     }
 
+    // ---- parse_rate_limits_bucket: corner cases ----
+
+    fn json(v: serde_json::Value) -> serde_json::Value {
+        v
+    }
+
+    #[test]
+    fn bucket_missing_used_percent_returns_none() {
+        let v = json(serde_json::json!({"window_minutes": 300, "resets_at": 1778000000}));
+        assert!(parse_rate_limits_bucket(&v).is_none());
+    }
+
+    #[test]
+    fn bucket_missing_window_minutes_returns_none() {
+        let v = json(serde_json::json!({"used_percent": 12.0, "resets_at": 1778000000}));
+        assert!(parse_rate_limits_bucket(&v).is_none());
+    }
+
+    #[test]
+    fn bucket_null_resets_at_is_tolerated() {
+        // v0.129+ sometimes emits resets_at: null alongside otherwise
+        // valid bucket data. We accept the percentage/window and
+        // leave the reset time unset.
+        let v = json(serde_json::json!({
+            "used_percent": 42.0,
+            "window_minutes": 60,
+            "resets_at": null,
+        }));
+        let b = parse_rate_limits_bucket(&v).unwrap();
+        assert!((b.used_percent - 42.0).abs() < 1e-6);
+        assert_eq!(b.window_minutes, 60);
+        assert!(b.resets_at.is_none());
+    }
+
+    #[test]
+    fn bucket_non_numeric_used_percent_returns_none() {
+        // Defensive: an upstream typo emitting a string instead of a
+        // number should not panic — `parse_rate_limits_bucket` returns
+        // None so the record falls through to the parent guard.
+        let v = json(serde_json::json!({
+            "used_percent": "27.5",
+            "window_minutes": 300,
+        }));
+        assert!(parse_rate_limits_bucket(&v).is_none());
+    }
+
+    // ---- parse_rate_limits (outer record): corner cases ----
+
+    #[test]
+    fn record_missing_record_at_returns_none() {
+        // No timestamp at all → we can't place the record in time, so
+        // reject the whole thing. Otherwise it'd silently win over a
+        // record with a real timestamp later.
+        let v = json(serde_json::json!({
+            "primary": {"used_percent": 1.0, "window_minutes": 300, "resets_at": 1778000000},
+        }));
+        assert!(parse_rate_limits(&v, None).is_none());
+    }
+
+    #[test]
+    fn record_with_only_credits_and_null_buckets_is_kept() {
+        // Codex CLI v0.129+ emits rate_limits with both buckets null
+        // (plus a `credits` block) when the user is on a plan that
+        // surfaces credits. We must keep the record (so it
+        // supersedes any earlier numbers) even though it carries no
+        // percentage data.
+        let v = json(serde_json::json!({
+            "primary": null,
+            "secondary": null,
+            "credits": {"used_pct": 0.0},
+            "plan_type": "plus",
+        }));
+        let now = Utc::now();
+        let rec = parse_rate_limits(&v, Some(now)).unwrap();
+        assert!(rec.primary.is_none());
+        assert!(rec.secondary.is_none());
+        assert_eq!(rec.plan_type.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn record_propagates_rate_limit_reached_type() {
+        let v = json(serde_json::json!({
+            "primary": null,
+            "secondary": null,
+            "rate_limit_reached_type": "session",
+            "plan_type": "plus",
+        }));
+        let rec = parse_rate_limits(&v, Some(Utc::now())).unwrap();
+        assert_eq!(rec.rate_limit_reached_type.as_deref(), Some("session"));
+    }
+
+    #[test]
+    fn record_with_only_primary_is_valid() {
+        // Older CLI versions don't emit a secondary bucket at all.
+        let v = json(serde_json::json!({
+            "primary": {"used_percent": 33.0, "window_minutes": 300, "resets_at": 1778000000},
+        }));
+        let rec = parse_rate_limits(&v, Some(Utc::now())).unwrap();
+        assert!(rec.primary.is_some());
+        assert!(rec.secondary.is_none());
+        assert!(rec.plan_type.is_none());
+    }
+
+    #[test]
+    fn record_with_malformed_primary_drops_only_that_bucket() {
+        // primary is unparseable (missing fields) → drop primary but
+        // keep secondary and the rest of the record.
+        let v = json(serde_json::json!({
+            "primary": {"used_percent": 1.0},  // window_minutes missing
+            "secondary": {"used_percent": 50.0, "window_minutes": 10080, "resets_at": 1778000000},
+            "plan_type": "plus",
+        }));
+        let rec = parse_rate_limits(&v, Some(Utc::now())).unwrap();
+        assert!(rec.primary.is_none(), "malformed primary dropped");
+        assert!(rec.secondary.is_some());
+    }
+
     /// Builds a minimal opencode-shaped SQLite file at `path` with two
     /// messages: one user (which the parser should skip) and one
     /// assistant in the requested `provider_id`.
