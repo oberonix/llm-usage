@@ -53,8 +53,24 @@ async fn main() -> Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("llm-usage {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let force_refresh = args.iter().any(|a| a == "--refresh");
     let once = args.iter().any(|a| a == "--once");
+    // Surface typos rather than silently dropping into watch mode.
+    if let Some(unknown) = args.iter().find(|a| {
+        !matches!(a.as_str(), "--refresh" | "--once" | "--help" | "-h" | "--version" | "-V")
+    }) {
+        eprintln!("unknown flag: {unknown}\n");
+        print_usage();
+        std::process::exit(2);
+    }
 
     if force_refresh {
         // Best-effort: tells the tray to poll immediately. Tray's
@@ -70,6 +86,26 @@ async fn main() -> Result<()> {
     } else {
         run_live(use_color).await
     }
+}
+
+fn print_usage() {
+    println!(
+        "llm-usage — tray-equivalent CLI view of LLM provider quotas.\n\
+         \n\
+         USAGE:\n\
+            llm-usage [FLAGS]\n\
+         \n\
+         FLAGS:\n\
+            --once         Render the current snapshot once and exit. Defaults\n\
+                           to live mode (re-renders when the tray writes).\n\
+            --refresh      Touch the tray's refresh trigger before rendering,\n\
+                           so the next snapshot is fresh rather than cached.\n\
+            -h, --help     Show this message.\n\
+            -V, --version  Print the binary version.\n\
+         \n\
+         Reads `snapshots.json` written by `llm-usage-tray`. If the tray isn't\n\
+         running, falls back to polling every enabled provider directly."
+    );
 }
 
 /// One-shot mode — render the current data and exit. Reads
