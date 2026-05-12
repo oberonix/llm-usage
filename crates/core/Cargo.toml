@@ -20,7 +20,6 @@ chrono.workspace = true
 directories.workspace = true
 dirs.workspace = true
 walkdir.workspace = true
-once_cell.workspace = true
 scraper.workspace = true
 regex.workspace = true
 semver.workspace = true
