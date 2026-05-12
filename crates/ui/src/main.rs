@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tokio::sync::Notify;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::runtime::{RuntimeHandle, RuntimeMessage};
 
@@ -67,9 +67,16 @@ fn main() -> Result<()> {
         .with_menu(Box::new(build_menu(&BTreeMap::new(), None)))
         .with_tooltip("llm-usage — waiting for first poll")
         .with_icon(icon::render_placeholder())
-        // Left-click spawns the popup window instead of opening the
-        // native menu. Right-click still shows the menu.
-        .with_menu_on_left_click(false)
+        // Left-click pops the menu. We used to set this to `false` so
+        // a left-click could spawn the compact popup view instead and
+        // reserve right-click for the menu, but Pop!_OS COSMIC's
+        // panel doesn't forward a "context-menu requested" event to
+        // SNI items — only the primary activation — so right-click
+        // never showed the menu. Defaulting to left-click-shows-menu
+        // works on every desktop tray host we care about, at the cost
+        // of dropping the click-to-popup shortcut (still reachable
+        // via the menu's "Open dashboard" item).
+        .with_menu_on_left_click(true)
         .build()?;
 
     let refresh = Arc::new(Notify::new());
@@ -209,16 +216,12 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Ok(TrayIconEvent::Click {
-            button: MouseButton::Left,
-            button_state: MouseButtonState::Up,
-            ..
-        }) = tray_channel.try_recv()
-        {
-            // Spawn (or focus, if already running) the popup
-            // window with the graphical quota view.
-            spawn_dashboard(&["--popup"]);
-        }
+        // Drain any tray click events without acting on them — the
+        // menu now pops on left-click via the builder's
+        // `with_menu_on_left_click(true)`, so there's nothing for us
+        // to do per-click. If we leave events un-drained the channel
+        // fills up and the tray-icon library starts logging warnings.
+        while tray_channel.try_recv().is_ok() {}
     });
 }
 
