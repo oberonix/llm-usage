@@ -29,11 +29,16 @@ use serde::Deserialize;
 /// Within this window we serve the cached `OAuthBackoff::last_good`
 /// instead of re-fetching — protects against file-watcher-driven
 /// refresh storms (Claude Code can write to `~/.claude/projects/`
-/// once per assistant turn, which would otherwise trigger one OAuth
-/// call per turn). 60 s is the sweet spot: fresh enough that the 5h
-/// quota fraction lags by at most a minute, slow enough that we
-/// won't surprise-429 ourselves under heavy use.
-const MIN_HTTP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// once per assistant turn).
+///
+/// Empirically 60 s is *not* safe: under heavy Claude Code use we
+/// were getting 429'd within 30 minutes. 300 s matches the
+/// `OAuthBackoff::INITIAL_COOLDOWN_SECS` floor — the same interval
+/// Anthropic implicitly tells us is acceptable. Local-file token
+/// counts still update instantly via the data-source watcher, so
+/// only the quota *percentage* fraction lags by up to 5 min, which
+/// is still 3× fresher than the pre-watcher 15 min default.
+const MIN_HTTP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
