@@ -18,7 +18,8 @@ path = "src/main.rs"
 llm-usage-core = { path = "../core" }
 anyhow.workspace = true
 tokio.workspace = true
-tracing.workspace = true
+# `tracing` is used transitively via `tracing-subscriber`'s
+# `tracing` re-export; the cli main only calls the subscriber.
 tracing-subscriber.workspace = true
 chrono.workspace = true
 notify.workspace = true

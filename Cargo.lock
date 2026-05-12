@@ -3151,7 +3151,6 @@ dependencies = [
  "llm-usage-core",
  "notify",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -3196,7 +3195,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -3223,17 +3221,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "directories",
  "gtk",
  "image",
  "llm-usage-core",
  "notify",
  "notify-rust",
- "serde",
- "serde_json",
  "tao",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
