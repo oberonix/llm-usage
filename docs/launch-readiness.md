@@ -158,13 +158,35 @@ coverage-per-effort" and re-stated in the form of concrete actions.
   with licences / advisories / sources / bans all passing
   (`bb6a487`). C8/C6 done; only B6 (macOS manual check), C1, C3,
   C7 remain.
+- 2026-05-12 — fourth iteration: real bug fixed — `Config::save`
+  was non-atomic under dashboard auto-save (`6e471c2`); Anthropic
+  OAuth 429-cooldown cache now flags `WindowUsage.stale` so the
+  per-row ⚠ matches the merge-from-cache renderer
+  (`5536866`); centralised STALE_MARKER (`dcfcb1a`); C3 done.
+- 2026-05-12 — fifth iteration: AlertsConfig.debounce_secs
+  documented as a no-op (`006d3f2`); README OpenAI billing-endpoint
+  drift removed (`4db1cd1`); CLI gained --help / --version /
+  unknown-flag exit (`83279d4`); SECURITY credential list refreshed
+  (`b7f962c`).
+- 2026-05-12 — sixth iteration: release workflow now runs the test
+  suite before building the macOS bundle and Linux tarball
+  (`4874d97`); tray logs dashboard-spawn failures (`3a85886`).
 
 ---
 
 ## Footer (updated each pass)
 
-- Latest cargo test workspace: **224 passed, 0 failed.**
-- Latest coverage: **~67.7 % lines.**
+- Latest cargo test workspace: **228 passed, 0 failed.**
+- Latest coverage: **~67.7 % lines.** Remaining sub-80 % files
+  (`runtime.rs` 0 %, `dashboard/settings.rs` 24 %, `dashboard/main.rs`
+  ~15 %, `ui/main.rs` 22 %, `setup/main.rs` 39 %, `cli/main.rs` 64 %)
+  are all event-loop / egui / webview scaffolding — unit testing
+  surfaces little real-bug value vs. the cost of mocking the
+  framework. Closing this gap would mean integration tests that
+  spawn the binaries.
 - Latest cargo deny: **all four checks green** (with documented
   ignores for transitive gtk-rs / fxhash unmaintained advisories).
-- Open items: 4 (A: 0, B: 1 [B6 macOS manual check], C: 3 — C1, C3, C7).
+- Latest cargo clippy: **clean with `-D warnings`**.
+- Open items: 3 (B6 macOS manual check, C1 last_fresh_at, C7
+  README screenshot — all out of scope for autonomous code work
+  or low-value UX nits).
