@@ -29,6 +29,13 @@ jobs:
             libwebkit2gtk-4.1-dev libsoup-3.0-dev \
             pkg-config libssl-dev
 
+      # Re-run the test suite on the exact commit being released.
+      # CI on main already runs this, but a tag could legitimately
+      # point to a stale commit (workflow_dispatch with an old tag,
+      # or a merge race) — better to fail loudly than ship broken
+      # binaries.
+      - run: cargo test --workspace --release
+
       - name: Build
         run: |
           cargo build --release \
@@ -85,6 +92,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo install cargo-bundle --locked || true
+
+      # Same rationale as the Linux job — re-test the tagged commit
+      # so a workflow_dispatch with a stale tag can't ship a broken
+      # macOS .app. macOS runners can build everything without
+      # apt-get prerequisites.
+      - run: cargo test --workspace --release --target ${{ matrix.target }}
 
       - name: Build binaries
         run: |
