@@ -263,8 +263,14 @@ fn build_menu(
                 // per-model weekly buckets (Sonnet, Opus) live in the
                 // full dashboard; the tray menu shows just the
                 // all-models 5h and weekly rows so the menu stays narrow.
+                // (Pre-rename these were "week (Sonnet)" / "week (Opus)";
+                // commit 83a8286 dropped the "week (" prefix without
+                // updating this filter, which silently leaked four-row
+                // menus instead of two-row ones into the tray and may
+                // have been what made the menu unscrollable on smaller
+                // panels.)
                 w.fraction_used.is_some()
-                    && !label.as_str().starts_with("week (")
+                    && !matches!(label.as_str(), "Sonnet" | "Opus")
             })
             .collect();
         let has_activity = snap
