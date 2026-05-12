@@ -35,6 +35,10 @@ jobs:
             libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
             libwebkit2gtk-4.1-dev libsoup-3.0-dev \
             pkg-config libssl-dev
+      # Run the full workspace test suite — the dashboard / tray / cli
+      # crates have GUI deps the test-core job can't install. Keeping
+      # both jobs means a pure-core regression still fast-fails.
+      - run: cargo test --workspace
       - run: cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
       - uses: actions/upload-artifact@v4
         with:
@@ -44,6 +48,29 @@ jobs:
             target/release/llm-usage-dashboard
             target/release/llm-usage-setup
             target/release/llm-usage
+
+  coverage:
+    name: coverage gate
+    runs-on: ubuntu-latest
+    # Pinning the floor at 60 % keeps regressions visible without
+    # locking in today's exact 67 %. Bump as new tests land.
+    env:
+      LINE_COVERAGE_FLOOR: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install GUI deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            pkg-config libssl-dev
+      - run: cargo install cargo-llvm-cov --locked
+      - run: cargo llvm-cov --workspace --fail-under-lines $LINE_COVERAGE_FLOOR --summary-only
 
   build-macos:
     name: build (macos)
