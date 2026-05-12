@@ -543,6 +543,7 @@ struct CacheCreation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::Write;
     use tempfile::TempDir;
 
@@ -670,6 +671,99 @@ mod tests {
         // tokens_in is the sum of input + every cache bucket.
         assert_eq!(a.tokens_in, 100 + 25 + 10 + 5);
         assert_eq!(a.tokens_out, 50);
+    }
+
+    #[test]
+    fn apply_oauth_usage_populates_canonical_windows() {
+        use crate::anthropic_oauth::{OAuthUsageResponse, QuotaBucket};
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        let resets_5h = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        let resets_7d = (Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+        let usage = OAuthUsageResponse {
+            five_hour: Some(QuotaBucket {
+                utilization: 55.0,
+                resets_at: Some(resets_5h),
+            }),
+            seven_day: Some(QuotaBucket {
+                utilization: 58.0,
+                resets_at: Some(resets_7d.clone()),
+            }),
+            seven_day_sonnet: Some(QuotaBucket {
+                utilization: 31.0,
+                resets_at: Some(resets_7d.clone()),
+            }),
+            seven_day_opus: None,
+            extra_usage: None,
+        };
+        let mut headline = String::new();
+        apply_oauth_usage(&mut snap, &usage, Utc::now(), &mut headline);
+
+        // 5h and week populate at canonical labels.
+        let five_h = snap
+            .window(WindowKind::FiveHourRolling)
+            .expect("5h present");
+        assert!((five_h.fraction_used.unwrap() - 0.55).abs() < 1e-9);
+        let week = snap.window(WindowKind::ThisWeek).expect("week present");
+        assert!((week.fraction_used.unwrap() - 0.58).abs() < 1e-9);
+        // Sonnet-specific weekly stashed as its own labelled window.
+        let sonnet = snap.windows.get("week (Sonnet)").expect("sonnet present");
+        assert!((sonnet.fraction_used.unwrap() - 0.31).abs() < 1e-9);
+        // Opus absent from response → window not created.
+        assert!(snap.windows.get("week (Opus)").is_none());
+        // Compact headline includes 5h and 7d but not the per-model
+        // breakdown (those would make it too noisy).
+        assert!(headline.contains("5h 55%"), "got: {headline}");
+        assert!(headline.contains("7d 58%"), "got: {headline}");
+        assert!(!headline.contains("Sonnet"), "got: {headline}");
+    }
+
+    #[test]
+    fn fill_quota_window_handles_unparseable_resets_at() {
+        // QuotaBucket whose resets_at can't be parsed — fraction
+        // should still populate, ends_at falls back to None so the
+        // renderer doesn't show a phantom countdown.
+        use crate::anthropic_oauth::QuotaBucket;
+        let now = Utc::now();
+        let mut w = WindowUsage::default();
+        let q = QuotaBucket {
+            utilization: 12.5,
+            resets_at: Some("not a date".to_string()),
+        };
+        fill_quota_window(&mut w, &q, now);
+        assert_eq!(w.fraction_used, Some(0.125));
+        assert!(w.ends_at.is_none());
+        assert_eq!(w.started_at, Some(now));
+    }
+
+    #[test]
+    fn fill_quota_window_zero_utilization_records_zero_not_none() {
+        use crate::anthropic_oauth::QuotaBucket;
+        let now = Utc::now();
+        let mut w = WindowUsage::default();
+        fill_quota_window(
+            &mut w,
+            &QuotaBucket {
+                utilization: 0.0,
+                resets_at: None,
+            },
+            now,
+        );
+        assert_eq!(w.fraction_used, Some(0.0));
+    }
+
+    #[test]
+    fn default_projects_dir_ends_in_claude_projects() {
+        let p = default_projects_dir();
+        let s = p.to_string_lossy();
+        assert!(s.ends_with(".claude/projects"), "got: {s}");
     }
 
     #[test]

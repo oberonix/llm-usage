@@ -271,6 +271,14 @@ impl Provider for CodexCliProvider {
     }
 }
 
+/// How long after a Codex rate-limits record's declared `resets_at`
+/// we keep treating the recorded fraction as "current" before
+/// flipping the `stale` flag. Five minutes is the rough latency
+/// between the API window rolling over and the user's next codex CLI
+/// invocation that would refresh the snapshot — short enough not to
+/// hide real staleness, long enough to absorb a clock-skew tick.
+const STALE_GRACE_SECS: i64 = 5 * 60;
+
 fn apply_rate_limits(
     w: &mut crate::model::WindowUsage,
     bucket: RateLimitsBucket,
@@ -282,7 +290,7 @@ fn apply_rate_limits(
     // and is still locked out wants to see "100 %", not a blank row.
     //
     // The `stale` flag tells downstream renderers to swap the reset
-    // countdown for a ⚠ marker. A 5-minute grace covers the gap
+    // countdown for a ⚠ marker. `STALE_GRACE_SECS` covers the gap
     // between the declared reset moment and the next time the user
     // actually runs codex CLI (which is what refreshes the data).
     let raw_frac = (bucket.used_percent / 100.0).clamp(0.0, 1.0);
@@ -291,7 +299,7 @@ fn apply_rate_limits(
     w.started_at = Some(now);
     w.stale = bucket
         .resets_at
-        .is_some_and(|t| (now - t).num_seconds() > 5 * 60);
+        .is_some_and(|t| (now - t).num_seconds() > STALE_GRACE_SECS);
     let _ = bucket.window_minutes; // kept for future labelling
 }
 
