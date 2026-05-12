@@ -24,5 +24,13 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 notify.workspace = true
 
+[dev-dependencies]
+# Spawn the built `llm-usage` binary and assert on its
+# stdout / stderr / exit code. Used by the integration tests
+# under `tests/`.
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
 [lints]
 workspace = true
