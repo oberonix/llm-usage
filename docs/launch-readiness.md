@@ -55,63 +55,49 @@ coverage-per-effort" and re-stated in the form of concrete actions.
 
 ## B. Bugs / risk hunt
 
-Things to actively look for, not just write tests for. Add findings
-inline as bullets when discovered.
-
-- [ ] **B1. Audit error paths for `unwrap`/`expect`/`panic` in non-test code**
-  - Run `grep -rn 'unwrap()\|expect(' crates/*/src/` and triage. The
-    Provider trait runs inside a tokio task — a panic there silently
-    kills the polling loop on that provider.
-
-- [ ] **B2. Audit `tokio::time::sleep` / select! for cancel-safety**
-  - The runtime's `select!` has three branches. Verify that
-    cancelling the refresh-notified branch doesn't lose state.
-
-- [ ] **B3. Config reload semantics**
-  - When the user changes `poll_interval_secs` from 900 → 60 mid-run,
-    is the in-flight sleep cancelled? Verify the reload Notify wakes
-    the select! and the new interval applies on the next iteration.
-
-- [ ] **B4. Snapshot-file growth / staleness on disabled providers**
-  - When a provider is toggled disabled, its entry is removed
-    in-memory but the on-disk file still has it after the next
-    write. Confirm the write replaces the file wholesale (it does,
-    via atomic write) — but seed-on-startup will re-introduce the
-    disabled provider into the in-memory map for one iteration.
-    Maybe filter at read time.
-
-- [ ] **B5. Anthropic OAuth: token write race**
-  - When the credentials file is refreshed by Claude Code in
-    parallel with the tray, both may want to write. Confirm we
-    re-read on every poll rather than caching the parsed cred for
-    the lifetime of the provider.
-
-- [ ] **B6. macOS path resolution**
-  - Spot-check every `~/.codex`, `~/.claude`, `~/.local/share/opencode`
-    site for a macOS-equivalent. opencode uses XDG on Linux but
-    Library/Application Support on macOS. Confirm we handle both.
-
-- [ ] **B7. `--release` build is the one used in distribution**
-  - Confirm `cargo test --release` still passes (some bugs only
-    show with optimizations on, eg. inlined floating-point rounding).
-
-- [ ] **B8. Tracing levels in shipped binaries**
-  - `tracing::debug!` should be filtered out by default. Confirm
-    `tracing_subscriber` filter respects `RUST_LOG` and defaults to
-    `info` everywhere.
-
-- [ ] **B9. The 5-min stale grace is hard-coded in three places**
-  - `apply_rate_limits` (codex), `quota_suffix` (tray), `quota_suffix`
-    (cli). Now that I've simplified the renderers to dispatch on the
-    `stale` flag, the renderers don't repeat the grace logic. But
-    the provider-side grace is still a magic number. Consider
-    making it a `const STALE_GRACE: Duration`.
-
-- [ ] **B10. Provider list rebuild on config reload**
-  - `build_state` recreates every Provider from scratch. If a
-    Provider had any internal cache (eg. HTTP client connection
-    pool), that's dropped. Verify there's no surprising perf hit.
-    Mostly informational.
+- [x] **B1. unwrap/expect/panic audit** — clean.
+  > Every non-test `unwrap`/`expect` falls into one of three safe
+  > buckets: (a) provably-safe ops like `Utc.timestamp_opt(0, 0)` and
+  > pre-compiled regex/icon construction, (b) `Mutex::lock().expect("poisoned")`
+  > where panic propagation is the right semantic, (c) `reqwest::Client::builder()`
+  > whose only failure is a misconfigured TLS backend baked at compile time.
+- [x] **B2. tokio select! cancel safety** — audited, correct.
+  > `Notify::notify_one` queues one permit if no waiter exists; on
+  > select! cancellation, `Notified::drop` returns any claimed permit.
+  > So a refresh / reload signal arriving between iterations is
+  > preserved across the next `notified()` poll.
+- [x] **B3. Config reload semantics** — audited, correct.
+  > `state.interval` is captured per `build_state(new_cfg)`. When the
+  > reload branch wins, the in-flight `tokio::time::sleep` is dropped
+  > (cancel-safe), state is rebuilt with the new interval, and the
+  > next iteration's sleep uses it.
+- [x] **B4. Snapshot-file growth on disabled providers** — audited, correct.
+  > The poll-loop removes `!provider.enabled()` from the in-memory
+  > map before `write_snapshots`. Seed-on-startup re-introduces them
+  > for one iteration but the first loop pass scrubs them. No durable
+  > drift.
+- [x] **B5. Anthropic OAuth token write race** — audited, no race.
+  > `OAuthCredentials::load()` re-reads the file on every poll. We
+  > never write to that file; Claude Code is the sole writer. A read
+  > mid-Claude-Code-write fails JSON parse → one degraded snapshot,
+  > recovers on next poll.
+- [~] **B6. macOS path resolution** — mostly correct, one open question.
+  > `~/.codex`, `~/.claude/.credentials.json`, `~/.claude/projects/`
+  > are written by Claude Code / codex CLI consistently across
+  > platforms. Open: `dirs::data_dir()` resolves to
+  > `~/Library/Application Support/opencode/opencode.db` on macOS;
+  > confirm opencode's macOS build actually writes there (vs an
+  > XDG-style `~/.local/share/opencode/`). Manual check needed.
+- [x] **B7. `cargo test --release` passes** — verified.
+- [x] **B8. Tracing levels in shipped binaries** — aligned at `info`.
+  > Tray's default dropped from `info,llm_usage=debug,llm_usage_core=debug`
+  > to plain `info` to match dashboard / setup. Users debug via
+  > `RUST_LOG=...`.
+- [x] **B9. STALE_GRACE_SECS const** — landed in `e0b5d81`.
+- [~] **B10. Provider list rebuild on config reload** — informational.
+  > Each reload constructs three new providers, each with a fresh
+  > `reqwest::Client` (no shared keep-alive pool). Cold-start cost
+  > of building a reqwest client is sub-millisecond; ignoring.
 
 ---
 
@@ -119,42 +105,40 @@ inline as bullets when discovered.
 
 - [ ] **C1. `merge_stale_from`: keep last-fresh-time per window**
   - Right now we know "this is stale" but not "this is from
-    3 hours ago". Adding a `last_fresh_at: Option<DateTime<Utc>>`
-    field would let renderers say "5 % · ⚠ 3h ago" instead of just
-    "5 % · ⚠". Trade-off: more UI noise. Worth it? Decide after
+    3 hours ago". Trade-off: more UI noise. Worth it? Decide after
     living with the current behaviour for a day.
 
-- [ ] **C2. Cap cache age**
-  - If Anthropic OAuth has been broken for 7 days, the cached 55 %
-    no longer reflects reality. Should we expire from cache after
-    some absolute age? Probably 7d.
+- [x] **C2. Cap cache age at 7 days** — `31d63ef`.
 
 - [ ] **C3. Centralise the warning character**
   - `" · ⚠"` appears in two renderers (tray + cli). Move to a
-    `WARN_MARK: &str = "⚠"` const in `core::model` or a small
-    `core::display` module so a future "swap to ??" change is
-    one-line.
+    `WARN_MARK: &str = "⚠"` const so a future "swap to ??" change
+    is one-line. Low priority — current is two-site, trivially
+    grep-able.
 
-- [ ] **C4. Headline "(no headline)" placeholder leaks into UI**
-  - Saw this once in `print_snapshots` output during a degraded
-    poll. Make sure the tray menu / CLI don't render that literal —
-    they should fall back to the cached headline (the merge does
-    this) or skip.
+- [x] **C4. Headline "(no headline)" placeholder leaks into UI** —
+  handled by `merge_stale_from`'s headline fallback. The literal
+  "(no headline)" only appears in `print_snapshots` (a debug
+  example), not the tray/CLI/dashboard.
 
-- [ ] **C5. Coverage gate in CI**
-  - Add `cargo llvm-cov --workspace --fail-under-lines 60` to
-    `.github/workflows/ci.yml`. Bump the floor each time a coverage
-    PR lands.
+- [x] **C5. Coverage gate in CI** — landed in `acf8775`. Floor 60 %.
 
 - [ ] **C6. `cargo deny` + `cargo audit` in CI**
-  - Same workflow file. Helps catch licence drift and CVE'd deps
-    pre-tag.
+  - Helps catch licence drift and CVE'd deps pre-tag. Worth doing
+    pre-launch — separate PR.
 
 - [ ] **C7. README "first run" walkthrough screenshot**
-  - The README has setup steps but no picture of the tray icon /
-    menu / dashboard. A single screenshot at the top conveys the
-    value prop instantly. Out of scope for autonomous code work —
-    note here for the maintainer.
+  - Out of scope for autonomous work — note for the maintainer.
+
+- [ ] **C8. clippy cleanup pass (NEW)**
+  - `cargo clippy --workspace --all-targets -- -D warnings` flags
+    ~17 nits in the test code I added (mostly
+    `field_reassign_with_default` patterns: building a struct via
+    `Default::default()` then assigning fields). Tidying them up
+    would let CI enforce `-D warnings` without false positives.
+    Also: `items after a test module` in `config.rs` (real code
+    comes after the `#[cfg(test)] mod tests` block) and one
+    `unnecessary use of get().is_none()` in `anthropic.rs:720`.
 
 ---
 
@@ -169,11 +153,17 @@ inline as bullets when discovered.
 - 2026-05-12 — A2..A9 landed across `2452679`, `f63d5d5`, `53e9142`,
   `c9fdd9c`, `941e7fc`, `4e43157`, `5fbac2c`. Coverage 57.64 → 66.80 %.
   Net 67 new tests; nothing flaky; A5 punted with rationale.
+- 2026-05-12 — second iteration: anthropic `apply_oauth_usage`
+  corner tests (`e0b5d81`); STALE_GRACE_SECS const; cache-age cap
+  at 7 days (`31d63ef`); tray tracing default aligned to `info`;
+  full B-list audit (clean except B6 macOS opencode path needs
+  manual check); CI gains workspace tests + 60 % coverage gate
+  (`acf8775`). C2/C4/C5 done. New item C8 captures clippy nits.
 
 ---
 
 ## Footer (updated each pass)
 
-- Latest cargo test workspace: **199 passed, 0 failed.**
-- Latest coverage: **66.80 % lines.**
-- Open items: 17 (A: 0, B: 10, C: 7).
+- Latest cargo test workspace: **224 passed, 0 failed.**
+- Latest coverage: **~67.7 % lines.**
+- Open items: 5 (A: 0, B: 1 [B6 macOS manual check], C: 4 — C1, C3, C6, C7, C8).
