@@ -628,7 +628,17 @@ fn spawn_dashboard(args: &[&str]) {
         .filter(|p| p.exists())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "llm-usage-dashboard".to_string());
-    let _ = std::process::Command::new(&cmd).args(args).spawn();
+    // Log spawn failures so the user has a fighting chance of
+    // diagnosing "the menu click did nothing". Most commonly this
+    // hits when the user moves the tray binary out of the sibling
+    // directory of the dashboard binary — e.g. `cargo install
+    // llm-usage-tray` without also installing the dashboard.
+    if let Err(e) = std::process::Command::new(&cmd).args(args).spawn() {
+        tracing::warn!(
+            command = %cmd, error = %e,
+            "failed to spawn dashboard — is llm-usage-dashboard installed alongside llm-usage-tray?"
+        );
+    }
 }
 
 /// Repaint the tray icon and update its tooltip for whichever
