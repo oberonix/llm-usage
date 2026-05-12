@@ -24,6 +24,12 @@ tray-icon = "0.21"
 tao = "0.34"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+[dev-dependencies]
+# Lets runtime.rs tests implement the async `Provider` trait via
+# fake doubles. Production code in this crate doesn't touch the
+# trait directly — providers come pre-boxed from core.
+async-trait = "0.1"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 
