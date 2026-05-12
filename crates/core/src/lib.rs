@@ -5,6 +5,7 @@ pub mod pricing;
 pub mod provider;
 pub mod providers;
 pub mod quota;
+pub mod opencode;
 pub mod snapshots_io;
 pub mod storage;
 pub mod updates;

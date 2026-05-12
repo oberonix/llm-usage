@@ -23,6 +23,14 @@ pub struct Config {
     /// entirely. The only outbound traffic that isn't to a data
     /// provider — see SECURITY.md.
     pub check_for_updates: bool,
+    /// Optional path to opencode's SQLite store. Every provider
+    /// (Anthropic, Codex, Ollama Cloud) consults this file for
+    /// per-message token activity scoped to its own `providerID` and
+    /// folds the result into its native aggregates.
+    /// - `None` (default) → `~/.local/share/opencode/opencode.db`
+    /// - `Some("")` → disable entirely
+    /// - `Some(path)` → use that file
+    pub opencode_db: Option<PathBuf>,
     pub anthropic: AnthropicConfig,
     pub codex_cli: CodexCliConfig,
     pub ollama_cloud: OllamaCloudConfig,
@@ -40,6 +48,7 @@ impl Default for Config {
             icon_rotation_secs: 15,
             show_pace_marker: true,
             check_for_updates: true,
+            opencode_db: None,
             anthropic: AnthropicConfig::default(),
             codex_cli: CodexCliConfig::default(),
             ollama_cloud: OllamaCloudConfig::default(),
@@ -93,17 +102,6 @@ pub struct CodexCliConfig {
     /// When false (default) the UI shows turn counts and tokens but hides
     /// the reverse-engineered dollar estimate.
     pub show_spend: bool,
-    /// Optional opencode SQLite store path. If the file exists, the
-    /// Codex provider reads its `message` table and folds any rows
-    /// whose `data.providerID == "openai"` into the same 5h/7d
-    /// aggregates as the native rollouts. Useful for users who use
-    /// opencode (or other openai-via-API tools) rather than the codex
-    /// CLI directly, since native rollouts are stale in that case.
-    ///
-    /// Empty string disables the integration even when the file exists.
-    /// None defaults to `~/.local/share/opencode/opencode.db` at
-    /// construction time.
-    pub opencode_db: Option<PathBuf>,
 }
 
 impl Default for CodexCliConfig {
@@ -113,7 +111,6 @@ impl Default for CodexCliConfig {
             codex_dir: None,
             warn_at: vec![0.75, 0.9],
             show_spend: false,
-            opencode_db: None,
         }
     }
 }
@@ -159,6 +156,17 @@ impl Default for AlertsConfig {
 }
 
 impl Config {
+    /// Resolve the opencode SQLite path each provider should consult,
+    /// honouring the `Some("")` "disable" convention and falling back
+    /// to the XDG default when the user hasn't set anything explicit.
+    pub fn resolve_opencode_db(&self) -> Option<PathBuf> {
+        match &self.opencode_db {
+            Some(p) if p.as_os_str().is_empty() => None,
+            Some(p) => Some(p.clone()),
+            None => Some(crate::opencode::default_db_path()),
+        }
+    }
+
     pub fn load_or_default() -> Result<Self> {
         let path = config_path()?;
         if path.exists() {

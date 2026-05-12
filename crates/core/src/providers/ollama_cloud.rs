@@ -39,7 +39,7 @@ use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind, Window
 use crate::provider::Provider;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use std::time::Duration;
@@ -50,10 +50,19 @@ const SETTINGS_PATH: &str = "/settings";
 pub struct OllamaCloudProvider {
     cfg: OllamaCloudConfig,
     http: reqwest::Client,
+    /// Optional opencode SQLite path; `None` disables the integration.
+    opencode_db: Option<std::path::PathBuf>,
 }
 
 impl OllamaCloudProvider {
     pub fn new(cfg: OllamaCloudConfig) -> Self {
+        Self::with_opencode_db(cfg, Some(crate::opencode::default_db_path()))
+    }
+
+    pub fn with_opencode_db(
+        cfg: OllamaCloudConfig,
+        opencode_db: Option<std::path::PathBuf>,
+    ) -> Self {
         let http = reqwest::Client::builder()
             // Browser-like UA so the page doesn't decide we're a bot and
             // serve a stripped HTML shell.
@@ -64,7 +73,8 @@ impl OllamaCloudProvider {
             .timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest");
-        Self { cfg, http }
+        let opencode_db = opencode_db.filter(|p| !p.as_os_str().is_empty());
+        Self { cfg, http, opencode_db }
     }
 
     /// Public so the `dump_ollama_cloud` example can reuse the auth path.
@@ -163,8 +173,70 @@ impl Provider for OllamaCloudProvider {
             w.started_at = Some(now);
         }
 
+        // Supplementary source: opencode token activity scoped to
+        // ollama-cloud. The page scrape doesn't surface tokens at all,
+        // so this is purely additive context — it fills in the 1h /
+        // today / week / month rows on the dashboard without touching
+        // the fraction_used we already populated above.
+        if let Some(db) = &self.opencode_db {
+            match crate::opencode::read_events(db, "ollama-cloud") {
+                Ok(events) => fold_opencode_events(&mut snap, &events, now),
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %db.display(), "opencode db read failed");
+                }
+            }
+        }
+
         snap.headline = Some(build_headline(&parsed, now));
         Ok(snap)
+    }
+}
+
+/// Bucket opencode events into 1h / today / 5h / week / month windows
+/// and accumulate tokens, requests, and cost. Doesn't touch
+/// `fraction_used` — those come from the page scrape.
+fn fold_opencode_events(
+    snap: &mut UsageSnapshot,
+    events: &[crate::opencode::OpencodeEvent],
+    now: DateTime<Utc>,
+) {
+    let hour_cutoff = now - chrono::Duration::hours(1);
+    let five_hour_cutoff = now - chrono::Duration::hours(5);
+    let week_cutoff = now - chrono::Duration::days(7);
+    let today = now.date_naive();
+    let this_month = (now.year(), now.month());
+
+    for e in events {
+        // Add the same event into every window it qualifies for.
+        let buckets: &[&str] = &(|| -> Vec<&'static str> {
+            let mut v = Vec::new();
+            if e.timestamp > hour_cutoff {
+                v.push("1h");
+            }
+            if e.timestamp.date_naive() == today {
+                v.push("today");
+            }
+            if e.timestamp > five_hour_cutoff {
+                v.push("5h");
+            }
+            if e.timestamp > week_cutoff {
+                v.push(WindowKind::ThisWeek.label());
+            }
+            let m = e.timestamp;
+            if (m.year(), m.month()) == this_month {
+                v.push("month");
+            }
+            v
+        })();
+        for label in buckets {
+            let w = snap.windows.entry((*label).to_string()).or_default();
+            w.tokens_in = w.tokens_in.saturating_add(e.input_tokens + e.cached_tokens);
+            w.tokens_out = w.tokens_out.saturating_add(e.output_tokens);
+            w.request_count = w.request_count.saturating_add(1);
+            if let Some(cost) = e.cost_usd {
+                w.spend_usd = Some(w.spend_usd.unwrap_or(0.0) + cost);
+            }
+        }
     }
 }
 

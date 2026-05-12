@@ -21,6 +21,13 @@ show_pace_marker = true
 # entirely.
 check_for_updates = true
 
+# Optional path to opencode's SQLite store (https://opencode.ai). Each
+# provider consults it for per-message token activity scoped to its
+# own providerID and folds the result into its native aggregates.
+# Leave commented to use the XDG default (~/.local/share/opencode/opencode.db).
+# Set to "" to disable the integration entirely.
+# opencode_db = "/home/you/.local/share/opencode/opencode.db"
+
 [anthropic]
 enabled = true
 # When false (default), only quota usage is shown. Flip to true to display

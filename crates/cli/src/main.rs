@@ -184,7 +184,15 @@ fn build_screen(
             .iter()
             .filter(|(_, w)| w.fraction_used.is_some())
             .collect();
-        if quota_windows.is_empty() {
+        let has_activity = snap
+            .windows
+            .values()
+            .any(|w| w.request_count > 0 || w.tokens_in > 0 || w.tokens_out > 0);
+        // Activity-only providers (e.g. Codex when rate_limits is
+        // stale but opencode captured turns) still get a header +
+        // headline summary row. Only providers with nothing at all
+        // get skipped.
+        if quota_windows.is_empty() && !has_activity {
             continue;
         }
         quota_windows.sort_by_key(|(label, _)| (window_order(label.as_str()), label.as_str()));
@@ -208,9 +216,15 @@ fn build_screen(
             s.push('\n');
         }
 
-        for (label, w) in quota_windows {
+        if !quota_windows.is_empty() {
+            for (label, w) in quota_windows {
+                s.push_str("  ");
+                s.push_str(&format_quota_row(label, w, use_color));
+                s.push('\n');
+            }
+        } else if let Some(h) = &snap.headline {
             s.push_str("  ");
-            s.push_str(&format_quota_row(label, w, use_color));
+            s.push_str(h);
             s.push('\n');
         }
     }
@@ -246,10 +260,20 @@ fn cached_snapshots() -> Option<BTreeMap<ProviderId, UsageSnapshot>> {
 
 async fn poll_fresh() -> Result<BTreeMap<ProviderId, UsageSnapshot>> {
     let config = Config::load_or_default()?;
+    let opencode = config.resolve_opencode_db();
     let providers: Vec<Box<dyn Provider>> = vec![
-        Box::new(AnthropicProvider::new(config.anthropic.clone())),
-        Box::new(CodexCliProvider::new(config.codex_cli.clone())),
-        Box::new(OllamaCloudProvider::new(config.ollama_cloud.clone())),
+        Box::new(AnthropicProvider::with_opencode_db(
+            config.anthropic.clone(),
+            opencode.clone(),
+        )),
+        Box::new(CodexCliProvider::with_opencode_db(
+            config.codex_cli.clone(),
+            opencode.clone(),
+        )),
+        Box::new(OllamaCloudProvider::with_opencode_db(
+            config.ollama_cloud.clone(),
+            opencode,
+        )),
     ];
     let mut out = BTreeMap::new();
     for p in &providers {
@@ -438,9 +462,11 @@ mod tests {
     }
 
     #[test]
-    fn build_screen_skips_providers_without_quota_windows() {
+    fn build_screen_shows_activity_only_providers_via_headline() {
+        // Provider with no fraction_used but with token activity now
+        // gets rendered as a header + headline row instead of being
+        // skipped — matches the tray menu's behaviour.
         let mut snap = make_snapshot(ProviderId::Anthropic);
-        // Drop both quota windows; leave only a token-only one.
         snap.windows.clear();
         snap.windows.insert(
             "today".into(),
@@ -449,10 +475,23 @@ mod tests {
                 ..Default::default()
             },
         );
+        snap.headline = Some("100 tokens in today".into());
         let mut snaps = BTreeMap::new();
         snaps.insert(ProviderId::Anthropic, snap);
         let s = build_screen(&snaps, false, false);
-        // Skipped → waiting shown.
+        assert!(s.contains("Anthropic"), "got: {}", s);
+        assert!(s.contains("100 tokens in today"), "got: {}", s);
+        assert!(!s.contains("waiting for first snapshot"), "got: {}", s);
+    }
+
+    #[test]
+    fn build_screen_skips_providers_with_no_data_at_all() {
+        let mut snap = make_snapshot(ProviderId::Anthropic);
+        snap.windows.clear();
+        snap.headline = None;
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::Anthropic, snap);
+        let s = build_screen(&snaps, false, false);
         assert!(s.contains("waiting for first snapshot"), "got: {}", s);
     }
 

@@ -262,7 +262,15 @@ fn build_menu(
                     && !label.as_str().starts_with("week (")
             })
             .collect();
-        if quota_windows.is_empty() {
+        let has_activity = snap
+            .windows
+            .values()
+            .any(|w| w.request_count > 0 || w.tokens_in > 0 || w.tokens_out > 0);
+        // Skip only when the provider has nothing to say at all — no
+        // quota fractions AND no activity counts. Providers with just
+        // activity (e.g. Codex when rate_limits is stale but opencode
+        // captured turns) still get a header + a one-line summary.
+        if quota_windows.is_empty() && !has_activity {
             continue;
         }
         quota_windows.sort_by_key(|(label, _)| menu_window_order(label.as_str()));
@@ -276,9 +284,17 @@ fn build_menu(
         let header = format!("{}{}", snap.provider.human(), plan);
         let _ = menu.append(&MenuItem::new(header, false, None));
 
-        for (label, w) in &quota_windows {
-            let text = format_quota_row(label, w);
-            let _ = menu.append(&MenuItem::new(text, false, None));
+        if !quota_windows.is_empty() {
+            for (label, w) in &quota_windows {
+                let text = format_quota_row(label, w);
+                let _ = menu.append(&MenuItem::new(text, false, None));
+            }
+        } else if let Some(h) = &snap.headline {
+            // Activity-only fall-through. The provider's own headline
+            // is the best summary it can give us (e.g. "0 turns / 5h ·
+            // 51 turns / 7d") — render it as one indented row so the
+            // visual structure still matches the quota-row case.
+            let _ = menu.append(&MenuItem::new(format!("  {}", h), false, None));
         }
     }
 

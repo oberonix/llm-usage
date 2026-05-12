@@ -64,12 +64,27 @@ use walkdir::WalkDir;
 pub struct CodexCliProvider {
     cfg: CodexCliConfig,
     codex_dir: PathBuf,
+    /// Resolved opencode SQLite path; `None` when explicitly disabled.
+    opencode_db: Option<PathBuf>,
 }
 
 impl CodexCliProvider {
+    /// Construct with the default opencode path resolution
+    /// (`~/.local/share/opencode/opencode.db`). Tests that want to
+    /// inject a fixture should use `with_opencode_db`.
     pub fn new(cfg: CodexCliConfig) -> Self {
         let codex_dir = cfg.codex_dir.clone().unwrap_or_else(default_codex_dir);
-        Self { cfg, codex_dir }
+        let opencode_db = Some(crate::opencode::default_db_path());
+        Self { cfg, codex_dir, opencode_db }
+    }
+
+    /// Construct with an explicit opencode override:
+    /// - `Some(path)` to read that file
+    /// - `Some(empty)` or `None` to disable the integration entirely
+    pub fn with_opencode_db(cfg: CodexCliConfig, opencode_db: Option<PathBuf>) -> Self {
+        let codex_dir = cfg.codex_dir.clone().unwrap_or_else(default_codex_dir);
+        let opencode_db = opencode_db.filter(|p| !p.as_os_str().is_empty());
+        Self { cfg, codex_dir, opencode_db }
     }
 
     fn collect_events(&self) -> Result<Collected> {
@@ -94,34 +109,29 @@ impl CodexCliProvider {
             }
         }
 
-        // Supplementary source: opencode's SQLite store, if present.
-        // Users who hit OpenAI via opencode (rather than the codex CLI
-        // directly) won't have fresh rollouts; their token activity
-        // lives here instead. opencode doesn't expose rate-limit
-        // headers, so the quota fractions still have to come from
-        // rollouts when they exist.
-        if let Some(db) = self.opencode_db_path() {
-            if db.exists() {
-                match read_opencode_events(&db, "openai") {
-                    Ok(events) => out.events.extend(events),
-                    Err(e) => {
-                        tracing::warn!(error = %e, path = %db.display(), "opencode db read failed");
-                    }
+        // Supplementary source: opencode's SQLite store. Users who hit
+        // OpenAI via opencode (rather than the codex CLI directly)
+        // won't have fresh rollouts; their token activity lives here
+        // instead. opencode doesn't expose rate-limit headers, so the
+        // quota fractions still have to come from rollouts when they
+        // exist.
+        if let Some(db) = &self.opencode_db {
+            match crate::opencode::read_events(db, "openai") {
+                Ok(events) => out
+                    .events
+                    .extend(events.into_iter().map(|e| TokenEvent {
+                        timestamp: e.timestamp,
+                        model: if e.model.is_empty() { "openai".into() } else { e.model },
+                        input_tokens: e.input_tokens,
+                        output_tokens: e.output_tokens,
+                        cached_tokens: e.cached_tokens,
+                    })),
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %db.display(), "opencode db read failed");
                 }
             }
         }
         Ok(out)
-    }
-
-    /// Resolve which SQLite file (if any) to consult for opencode
-    /// events. `Some(empty)` from the config explicitly disables the
-    /// integration; `None` falls back to the default XDG path.
-    fn opencode_db_path(&self) -> Option<PathBuf> {
-        match &self.cfg.opencode_db {
-            Some(p) if p.as_os_str().is_empty() => None,
-            Some(p) => Some(p.clone()),
-            None => dirs::data_dir().map(|d| d.join("opencode").join("opencode.db")),
-        }
     }
 }
 
@@ -347,97 +357,6 @@ fn default_codex_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
-/// Read the opencode SQLite store and emit a `TokenEvent` per
-/// assistant message whose `data.providerID` matches `provider_id`.
-///
-/// opencode stores all message metadata inside a single `data` TEXT
-/// column as JSON; we only deserialise the few fields we need
-/// (`role`, `providerID`, `modelID`, `tokens`, `time.completed`). The
-/// connection is opened read-only so we never race opencode's own
-/// writes — opencode keeps the DB in WAL mode so concurrent readers
-/// are safe and cheap.
-fn read_opencode_events(
-    db_path: &std::path::Path,
-    provider_id: &str,
-) -> Result<Vec<TokenEvent>> {
-    use rusqlite::{Connection, OpenFlags};
-
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    // Worth setting query_only as a belt-and-suspenders against
-    // accidental writes from a future code change.
-    let _ = conn.pragma_update(None, "query_only", true);
-
-    // Only the last 14 days — gives the 7d window plenty of headroom
-    // and keeps the scan O(recent) instead of O(history).
-    let cutoff_ms = (Utc::now() - Duration::days(14)).timestamp_millis();
-    let mut stmt = conn.prepare(
-        "SELECT time_created, data FROM message WHERE time_created >= ?",
-    )?;
-    let mut rows = stmt.query([cutoff_ms])?;
-
-    let mut events = Vec::new();
-    while let Some(row) = rows.next()? {
-        let created_ms: i64 = row.get(0)?;
-        let blob: String = row.get(1)?;
-        let v: Value = match serde_json::from_str(&blob) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v.get("role").and_then(|x| x.as_str()) != Some("assistant") {
-            continue;
-        }
-        // Provider/model can live at the message root or one level
-        // down on the first part — accept either shape.
-        let model_node = v.get("model").cloned().or_else(|| {
-            v.pointer("/parts/0/model").cloned()
-        });
-        let prov = v
-            .get("providerID")
-            .and_then(|x| x.as_str())
-            .or_else(|| model_node.as_ref().and_then(|m| m.get("providerID")).and_then(|x| x.as_str()))
-            .unwrap_or("");
-        if prov != provider_id {
-            continue;
-        }
-        let model_id = v
-            .get("modelID")
-            .and_then(|x| x.as_str())
-            .or_else(|| model_node.as_ref().and_then(|m| m.get("modelID")).and_then(|x| x.as_str()))
-            .unwrap_or("openai")
-            .to_string();
-        let tokens = v.get("tokens");
-        let input = tokens.and_then(|t| t.get("input")).and_then(|x| x.as_u64()).unwrap_or(0);
-        let output = tokens.and_then(|t| t.get("output")).and_then(|x| x.as_u64()).unwrap_or(0);
-        let cached = tokens
-            .and_then(|t| t.get("cache"))
-            .and_then(|c| c.get("read"))
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0);
-        if input == 0 && output == 0 && cached == 0 {
-            continue;
-        }
-        // Prefer time.completed when present (it's set on the final
-        // chunk of the stream and is when the response *finished*);
-        // fall back to time_created.
-        let completed_ms = v
-            .pointer("/time/completed")
-            .and_then(|x| x.as_i64())
-            .unwrap_or(created_ms);
-        let ts = Utc.timestamp_millis_opt(completed_ms).single();
-        let Some(ts) = ts else { continue };
-        events.push(TokenEvent {
-            timestamp: ts,
-            model: model_id,
-            input_tokens: input,
-            output_tokens: output,
-            cached_tokens: cached,
-        });
-    }
-    Ok(events)
-}
 
 #[derive(Debug, Default)]
 struct Bucket {
@@ -649,8 +568,8 @@ mod tests {
 
         let mut cfg = CodexCliConfig::default();
         cfg.codex_dir = Some(dir.path().to_path_buf());
-        cfg.opencode_db = Some(PathBuf::new()); // disable opencode merge
-        let p = CodexCliProvider::new(cfg);
+        // Disable opencode merge for this fixture-driven test.
+        let p = CodexCliProvider::with_opencode_db(cfg, None);
         let collected = p.collect_events().unwrap();
         assert_eq!(
             collected.events.len(),
@@ -765,8 +684,7 @@ mod tests {
 
         let mut cfg = CodexCliConfig::default();
         cfg.codex_dir = Some(dir.path().to_path_buf());
-        cfg.opencode_db = Some(PathBuf::new());
-        let p = CodexCliProvider::new(cfg);
+        let p = CodexCliProvider::with_opencode_db(cfg, None);
         let collected = p.collect_events().unwrap();
         let rl = collected
             .latest_rate_limits
@@ -842,44 +760,6 @@ mod tests {
     }
 
     #[test]
-    fn read_opencode_events_extracts_assistant_token_data() {
-        let dir = TempDir::new().unwrap();
-        let db = dir.path().join("opencode.db");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        write_opencode_fixture(&db, "openai", now_ms, 1_000, 200);
-        let events = read_opencode_events(&db, "openai").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].input_tokens, 1_000);
-        assert_eq!(events[0].output_tokens, 200);
-        // Timestamp must use time.completed when present.
-        assert!((events[0].timestamp.timestamp_millis() - now_ms).abs() < 50);
-    }
-
-    #[test]
-    fn read_opencode_events_filters_by_provider_id() {
-        let dir = TempDir::new().unwrap();
-        let db = dir.path().join("opencode.db");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        write_opencode_fixture(&db, "ollama-cloud", now_ms, 500, 50);
-        // Asking for "openai" gets nothing back.
-        let events = read_opencode_events(&db, "openai").unwrap();
-        assert!(events.is_empty());
-        // Asking for the right provider yields the row.
-        let events = read_opencode_events(&db, "ollama-cloud").unwrap();
-        assert_eq!(events.len(), 1);
-    }
-
-    #[test]
-    fn read_opencode_events_skips_zero_token_rows() {
-        let dir = TempDir::new().unwrap();
-        let db = dir.path().join("opencode.db");
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        write_opencode_fixture(&db, "openai", now_ms, 0, 0);
-        let events = read_opencode_events(&db, "openai").unwrap();
-        assert!(events.is_empty());
-    }
-
-    #[test]
     fn collect_events_merges_opencode_into_rollouts() {
         let dir = TempDir::new().unwrap();
         // Codex rollout with one event.
@@ -913,8 +793,7 @@ mod tests {
 
         let mut cfg = CodexCliConfig::default();
         cfg.codex_dir = Some(dir.path().to_path_buf());
-        cfg.opencode_db = Some(db);
-        let p = CodexCliProvider::new(cfg);
+        let p = CodexCliProvider::with_opencode_db(cfg, Some(db));
         let collected = p.collect_events().unwrap();
         // 1 rollout event + 1 opencode event = 2.
         assert_eq!(collected.events.len(), 2);
@@ -928,12 +807,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cfg = CodexCliConfig::default();
         cfg.codex_dir = Some(dir.path().to_path_buf());
-        cfg.opencode_db = Some(PathBuf::new());
-        let p = CodexCliProvider::new(cfg);
-        // No rollouts, no opencode → empty result, no error.
-        let collected = p.collect_events().unwrap();
-        assert!(collected.events.is_empty());
-        assert!(p.opencode_db_path().is_none());
+        // Both forms disable.
+        let p = CodexCliProvider::with_opencode_db(cfg.clone(), None);
+        assert!(p.collect_events().unwrap().events.is_empty());
+        let p = CodexCliProvider::with_opencode_db(cfg, Some(PathBuf::new()));
+        assert!(p.collect_events().unwrap().events.is_empty());
     }
 
     #[test]

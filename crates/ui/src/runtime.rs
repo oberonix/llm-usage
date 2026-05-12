@@ -51,10 +51,20 @@ fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
         engine.set_thresholds(ProviderId::OllamaCloud, config.ollama_cloud.warn_at.clone());
     }
 
+    let opencode = config.resolve_opencode_db();
     let providers: Vec<Box<dyn Provider>> = vec![
-        Box::new(AnthropicProvider::new(config.anthropic.clone())),
-        Box::new(CodexCliProvider::new(config.codex_cli.clone())),
-        Box::new(OllamaCloudProvider::new(config.ollama_cloud.clone())),
+        Box::new(AnthropicProvider::with_opencode_db(
+            config.anthropic.clone(),
+            opencode.clone(),
+        )),
+        Box::new(CodexCliProvider::with_opencode_db(
+            config.codex_cli.clone(),
+            opencode.clone(),
+        )),
+        Box::new(OllamaCloudProvider::with_opencode_db(
+            config.ollama_cloud.clone(),
+            opencode,
+        )),
     ];
 
     LoopState {

@@ -35,10 +35,16 @@ pub struct AnthropicProvider {
     /// Persists across polls — survives 429s by serving last-good and
     /// holding off the next request until cooldown ends.
     oauth_backoff: Mutex<OAuthBackoff>,
+    /// Optional opencode SQLite path; `None` disables the integration.
+    opencode_db: Option<PathBuf>,
 }
 
 impl AnthropicProvider {
     pub fn new(cfg: AnthropicConfig) -> Self {
+        Self::with_opencode_db(cfg, Some(crate::opencode::default_db_path()))
+    }
+
+    pub fn with_opencode_db(cfg: AnthropicConfig, opencode_db: Option<PathBuf>) -> Self {
         let projects_dir = cfg
             .claude_projects_dir
             .clone()
@@ -48,11 +54,13 @@ impl AnthropicProvider {
             .timeout(Duration::from_secs(5))
             .build()
             .expect("reqwest");
+        let opencode_db = opencode_db.filter(|p| !p.as_os_str().is_empty());
         Self {
             cfg,
             projects_dir,
             http,
             oauth_backoff: Mutex::new(OAuthBackoff::default()),
+            opencode_db,
         }
     }
 
@@ -87,6 +95,35 @@ impl AnthropicProvider {
         {
             if let Err(err) = self.process_file(entry.path(), now, &mut seen_msg_ids, &mut agg) {
                 tracing::warn!(path = %entry.path().display(), error = %err, "failed to parse claude jsonl");
+            }
+        }
+
+        // Supplementary source: opencode's SQLite store. Users hitting
+        // Anthropic via opencode rather than Claude Code won't write to
+        // ~/.claude/projects, so their turn activity lives there. We
+        // run those tokens through the same `rate_for(model)` table so
+        // the resulting spend column is consistent with the JSONL path.
+        if let Some(db) = &self.opencode_db {
+            match crate::opencode::read_events(db, "anthropic") {
+                Ok(events) => {
+                    for e in events {
+                        let usage = AnthropicTokenUsage {
+                            input_tokens: e.input_tokens,
+                            output_tokens: e.output_tokens,
+                            cache_read_input_tokens: e.cached_tokens,
+                            cache_creation_5m_input_tokens: 0,
+                            cache_creation_1h_input_tokens: 0,
+                        };
+                        let cost = match e.cost_usd {
+                            Some(c) => c,
+                            None => usage.cost_usd(self.rate_for(&e.model)),
+                        };
+                        agg.add(e.timestamp, now, usage, cost);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, path = %db.display(), "opencode db read failed");
+                }
             }
         }
         Ok(agg)
@@ -653,7 +690,8 @@ mod tests {
 
         let mut cfg = AnthropicConfig::default();
         cfg.claude_projects_dir = Some(dir.path().to_path_buf());
-        let p = AnthropicProvider::new(cfg);
+        // Disable opencode merge so we only assert against the JSONL.
+        let p = AnthropicProvider::with_opencode_db(cfg, None);
         let now = chrono::Utc.with_ymd_and_hms(2026, 5, 8, 10, 30, 0).unwrap();
         let agg = p.aggregate(now).unwrap();
         assert_eq!(agg.last_hour.requests, 2);
