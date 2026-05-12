@@ -99,10 +99,13 @@ fn main() -> Result<()> {
         })?;
 
     // File watchers: signal `reload` on config writes, `refresh` on
-    // dashboard-triggered refresh.trigger writes. Hold both for the
-    // lifetime of the event loop; dropping cancels the subscription.
+    // dashboard-triggered refresh.trigger writes, and `refresh` again
+    // whenever a local data source (Claude Code JSONL, Codex rollout,
+    // opencode SQLite) changes. Hold all for the lifetime of the
+    // event loop; dropping cancels the subscription.
     let _config_watcher = spawn_config_watcher(reload.clone());
     let _trigger_watcher = spawn_refresh_trigger_watcher(refresh.clone());
+    let _data_watchers = spawn_data_source_watchers(&config, refresh.clone());
 
     let menu_channel = MenuEvent::receiver();
     let tray_channel = TrayIconEvent::receiver();
@@ -490,6 +493,78 @@ mod tests {
         // Bar fully empty.
         assert!(s.starts_with("▱"), "got {}", s);
     }
+
+    // ---- data_source_paths ----
+    //
+    // The watcher itself is event-loop-driven (best tested by
+    // touching files and asserting on `refresh.notify_one`), but the
+    // path resolver is pure and easy to pin down.
+
+    #[test]
+    fn data_source_paths_includes_default_three_when_no_overrides() {
+        let cfg = Config::default();
+        let paths = data_source_paths(&cfg);
+        let labels: Vec<&str> = paths.iter().map(|(_, _, l)| *l).collect();
+        // Order matters in the live code (Claude first, then Codex,
+        // then opencode) — the watcher logs by label, so pinning the
+        // order keeps the operator's mental model consistent.
+        assert_eq!(
+            labels,
+            vec!["claude_projects", "codex_sessions", "opencode"]
+        );
+        // Recursion mode: JSONLs nest under project / day dirs so
+        // both Claude and Codex need recursive; opencode is one DB
+        // file in a flat dir.
+        assert!(matches!(paths[0].1, RecursiveMode::Recursive));
+        assert!(matches!(paths[1].1, RecursiveMode::Recursive));
+        assert!(matches!(paths[2].1, RecursiveMode::NonRecursive));
+    }
+
+    #[test]
+    fn data_source_paths_respects_config_overrides() {
+        // Custom project / codex paths must flow into the watcher
+        // so a user running Claude Code from a non-default $HOME
+        // (sandbox, dev container, etc.) still gets fast refresh.
+        let mut cfg = Config::default();
+        cfg.anthropic.claude_projects_dir = Some(std::path::PathBuf::from("/tmp/custom-claude"));
+        cfg.codex_cli.codex_dir = Some(std::path::PathBuf::from("/tmp/custom-codex"));
+        let paths = data_source_paths(&cfg);
+        assert!(paths
+            .iter()
+            .any(|(p, _, l)| *l == "claude_projects" && p == &std::path::PathBuf::from("/tmp/custom-claude")));
+        // Codex appends `/sessions` to the configured codex_dir.
+        assert!(paths.iter().any(|(p, _, l)| *l == "codex_sessions"
+            && p == &std::path::PathBuf::from("/tmp/custom-codex/sessions")));
+    }
+
+    #[test]
+    fn data_source_paths_drops_opencode_when_disabled() {
+        // Empty-string opencode_db is the documented "disable"
+        // signal — see `Config::resolve_opencode_db`. The watcher
+        // must not subscribe to a non-existent path.
+        let mut cfg = Config::default();
+        cfg.opencode_db = Some(std::path::PathBuf::new());
+        let paths = data_source_paths(&cfg);
+        assert!(paths.iter().all(|(_, _, l)| *l != "opencode"));
+        // The other two are still present.
+        assert!(paths.iter().any(|(_, _, l)| *l == "claude_projects"));
+        assert!(paths.iter().any(|(_, _, l)| *l == "codex_sessions"));
+    }
+
+    #[test]
+    fn data_source_paths_uses_opencode_parent_dir() {
+        // Watcher attaches to the *parent* of `opencode.db` so it
+        // catches writes to `opencode.db`, `opencode.db-wal`, and
+        // `opencode.db-shm` in one subscription.
+        let mut cfg = Config::default();
+        cfg.opencode_db = Some(std::path::PathBuf::from("/tmp/x/y/opencode.db"));
+        let paths = data_source_paths(&cfg);
+        let opencode = paths
+            .iter()
+            .find(|(_, _, l)| *l == "opencode")
+            .expect("opencode entry present");
+        assert_eq!(opencode.0, std::path::PathBuf::from("/tmp/x/y"));
+    }
 }
 
 /// Watch the config file for writes and signal the runtime to reload.
@@ -604,6 +679,129 @@ fn spawn_refresh_trigger_watcher(refresh: Arc<Notify>) -> Option<RecommendedWatc
     }
     tracing::info!(path = %trigger_path.display(), "refresh trigger watcher live");
     Some(watcher)
+}
+
+/// Watch the local data sources upstream of each provider (Claude
+/// Code JSONLs, Codex CLI rollouts, opencode SQLite) and signal the
+/// runtime's `refresh` whenever they change. This is what lets a
+/// `codex` invocation surface in the tray within a second or two
+/// rather than at the next 15-minute poll boundary.
+///
+/// Each watcher path is best-effort: if the directory doesn't exist
+/// on this machine, or if inotify subscription fails (per-user
+/// watch limit, missing kernel support, etc.), we log at WARN and
+/// skip that source. The remaining sources still work.
+///
+/// The HTTP-throttle in each provider keeps refresh storms (Claude
+/// Code can write a JSONL on every assistant turn) from translating
+/// into per-event upstream calls. See `MIN_HTTP_INTERVAL` in
+/// `crates/core/src/providers/anthropic.rs` and `ollama_cloud.rs`.
+fn spawn_data_source_watchers(
+    config: &Config,
+    refresh: Arc<Notify>,
+) -> Vec<RecommendedWatcher> {
+    let mut out = Vec::new();
+    let paths = data_source_paths(config);
+    // Shared debounce: any source can fire it. 500ms covers the
+    // "Claude Code writes the same JSONL three times in a few hundred
+    // ms" case without making the tray feel laggy on the first event.
+    let last_fire = Arc::new(std::sync::Mutex::new(Instant::now() - Duration::from_secs(60)));
+    for (path, mode, label) in paths {
+        if !path.exists() {
+            tracing::debug!(path = %path.display(), source = label, "data source dir absent; not watching");
+            continue;
+        }
+        let refresh_ = refresh.clone();
+        let last_fire_ = last_fire.clone();
+        let path_ = path.clone();
+        let label_owned = label.to_string();
+        let mut watcher =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                let event = match res {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::warn!(error = %err, source = %label_owned, "data watcher error");
+                        return;
+                    }
+                };
+                let interesting =
+                    matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+                if !interesting {
+                    return;
+                }
+                let now = Instant::now();
+                let mut guard = last_fire_.lock().expect("poisoned");
+                if now.duration_since(*guard) < Duration::from_millis(500) {
+                    return;
+                }
+                *guard = now;
+                tracing::debug!(
+                    path = %path_.display(),
+                    source = %label_owned,
+                    "data source changed; firing fast-refresh",
+                );
+                refresh_.notify_one();
+            }) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::warn!(error = %e, source = label, "data watcher start failed");
+                    continue;
+                }
+            };
+        if let Err(e) = watcher.watch(&path, mode) {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                source = label,
+                "data watcher subscribe failed (inotify limit? \
+                 see sysctl fs.inotify.max_user_watches on Linux)",
+            );
+            continue;
+        }
+        tracing::info!(path = %path.display(), source = label, "data source watcher live");
+        out.push(watcher);
+    }
+    out
+}
+
+/// The three (or fewer, depending on what's installed) local paths
+/// we watch for "something happened, re-poll the providers" signals.
+/// Each entry is (path, recursion mode, log-friendly label).
+fn data_source_paths(
+    config: &Config,
+) -> Vec<(std::path::PathBuf, RecursiveMode, &'static str)> {
+    let mut out = Vec::new();
+
+    // Anthropic JSONLs — config override or ~/.claude/projects.
+    let claude_projects = config
+        .anthropic
+        .claude_projects_dir
+        .clone()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".claude").join("projects")));
+    if let Some(p) = claude_projects {
+        out.push((p, RecursiveMode::Recursive, "claude_projects"));
+    }
+
+    // Codex rollouts — config override or ~/.codex/sessions.
+    let codex_sessions = config
+        .codex_cli
+        .codex_dir
+        .clone()
+        .map(|d| d.join("sessions"))
+        .or_else(|| dirs::home_dir().map(|h| h.join(".codex").join("sessions")));
+    if let Some(p) = codex_sessions {
+        out.push((p, RecursiveMode::Recursive, "codex_sessions"));
+    }
+
+    // opencode SQLite — watch the parent dir non-recursively so we
+    // catch writes to `opencode.db` and its `-wal` / `-shm` siblings.
+    if let Some(db) = config.resolve_opencode_db() {
+        if let Some(parent) = db.parent() {
+            out.push((parent.to_path_buf(), RecursiveMode::NonRecursive, "opencode"));
+        }
+    }
+
+    out
 }
 
 /// Open a URL in the user's default browser. `xdg-open` on Linux,
