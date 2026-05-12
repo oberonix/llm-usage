@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -177,6 +177,13 @@ impl UsageSnapshot {
         }
     }
 
+    /// How old a cached snapshot can be before [`merge_stale_from`]
+    /// refuses to graft from it. Seven days is generous — a quota
+    /// window from a week ago likely doesn't reflect anything useful,
+    /// and showing "55 % used (stale)" forever after a provider has
+    /// truly gone away would be worse than showing nothing.
+    pub const STALE_CACHE_MAX_AGE_DAYS: i64 = 7;
+
     /// Graft cached quota state from a previous snapshot onto this one,
     /// marking any borrowed window as `stale`. Renderers replace the
     /// reset countdown with a ⚠ marker for stale windows so the user
@@ -193,10 +200,20 @@ impl UsageSnapshot {
     ///    (`fraction_used`, `ends_at`, `started_at`, `limit_*`) so the
     ///    activity counters from the fresh poll stay authoritative.
     ///
+    /// Snapshots older than [`STALE_CACHE_MAX_AGE_DAYS`] are ignored:
+    /// at some point yesterday's numbers stop being a useful hint
+    /// about today's reality. Use the fresh snapshot's `timestamp` as
+    /// the "now" reference, so a slow clock doesn't artificially age
+    /// the cache.
+    ///
     /// Returns the number of windows that ended up stale, so callers
     /// can log "served 2 stale windows from cache" if useful.
     pub fn merge_stale_from(&mut self, cached: &UsageSnapshot) -> usize {
         if self.provider != cached.provider {
+            return 0;
+        }
+        let age = self.timestamp - cached.timestamp;
+        if age > Duration::days(Self::STALE_CACHE_MAX_AGE_DAYS) {
             return 0;
         }
         let mut stale_count = 0;
@@ -350,6 +367,31 @@ mod tests {
         let w = fresh.windows.get("5h").unwrap();
         assert_eq!(w.fraction_used, Some(0.10));
         assert!(!w.stale);
+    }
+
+    #[test]
+    fn merge_stale_from_refuses_stale_cache_older_than_max_age() {
+        // Cache from 10 days ago is too old to be useful — refuse to
+        // graft. Otherwise a long-dead provider would keep showing
+        // ancient percentages forever.
+        let mut cached = cached_snapshot_with_fraction(ProviderId::Anthropic);
+        cached.timestamp = Utc::now() - chrono::Duration::days(10);
+        let mut fresh = UsageSnapshot::unavailable(ProviderId::Anthropic, "boom");
+        let n = fresh.merge_stale_from(&cached);
+        assert_eq!(n, 0, "cache older than max age must be ignored");
+        assert!(fresh.windows.is_empty(), "no stale graft from old cache");
+    }
+
+    #[test]
+    fn merge_stale_from_accepts_cache_just_under_max_age() {
+        // Just under the 7-day cap — cache still usable. (We deliberately
+        // pick `7 days - 1 hour` so future cap changes either way show
+        // up as a test failure to revisit.)
+        let mut cached = cached_snapshot_with_fraction(ProviderId::Anthropic);
+        cached.timestamp = Utc::now() - chrono::Duration::days(7) + chrono::Duration::hours(1);
+        let mut fresh = UsageSnapshot::unavailable(ProviderId::Anthropic, "boom");
+        let n = fresh.merge_stale_from(&cached);
+        assert!(n > 0, "cache just under max age should still graft");
     }
 
     #[test]

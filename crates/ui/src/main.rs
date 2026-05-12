@@ -44,10 +44,13 @@ const UPDATE_ID: &str = "update";
 const QUIT_ID: &str = "quit";
 
 fn main() -> Result<()> {
+    // Default filter matches the dashboard binary. Set RUST_LOG to
+    // raise verbosity per-crate when triaging a bug — e.g.
+    //   RUST_LOG=info,llm_usage=debug,llm_usage_core=debug
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,llm_usage=debug,llm_usage_core=debug".into()),
+                .unwrap_or_else(|_| "info".into()),
         )
         .init();
 
