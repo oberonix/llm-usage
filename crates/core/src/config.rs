@@ -189,7 +189,17 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let s = toml::to_string_pretty(self)?;
-        std::fs::write(path, s)?;
+        // Atomic write: serialise to a sibling `.tmp` first, then
+        // rename onto the target. The dashboard's auto-save fires
+        // on every Settings form keystroke, so a crash mid-write is
+        // a real risk; the rename guarantees the user never sees
+        // a half-written config.toml.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, s)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| {
+            format!("rename {} -> {}", tmp.display(), path.display())
+        })?;
         Ok(())
     }
 }
@@ -274,6 +284,50 @@ mod tests {
         assert!(!loaded.show_pace_marker);
         assert!(loaded.anthropic.show_spend);
         assert_eq!(loaded.codex_cli.warn_at, vec![0.5, 0.9]);
+    }
+
+    #[test]
+    fn save_creates_parent_dir() {
+        // Settings tab writes to `~/.config/llm-usage/config.toml`; on
+        // a fresh install that directory doesn't exist yet. Confirm
+        // `Config::save` creates it rather than erroring.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nested").join("deeper").join("config.toml");
+        Config::default().save(&path).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn save_is_atomic_via_tmp_rename() {
+        // Atomic save (write-to-.tmp + rename) guarantees the target
+        // is never observed half-written, which matters because the
+        // dashboard auto-saves on every form keystroke. Verify the
+        // .tmp companion is cleaned up after a successful save.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c.toml");
+        Config::default().save(&path).unwrap();
+        assert!(path.exists());
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            ".tmp companion must be cleaned up after a clean save"
+        );
+    }
+
+    #[test]
+    fn save_replaces_existing_file_wholesale() {
+        // Atomic rename must overwrite the previous contents — a
+        // partial write that left both .tmp and the old target on
+        // disk would risk the next reader seeing stale config.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("c.toml");
+        let mut a = Config::default();
+        a.poll_interval_secs = 600;
+        a.save(&path).unwrap();
+        let mut b = Config::default();
+        b.poll_interval_secs = 1200;
+        b.save(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.poll_interval_secs, 1200);
     }
 
     #[test]
