@@ -39,3 +39,6 @@ long_description = "Lightweight tray app that shows current usage and spend acro
 category = "DeveloperTool"
 osx_minimum_system_version = "11.0"
 osx_info_plist_exts = ["../../packaging/macos/Info.extra.plist"]
+
+[lints]
+workspace = true

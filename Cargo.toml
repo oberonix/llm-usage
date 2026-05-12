@@ -9,6 +9,19 @@ license = "MIT"
 repository = "https://github.com/oberonix/llm-usage"
 rust-version = "1.80"
 
+# Workspace-wide clippy tuning. These opt-outs silence style lints
+# that flagged a lot of test code without identifying real bugs,
+# so CI can enforce `-D warnings` without false-positive noise.
+[workspace.lints.clippy]
+# `let mut cfg = Config::default(); cfg.x = …;` reads more linearly
+# than a struct literal when the test is setting up just one or two
+# fields against a wide default.
+field_reassign_with_default = "allow"
+# Cargo binaries keep their main `fn` and helpers in the same
+# `main.rs` as the `mod tests` block. Reordering would mean hundreds
+# of lines of churn for a purely stylistic preference.
+items_after_test_module = "allow"
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

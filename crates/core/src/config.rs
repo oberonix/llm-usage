@@ -207,6 +207,38 @@ pub fn data_path() -> Result<PathBuf> {
     Ok(project_dirs()?.data_dir().join("usage.sqlite"))
 }
 
+/// Shared snapshot file: the tray writes here after every poll, the
+/// dashboard reads from it. Co-located with the sqlite store under the
+/// OS data directory.
+pub fn snapshots_path() -> Result<PathBuf> {
+    Ok(project_dirs()?.data_dir().join("snapshots.json"))
+}
+
+/// Trigger file the dashboard touches when the user clicks "Refresh".
+/// The tray watches it and forces an immediate poll. Co-located with
+/// the snapshot file so a single watcher on the data directory catches
+/// both.
+pub fn refresh_trigger_path() -> Result<PathBuf> {
+    Ok(project_dirs()?.data_dir().join("refresh.trigger"))
+}
+
+/// PID file used to enforce a singleton window for `name` (e.g.
+/// "dashboard" or "popup"). A second instance writes the matching
+/// focus-trigger file and exits.
+pub fn singleton_pid_path(name: &str) -> Result<PathBuf> {
+    Ok(project_dirs()?
+        .data_dir()
+        .join(format!("{}.pid", name)))
+}
+
+/// Companion file to `singleton_pid_path`. The running instance watches
+/// for writes here and brings its window to the foreground.
+pub fn singleton_focus_trigger_path(name: &str) -> Result<PathBuf> {
+    Ok(project_dirs()?
+        .data_dir()
+        .join(format!("{}.focus", name)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,36 +336,4 @@ mod tests {
         let trig = refresh_trigger_path().unwrap();
         assert_eq!(snap.parent(), trig.parent());
     }
-}
-
-/// Shared snapshot file: the tray writes here after every poll, the
-/// dashboard reads from it. Co-located with the sqlite store under the
-/// OS data directory.
-pub fn snapshots_path() -> Result<PathBuf> {
-    Ok(project_dirs()?.data_dir().join("snapshots.json"))
-}
-
-/// Trigger file the dashboard touches when the user clicks "Refresh".
-/// The tray watches it and forces an immediate poll. Co-located with
-/// the snapshot file so a single watcher on the data directory catches
-/// both.
-pub fn refresh_trigger_path() -> Result<PathBuf> {
-    Ok(project_dirs()?.data_dir().join("refresh.trigger"))
-}
-
-/// PID file used to enforce a singleton window for `name` (e.g.
-/// "dashboard" or "popup"). A second instance writes the matching
-/// focus-trigger file and exits.
-pub fn singleton_pid_path(name: &str) -> Result<PathBuf> {
-    Ok(project_dirs()?
-        .data_dir()
-        .join(format!("{}.pid", name)))
-}
-
-/// Companion file to `singleton_pid_path`. The running instance watches
-/// for writes here and brings its window to the foreground.
-pub fn singleton_focus_trigger_path(name: &str) -> Result<PathBuf> {
-    Ok(project_dirs()?
-        .data_dir()
-        .join(format!("{}.focus", name)))
 }

@@ -277,7 +277,7 @@ mod tests {
         // disturb the user's machine in tests.
         let p = crate::config::refresh_trigger_path().unwrap();
         assert!(
-            p.as_os_str().len() > 0,
+            !p.as_os_str().is_empty(),
             "refresh_trigger_path must yield something"
         );
     }

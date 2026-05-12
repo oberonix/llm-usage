@@ -206,17 +206,15 @@ fn main() -> Result<()> {
             }
         }
 
-        if let Ok(tray_event) = tray_channel.try_recv() {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = tray_event
-            {
-                // Spawn (or focus, if already running) the popup
-                // window with the graphical quota view.
-                spawn_dashboard(&["--popup"]);
-            }
+        if let Ok(TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        }) = tray_channel.try_recv()
+        {
+            // Spawn (or focus, if already running) the popup
+            // window with the graphical quota view.
+            spawn_dashboard(&["--popup"]);
         }
     });
 }

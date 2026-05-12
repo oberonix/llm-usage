@@ -27,6 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install GUI deps
         run: |
@@ -39,6 +41,7 @@ jobs:
       # crates have GUI deps the test-core job can't install. Keeping
       # both jobs means a pure-core regression still fast-fails.
       - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
       - uses: actions/upload-artifact@v4
         with:

@@ -222,28 +222,24 @@ fn fold_opencode_events(
     let this_month = (now.year(), now.month());
 
     for e in events {
-        // Add the same event into every window it qualifies for.
-        let buckets: &[&str] = &(|| -> Vec<&'static str> {
-            let mut v = Vec::new();
-            if e.timestamp > hour_cutoff {
-                v.push("1h");
-            }
-            if e.timestamp.date_naive() == today {
-                v.push("today");
-            }
-            if e.timestamp > five_hour_cutoff {
-                v.push("5h");
-            }
-            if e.timestamp > week_cutoff {
-                v.push(WindowKind::ThisWeek.label());
-            }
-            let m = e.timestamp;
-            if (m.year(), m.month()) == this_month {
-                v.push("month");
-            }
-            v
-        })();
-        for label in buckets {
+        // Build the list of windows this event qualifies for.
+        let mut buckets: Vec<&'static str> = Vec::new();
+        if e.timestamp > hour_cutoff {
+            buckets.push("1h");
+        }
+        if e.timestamp.date_naive() == today {
+            buckets.push("today");
+        }
+        if e.timestamp > five_hour_cutoff {
+            buckets.push("5h");
+        }
+        if e.timestamp > week_cutoff {
+            buckets.push(WindowKind::ThisWeek.label());
+        }
+        if (e.timestamp.year(), e.timestamp.month()) == this_month {
+            buckets.push("month");
+        }
+        for label in &buckets {
             let w = snap.windows.entry((*label).to_string()).or_default();
             w.tokens_in = w.tokens_in.saturating_add(e.input_tokens + e.cached_tokens);
             w.tokens_out = w.tokens_out.saturating_add(e.output_tokens);

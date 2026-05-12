@@ -717,7 +717,7 @@ mod tests {
         let sonnet = snap.windows.get("week (Sonnet)").expect("sonnet present");
         assert!((sonnet.fraction_used.unwrap() - 0.31).abs() < 1e-9);
         // Opus absent from response → window not created.
-        assert!(snap.windows.get("week (Opus)").is_none());
+        assert!(!snap.windows.contains_key("week (Opus)"));
         // Compact headline includes 5h and 7d but not the per-model
         // breakdown (those would make it too noisy).
         assert!(headline.contains("5h 55%"), "got: {headline}");

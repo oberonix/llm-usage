@@ -341,8 +341,7 @@ fn draw_label(buf: &mut [u8], label: &str, color: (u8, u8, u8)) {
     for (i, ch) in label.chars().enumerate() {
         let g = glyph(ch);
         let gx = start_x + i * (GLYPH_W + GLYPH_SPACING);
-        for y in 0..GLYPH_H {
-            let row = g[y];
+        for (y, &row) in g.iter().enumerate() {
             for x in 0..GLYPH_W {
                 let bit_set = (row >> (GLYPH_W - 1 - x)) & 1 == 1;
                 if bit_set {
