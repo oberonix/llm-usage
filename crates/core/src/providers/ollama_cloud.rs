@@ -52,6 +52,9 @@ pub struct OllamaCloudProvider {
     http: reqwest::Client,
     /// Optional opencode SQLite path; `None` disables the integration.
     opencode_db: Option<std::path::PathBuf>,
+    /// Base URL for the settings request. Production default is
+    /// `BASE_URL`; tests inject a wiremock URI via [`with_base_url`].
+    base_url: String,
 }
 
 impl OllamaCloudProvider {
@@ -74,7 +77,19 @@ impl OllamaCloudProvider {
             .build()
             .expect("reqwest");
         let opencode_db = opencode_db.filter(|p| !p.as_os_str().is_empty());
-        Self { cfg, http, opencode_db }
+        Self {
+            cfg,
+            http,
+            opencode_db,
+            base_url: BASE_URL.to_string(),
+        }
+    }
+
+    /// Replace the base URL used for the settings request. Only tests
+    /// should need this — production always talks to ollama.com.
+    pub fn with_base_url(mut self, base: impl Into<String>) -> Self {
+        self.base_url = base.into();
+        self
     }
 
     /// Public so the `dump_ollama_cloud` example can reuse the auth path.
@@ -84,7 +99,7 @@ impl OllamaCloudProvider {
             .session_cookie
             .as_deref()
             .ok_or_else(|| anyhow!("no session_cookie set"))?;
-        let url = format!("{}{}", BASE_URL, SETTINGS_PATH);
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), SETTINGS_PATH);
         let resp = self
             .http
             .get(&url)
@@ -484,5 +499,161 @@ mod tests {
         let parsed = parse_settings(html);
         assert_eq!(parsed.rows.len(), 1);
         assert!((parsed.rows[0].percent - 100.0).abs() < 1e-6);
+    }
+
+    // ---- HTTP-layer tests against wiremock ----
+    //
+    // These exercise the path from `poll()` through `fetch_settings_html`
+    // and back: auth failures, transport failures, body-parse failures,
+    // and the happy path. We disable the opencode integration in all of
+    // them so the assertions stay focused on what the page-scrape did.
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn provider_against(server: &MockServer, cookie: &str) -> OllamaCloudProvider {
+        let mut cfg = OllamaCloudConfig::default();
+        cfg.enabled = true;
+        cfg.session_cookie = Some(cookie.into());
+        // Disable opencode merge: an empty path string is the documented
+        // way to opt out, see `Config::resolve_opencode_db`.
+        OllamaCloudProvider::with_opencode_db(cfg, None).with_base_url(server.uri())
+    }
+
+    #[tokio::test]
+    async fn fetch_settings_returns_body_on_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .and(header("Cookie", "session=abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=abc");
+        let body = p.fetch_settings_html().await.unwrap();
+        assert!(body.contains("Session usage"));
+    }
+
+    #[tokio::test]
+    async fn fetch_settings_401_yields_auth_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=stale");
+        let err = p.fetch_settings_html().await.unwrap_err().to_string();
+        assert!(err.contains("session cookie"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_settings_403_yields_auth_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=stale");
+        let err = p.fetch_settings_html().await.unwrap_err().to_string();
+        assert!(err.contains("session cookie"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_settings_500_yields_generic_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=ok");
+        let err = p.fetch_settings_html().await.unwrap_err().to_string();
+        assert!(err.contains("500"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_settings_missing_cookie_errors_before_request() {
+        let server = MockServer::start().await;
+        // No mock registered → if we attempted the request the test
+        // would fail with "unexpected request" or a network error.
+        // The session_cookie=None guard rejects before that point.
+        let mut cfg = OllamaCloudConfig::default();
+        cfg.enabled = true;
+        cfg.session_cookie = None;
+        let p = OllamaCloudProvider::with_opencode_db(cfg, None).with_base_url(server.uri());
+        let err = p.fetch_settings_html().await.unwrap_err().to_string();
+        assert!(err.contains("no session_cookie"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn poll_happy_path_populates_quota_windows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE))
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=abc");
+        let snap = p.poll().await.unwrap();
+        assert_eq!(snap.status, ProviderStatus::Ok);
+        assert_eq!(snap.plan_label.as_deref(), Some("Pro"));
+        // Session usage is normalised to the "5h" label.
+        let five_h = snap.windows.get("5h").expect("5h window present");
+        assert!((five_h.fraction_used.unwrap() - 0.278).abs() < 1e-6);
+        // Weekly usage rolls into the canonical week label.
+        let week = snap.windows.get(WindowKind::ThisWeek.label())
+            .expect("week window present");
+        assert!((week.fraction_used.unwrap() - 0.835).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn poll_returns_unavailable_when_body_has_no_markers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<html><body>maintenance</body></html>"),
+            )
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=abc");
+        let snap = p.poll().await.unwrap();
+        assert_eq!(snap.status, ProviderStatus::Unavailable);
+        assert!(snap.error.as_deref().unwrap_or("").contains("parse failed"));
+    }
+
+    #[tokio::test]
+    async fn poll_returns_unavailable_when_http_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=abc");
+        let snap = p.poll().await.unwrap();
+        // `poll` swallows fetch errors into an unavailable snapshot
+        // rather than failing the whole tray loop.
+        assert_eq!(snap.status, ProviderStatus::Unavailable);
+        assert!(snap
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("fetch failed"));
+    }
+
+    #[tokio::test]
+    async fn poll_without_cookie_is_unavailable_with_setup_hint() {
+        let server = MockServer::start().await;
+        let mut cfg = OllamaCloudConfig::default();
+        cfg.enabled = true;
+        cfg.session_cookie = None;
+        let p = OllamaCloudProvider::with_opencode_db(cfg, None).with_base_url(server.uri());
+        let snap = p.poll().await.unwrap();
+        assert_eq!(snap.status, ProviderStatus::Unavailable);
+        assert!(snap.error.as_deref().unwrap_or("").contains("not signed in"));
     }
 }
