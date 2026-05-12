@@ -74,27 +74,54 @@ impl CodexCliProvider {
 
     fn collect_events(&self) -> Result<Collected> {
         let mut out = Collected::default();
-        if !self.codex_dir.exists() {
-            return Ok(out);
-        }
-        // Only the active sessions dir matters for rolling windows up to 7d;
-        // we walk archived_sessions too in case ours is configured oddly.
-        for sub in ["sessions", "archived_sessions"] {
-            let root = self.codex_dir.join(sub);
-            if !root.exists() {
-                continue;
+        if self.codex_dir.exists() {
+            // Only the active sessions dir matters for rolling windows up to 7d;
+            // we walk archived_sessions too in case ours is configured oddly.
+            for sub in ["sessions", "archived_sessions"] {
+                let root = self.codex_dir.join(sub);
+                if !root.exists() {
+                    continue;
+                }
+                for entry in WalkDir::new(&root)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
+                {
+                    if let Err(e) = parse_session_file(entry.path(), &mut out) {
+                        tracing::warn!(path = %entry.path().display(), error = %e, "codex parse failed");
+                    }
+                }
             }
-            for entry in WalkDir::new(&root)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
-            {
-                if let Err(e) = parse_session_file(entry.path(), &mut out) {
-                    tracing::warn!(path = %entry.path().display(), error = %e, "codex parse failed");
+        }
+
+        // Supplementary source: opencode's SQLite store, if present.
+        // Users who hit OpenAI via opencode (rather than the codex CLI
+        // directly) won't have fresh rollouts; their token activity
+        // lives here instead. opencode doesn't expose rate-limit
+        // headers, so the quota fractions still have to come from
+        // rollouts when they exist.
+        if let Some(db) = self.opencode_db_path() {
+            if db.exists() {
+                match read_opencode_events(&db, "openai") {
+                    Ok(events) => out.events.extend(events),
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %db.display(), "opencode db read failed");
+                    }
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Resolve which SQLite file (if any) to consult for opencode
+    /// events. `Some(empty)` from the config explicitly disables the
+    /// integration; `None` falls back to the default XDG path.
+    fn opencode_db_path(&self) -> Option<PathBuf> {
+        match &self.cfg.opencode_db {
+            Some(p) if p.as_os_str().is_empty() => None,
+            Some(p) => Some(p.clone()),
+            None => dirs::data_dir().map(|d| d.join("opencode").join("opencode.db")),
+        }
     }
 }
 
@@ -238,12 +265,24 @@ fn apply_rate_limits(
     now: DateTime<Utc>,
 ) {
     let raw_frac = bucket.used_percent / 100.0;
-    // If the snapshot's window has already rolled, the percentage is
-    // stale — clamp to 0 rather than showing a phantom utilization.
+    // If the snapshot's window has already rolled (resets_at < now),
+    // the percentage tells us nothing about the *current* window: it's
+    // a leftover from the last codex CLI run. Surface that as "unknown"
+    // (fraction_used = None) rather than "0%", which would visually
+    // claim the user has used nothing. Downstream renderers (tray
+    // icon rotation, dashboard cards, CLI bars) skip windows without
+    // a fraction, so the row simply disappears until fresh data lands.
     let still_in_window = bucket.resets_at.is_some_and(|t| t > now);
-    w.fraction_used = Some(if still_in_window { raw_frac } else { 0.0 });
-    w.ends_at = bucket.resets_at;
-    w.started_at = Some(now);
+    if still_in_window {
+        w.fraction_used = Some(raw_frac);
+        w.ends_at = bucket.resets_at;
+        w.started_at = Some(now);
+    } else {
+        // Leave fraction_used = None. We still keep `ends_at` cleared
+        // so the row doesn't accidentally show a past reset time.
+        w.fraction_used = None;
+        w.ends_at = None;
+    }
     let _ = bucket.window_minutes; // kept for future labelling
 }
 
@@ -306,6 +345,98 @@ fn default_codex_dir() -> PathBuf {
     dirs::home_dir()
         .map(|h| h.join(".codex"))
         .unwrap_or_else(|| PathBuf::from(".codex"))
+}
+
+/// Read the opencode SQLite store and emit a `TokenEvent` per
+/// assistant message whose `data.providerID` matches `provider_id`.
+///
+/// opencode stores all message metadata inside a single `data` TEXT
+/// column as JSON; we only deserialise the few fields we need
+/// (`role`, `providerID`, `modelID`, `tokens`, `time.completed`). The
+/// connection is opened read-only so we never race opencode's own
+/// writes — opencode keeps the DB in WAL mode so concurrent readers
+/// are safe and cheap.
+fn read_opencode_events(
+    db_path: &std::path::Path,
+    provider_id: &str,
+) -> Result<Vec<TokenEvent>> {
+    use rusqlite::{Connection, OpenFlags};
+
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Worth setting query_only as a belt-and-suspenders against
+    // accidental writes from a future code change.
+    let _ = conn.pragma_update(None, "query_only", true);
+
+    // Only the last 14 days — gives the 7d window plenty of headroom
+    // and keeps the scan O(recent) instead of O(history).
+    let cutoff_ms = (Utc::now() - Duration::days(14)).timestamp_millis();
+    let mut stmt = conn.prepare(
+        "SELECT time_created, data FROM message WHERE time_created >= ?",
+    )?;
+    let mut rows = stmt.query([cutoff_ms])?;
+
+    let mut events = Vec::new();
+    while let Some(row) = rows.next()? {
+        let created_ms: i64 = row.get(0)?;
+        let blob: String = row.get(1)?;
+        let v: Value = match serde_json::from_str(&blob) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("role").and_then(|x| x.as_str()) != Some("assistant") {
+            continue;
+        }
+        // Provider/model can live at the message root or one level
+        // down on the first part — accept either shape.
+        let model_node = v.get("model").cloned().or_else(|| {
+            v.pointer("/parts/0/model").cloned()
+        });
+        let prov = v
+            .get("providerID")
+            .and_then(|x| x.as_str())
+            .or_else(|| model_node.as_ref().and_then(|m| m.get("providerID")).and_then(|x| x.as_str()))
+            .unwrap_or("");
+        if prov != provider_id {
+            continue;
+        }
+        let model_id = v
+            .get("modelID")
+            .and_then(|x| x.as_str())
+            .or_else(|| model_node.as_ref().and_then(|m| m.get("modelID")).and_then(|x| x.as_str()))
+            .unwrap_or("openai")
+            .to_string();
+        let tokens = v.get("tokens");
+        let input = tokens.and_then(|t| t.get("input")).and_then(|x| x.as_u64()).unwrap_or(0);
+        let output = tokens.and_then(|t| t.get("output")).and_then(|x| x.as_u64()).unwrap_or(0);
+        let cached = tokens
+            .and_then(|t| t.get("cache"))
+            .and_then(|c| c.get("read"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        if input == 0 && output == 0 && cached == 0 {
+            continue;
+        }
+        // Prefer time.completed when present (it's set on the final
+        // chunk of the stream and is when the response *finished*);
+        // fall back to time_created.
+        let completed_ms = v
+            .pointer("/time/completed")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(created_ms);
+        let ts = Utc.timestamp_millis_opt(completed_ms).single();
+        let Some(ts) = ts else { continue };
+        events.push(TokenEvent {
+            timestamp: ts,
+            model: model_id,
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: cached,
+        });
+    }
+    Ok(events)
 }
 
 #[derive(Debug, Default)]
@@ -518,6 +649,7 @@ mod tests {
 
         let mut cfg = CodexCliConfig::default();
         cfg.codex_dir = Some(dir.path().to_path_buf());
+        cfg.opencode_db = Some(PathBuf::new()); // disable opencode merge
         let p = CodexCliProvider::new(cfg);
         let collected = p.collect_events().unwrap();
         assert_eq!(
@@ -633,6 +765,7 @@ mod tests {
 
         let mut cfg = CodexCliConfig::default();
         cfg.codex_dir = Some(dir.path().to_path_buf());
+        cfg.opencode_db = Some(PathBuf::new());
         let p = CodexCliProvider::new(cfg);
         let collected = p.collect_events().unwrap();
         let rl = collected
@@ -650,5 +783,187 @@ mod tests {
         let secondary = rl.secondary.expect("secondary present");
         assert!((secondary.used_percent - 17.0).abs() < 1e-6);
         assert_eq!(secondary.window_minutes, 10080);
+    }
+
+    /// Builds a minimal opencode-shaped SQLite file at `path` with two
+    /// messages: one user (which the parser should skip) and one
+    /// assistant in the requested `provider_id`.
+    fn write_opencode_fixture(
+        path: &std::path::Path,
+        provider_id: &str,
+        completed_ms: i64,
+        input: u64,
+        output: u64,
+    ) {
+        use rusqlite::Connection;
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        let user_data = serde_json::json!({
+            "role": "user",
+            "time": {"created": completed_ms - 1000},
+        })
+        .to_string();
+        let asst_data = serde_json::json!({
+            "role": "assistant",
+            "providerID": provider_id,
+            "modelID": "gpt-5.5",
+            "time": {"created": completed_ms - 500, "completed": completed_ms},
+            "tokens": {
+                "input": input,
+                "output": output,
+                "cache": {"read": 0, "write": 0},
+                "reasoning": 0,
+                "total": input + output,
+            },
+            "cost": 0,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO message VALUES (?,?,?,?,?)",
+            rusqlite::params!["u1", "ses1", completed_ms - 1000, completed_ms - 1000, user_data],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message VALUES (?,?,?,?,?)",
+            rusqlite::params!["a1", "ses1", completed_ms - 500, completed_ms, asst_data],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn read_opencode_events_extracts_assistant_token_data() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("opencode.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        write_opencode_fixture(&db, "openai", now_ms, 1_000, 200);
+        let events = read_opencode_events(&db, "openai").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].input_tokens, 1_000);
+        assert_eq!(events[0].output_tokens, 200);
+        // Timestamp must use time.completed when present.
+        assert!((events[0].timestamp.timestamp_millis() - now_ms).abs() < 50);
+    }
+
+    #[test]
+    fn read_opencode_events_filters_by_provider_id() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("opencode.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        write_opencode_fixture(&db, "ollama-cloud", now_ms, 500, 50);
+        // Asking for "openai" gets nothing back.
+        let events = read_opencode_events(&db, "openai").unwrap();
+        assert!(events.is_empty());
+        // Asking for the right provider yields the row.
+        let events = read_opencode_events(&db, "ollama-cloud").unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn read_opencode_events_skips_zero_token_rows() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("opencode.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        write_opencode_fixture(&db, "openai", now_ms, 0, 0);
+        let events = read_opencode_events(&db, "openai").unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn collect_events_merges_opencode_into_rollouts() {
+        let dir = TempDir::new().unwrap();
+        // Codex rollout with one event.
+        let day = dir.path().join("sessions/2026/05/08");
+        std::fs::create_dir_all(&day).unwrap();
+        let f = day.join("rollout-test.jsonl");
+        let mut out = std::fs::File::create(&f).unwrap();
+        let recent = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let ts = recent.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        writeln!(
+            out,
+            r#"{{"type":"turn_context","timestamp":"{ts}","payload":{{"model":"gpt-5-codex"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            out,
+            r#"{{"type":"event_msg","timestamp":"{ts}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":50,"cached_input_tokens":0,"total_tokens":150}}}}}}}}"#
+        )
+        .unwrap();
+        drop(out);
+
+        // opencode db with an openai assistant message.
+        let db = dir.path().join("opencode.db");
+        write_opencode_fixture(
+            &db,
+            "openai",
+            chrono::Utc::now().timestamp_millis(),
+            500,
+            120,
+        );
+
+        let mut cfg = CodexCliConfig::default();
+        cfg.codex_dir = Some(dir.path().to_path_buf());
+        cfg.opencode_db = Some(db);
+        let p = CodexCliProvider::new(cfg);
+        let collected = p.collect_events().unwrap();
+        // 1 rollout event + 1 opencode event = 2.
+        assert_eq!(collected.events.len(), 2);
+        // Sum of input tokens across both sources.
+        let total_in: u64 = collected.events.iter().map(|e| e.input_tokens).sum();
+        assert_eq!(total_in, 600);
+    }
+
+    #[test]
+    fn empty_opencode_db_path_disables_integration() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = CodexCliConfig::default();
+        cfg.codex_dir = Some(dir.path().to_path_buf());
+        cfg.opencode_db = Some(PathBuf::new());
+        let p = CodexCliProvider::new(cfg);
+        // No rollouts, no opencode → empty result, no error.
+        let collected = p.collect_events().unwrap();
+        assert!(collected.events.is_empty());
+        assert!(p.opencode_db_path().is_none());
+    }
+
+    #[test]
+    fn apply_rate_limits_drops_fraction_when_stale() {
+        use crate::model::WindowUsage;
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        let stale_bucket = RateLimitsBucket {
+            used_percent: 42.0,
+            window_minutes: 300,
+            resets_at: Some(now - chrono::Duration::minutes(5)),
+        };
+        apply_rate_limits(&mut w, stale_bucket, now);
+        // Stale snapshot → fraction is unknown, not 0.
+        assert!(w.fraction_used.is_none(), "got {:?}", w.fraction_used);
+        assert!(w.ends_at.is_none(), "stale ends_at should be cleared");
+    }
+
+    #[test]
+    fn apply_rate_limits_keeps_fraction_when_fresh() {
+        use crate::model::WindowUsage;
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        let fresh_bucket = RateLimitsBucket {
+            used_percent: 28.0,
+            window_minutes: 300,
+            resets_at: Some(now + chrono::Duration::hours(3)),
+        };
+        apply_rate_limits(&mut w, fresh_bucket, now);
+        assert!((w.fraction_used.unwrap() - 0.28).abs() < 1e-9);
+        assert!(w.ends_at.is_some());
     }
 }

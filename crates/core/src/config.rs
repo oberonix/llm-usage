@@ -93,6 +93,17 @@ pub struct CodexCliConfig {
     /// When false (default) the UI shows turn counts and tokens but hides
     /// the reverse-engineered dollar estimate.
     pub show_spend: bool,
+    /// Optional opencode SQLite store path. If the file exists, the
+    /// Codex provider reads its `message` table and folds any rows
+    /// whose `data.providerID == "openai"` into the same 5h/7d
+    /// aggregates as the native rollouts. Useful for users who use
+    /// opencode (or other openai-via-API tools) rather than the codex
+    /// CLI directly, since native rollouts are stale in that case.
+    ///
+    /// Empty string disables the integration even when the file exists.
+    /// None defaults to `~/.local/share/opencode/opencode.db` at
+    /// construction time.
+    pub opencode_db: Option<PathBuf>,
 }
 
 impl Default for CodexCliConfig {
@@ -102,6 +113,7 @@ impl Default for CodexCliConfig {
             codex_dir: None,
             warn_at: vec![0.75, 0.9],
             show_spend: false,
+            opencode_db: None,
         }
     }
 }
