@@ -223,6 +223,36 @@ impl OAuthBackoff {
         self.last_good = Some(body.clone());
         self.last_good_at = Some(now);
     }
+
+    /// True when the caller should *skip* a fresh HTTP call and reuse
+    /// `last_good`. Two cases combined:
+    ///
+    ///   1. We're inside the 429 cooldown window (existing behaviour).
+    ///   2. The last successful response is younger than `min_interval`
+    ///      — covers file-watcher-driven refresh storms where local
+    ///      JSONL writes could otherwise trigger many `/usage` calls
+    ///      per minute and surprise-429 us.
+    ///
+    /// Returns `false` when no `last_good` has ever been recorded so
+    /// the first poll after startup is always allowed through.
+    pub fn should_skip_http(
+        &self,
+        now: DateTime<Utc>,
+        min_interval: std::time::Duration,
+    ) -> bool {
+        if self.in_cooldown(now) {
+            return true;
+        }
+        match self.last_good_at {
+            Some(t) => match (now - t).to_std() {
+                Ok(elapsed) => elapsed < min_interval,
+                // Clock skew → treat as "skip" defensively; we don't
+                // want to fire HTTP based on a wonky time delta.
+                Err(_) => true,
+            },
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -372,6 +402,42 @@ mod tests {
         assert_eq!(b.next_allowed_unix_secs, 0);
         assert!(b.last_good.is_some());
         assert!(!b.in_cooldown(now));
+    }
+
+    #[test]
+    fn should_skip_http_returns_false_when_no_prior_call() {
+        // Cold start: never made an HTTP call yet → always allowed.
+        let b = OAuthBackoff::default();
+        assert!(!b.should_skip_http(Utc::now(), std::time::Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn should_skip_http_throttles_within_min_interval() {
+        // last_good_at = 30s ago, min_interval = 60s → throttled.
+        let mut b = OAuthBackoff::default();
+        let now = Utc::now();
+        b.record_success(
+            now - chrono::Duration::seconds(30),
+            &OAuthUsageResponse::default(),
+        );
+        assert!(b.should_skip_http(now, std::time::Duration::from_secs(60)));
+        // Outside the interval → not throttled.
+        assert!(!b.should_skip_http(now, std::time::Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn should_skip_http_returns_true_during_429_cooldown_even_if_min_interval_elapsed() {
+        // 429 cooldown wins over min-interval check — we must NOT
+        // hammer a rate-limited endpoint just because the soft
+        // throttle says it's been long enough since last success.
+        let mut b = OAuthBackoff::default();
+        let now = Utc::now();
+        b.record_success(
+            now - chrono::Duration::hours(1),
+            &OAuthUsageResponse::default(),
+        );
+        b.record_429(now); // installs the 5min cooldown
+        assert!(b.should_skip_http(now, std::time::Duration::from_secs(60)));
     }
 
     #[test]

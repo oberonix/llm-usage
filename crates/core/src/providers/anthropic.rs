@@ -24,6 +24,16 @@ use chrono::{DateTime, Datelike, Utc};
 #[cfg(test)]
 use chrono::TimeZone;
 use serde::Deserialize;
+
+/// Minimum time between successive `/api/oauth/usage` HTTP calls.
+/// Within this window we serve the cached `OAuthBackoff::last_good`
+/// instead of re-fetching — protects against file-watcher-driven
+/// refresh storms (Claude Code can write to `~/.claude/projects/`
+/// once per assistant turn, which would otherwise trigger one OAuth
+/// call per turn). 60 s is the sweet spot: fresh enough that the 5h
+/// quota fraction lags by at most a minute, slow enough that we
+/// won't surprise-429 ourselves under heavy use.
+const MIN_HTTP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -268,20 +278,24 @@ impl Provider for AnthropicProvider {
         // Quota windows from Anthropic's OAuth /usage endpoint — same data
         // Claude Code's `/usage` shows. We fetch it ourselves on each poll
         // using the access token in ~/.claude/.credentials.json. If we got
-        // 429'd recently, serve the last-good cached response instead.
+        // 429'd recently OR the last successful fetch is too recent to
+        // warrant a re-call, serve the last-good cached response instead.
         let mut quota_headline = String::new();
         let mut quota_error: Option<String> = None;
         let mut serving_stale = false;
 
-        let in_cooldown = self
+        let (skip_http, in_cooldown) = self
             .oauth_backoff
             .lock()
             .ok()
-            .map(|b| b.in_cooldown(now))
-            .unwrap_or(false);
+            .map(|b| (b.should_skip_http(now, MIN_HTTP_INTERVAL), b.in_cooldown(now)))
+            .unwrap_or((false, false));
 
-        if in_cooldown {
-            // Skip the network call entirely; reuse last-good if we have it.
+        if skip_http {
+            // Either rate-limit cooldown or a recent success short-
+            // circuits the network call. Reuse last-good and (if it
+            // was a 429 cooldown) flag the windows stale so the tray
+            // shows ⚠ markers.
             let snapshot_data = self
                 .oauth_backoff
                 .lock()
@@ -289,19 +303,23 @@ impl Provider for AnthropicProvider {
                 .and_then(|b| b.last_good.clone());
             if let Some(usage) = snapshot_data {
                 apply_oauth_usage(&mut snap, &usage, now, &mut quota_headline);
-                mark_oauth_windows_stale(&mut snap);
-                serving_stale = true;
+                if in_cooldown {
+                    mark_oauth_windows_stale(&mut snap);
+                    serving_stale = true;
+                }
             }
-            let remaining = self
-                .oauth_backoff
-                .lock()
-                .ok()
-                .map(|b| b.cooldown_remaining(now))
-                .unwrap_or(0);
-            quota_error = Some(format!(
-                "rate-limited; quota refresh paused for {}m",
-                remaining.div_euclid(60)
-            ));
+            if in_cooldown {
+                let remaining = self
+                    .oauth_backoff
+                    .lock()
+                    .ok()
+                    .map(|b| b.cooldown_remaining(now))
+                    .unwrap_or(0);
+                quota_error = Some(format!(
+                    "rate-limited; quota refresh paused for {}m",
+                    remaining.div_euclid(60)
+                ));
+            }
         } else {
             match anthropic_oauth::fetch_usage(&self.http).await {
                 Ok(usage) => {

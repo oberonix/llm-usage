@@ -47,6 +47,17 @@ use std::time::Duration;
 const BASE_URL: &str = "https://ollama.com";
 const SETTINGS_PATH: &str = "/settings";
 
+/// Minimum time between `/settings` HTTP calls. Within this window
+/// we reuse the cached HTML so file-watcher-driven refreshes don't
+/// hammer ollama.com (which has no documented rate limit but is
+/// well within bot-detection territory if we knock too fast).
+const MIN_HTTP_INTERVAL: Duration = Duration::from_secs(60);
+
+struct CachedFetch {
+    at: chrono::DateTime<Utc>,
+    html: String,
+}
+
 pub struct OllamaCloudProvider {
     cfg: OllamaCloudConfig,
     http: reqwest::Client,
@@ -55,6 +66,10 @@ pub struct OllamaCloudProvider {
     /// Base URL for the settings request. Production default is
     /// `BASE_URL`; tests inject a wiremock URI via [`with_base_url`].
     base_url: String,
+    /// Last successful `/settings` fetch, served on cache-hit. Only
+    /// successful responses are stored — auth failures and parse
+    /// failures must keep re-trying.
+    last_good: std::sync::Mutex<Option<CachedFetch>>,
 }
 
 impl OllamaCloudProvider {
@@ -82,6 +97,7 @@ impl OllamaCloudProvider {
             http,
             opencode_db,
             base_url: BASE_URL.to_string(),
+            last_good: std::sync::Mutex::new(None),
         }
     }
 
@@ -140,13 +156,43 @@ impl Provider for OllamaCloudProvider {
             ));
         }
 
-        let html = match self.fetch_settings_html().await {
-            Ok(h) => h,
-            Err(e) => {
-                return Ok(UsageSnapshot::unavailable(
-                    ProviderId::OllamaCloud,
-                    format!("fetch failed: {}", e),
-                ));
+        // Cache-hit short-circuit: if we successfully fetched within
+        // the throttle window, skip the HTTP and reuse the prior body.
+        let now_pre = Utc::now();
+        let cached_html: Option<String> = self
+            .last_good
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().and_then(|c| {
+                    let elapsed = (now_pre - c.at).to_std().ok()?;
+                    if elapsed < MIN_HTTP_INTERVAL {
+                        Some(c.html.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+
+        let html = if let Some(cached) = cached_html {
+            cached
+        } else {
+            match self.fetch_settings_html().await {
+                Ok(h) => {
+                    if let Ok(mut guard) = self.last_good.lock() {
+                        *guard = Some(CachedFetch {
+                            at: Utc::now(),
+                            html: h.clone(),
+                        });
+                    }
+                    h
+                }
+                Err(e) => {
+                    return Ok(UsageSnapshot::unavailable(
+                        ProviderId::OllamaCloud,
+                        format!("fetch failed: {}", e),
+                    ));
+                }
             }
         };
 
@@ -651,5 +697,32 @@ mod tests {
         let snap = p.poll().await.unwrap();
         assert_eq!(snap.status, ProviderStatus::Unavailable);
         assert!(snap.error.as_deref().unwrap_or("").contains("not signed in"));
+    }
+
+    #[tokio::test]
+    async fn second_poll_within_throttle_window_reuses_cache_no_http() {
+        // Two back-to-back polls. The mock is configured to expect
+        // *exactly one* HTTP call (`.expect(1)`); a second `/settings`
+        // request would fail the test on server drop. Confirms that
+        // the in-process cache short-circuits the network entirely.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SAMPLE))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=abc");
+        let first = p.poll().await.unwrap();
+        assert_eq!(first.status, ProviderStatus::Ok);
+        let second = p.poll().await.unwrap();
+        // Same fractions, same plan label — the cache replays the
+        // identical HTML so the parsed result is bit-for-bit equal.
+        assert_eq!(second.status, ProviderStatus::Ok);
+        assert_eq!(second.plan_label, first.plan_label);
+        assert_eq!(
+            second.windows.get("5h").unwrap().fraction_used,
+            first.windows.get("5h").unwrap().fraction_used,
+        );
     }
 }
