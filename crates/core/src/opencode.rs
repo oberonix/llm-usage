@@ -256,4 +256,240 @@ mod tests {
         write_fixture(&p, "openai", chrono::Utc::now().timestamp_millis(), 0, 0, None);
         assert!(read_events(&p, "openai").unwrap().is_empty());
     }
+
+    // Helper that creates the table once and lets the caller insert any
+    // number of rows with arbitrary `data` JSON. Power-user version of
+    // `write_fixture` for the schema/corner-case tests below.
+    fn make_db(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_row(conn: &Connection, id: &str, time_created_ms: i64, data: &str) {
+        conn.execute(
+            "INSERT INTO message VALUES (?,?,?,?,?)",
+            rusqlite::params![id, "ses", time_created_ms, time_created_ms, data],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn skips_rows_with_corrupt_json_blob() {
+        // A `data` column that doesn't parse must be skipped silently
+        // — opencode's writer could emit half-truncated JSON during a
+        // crash and we don't want to take the whole poll down.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("oc.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let conn = make_db(&p);
+            insert_row(&conn, "bad", now_ms, "{not valid json");
+            insert_row(
+                &conn,
+                "good",
+                now_ms,
+                r#"{"role":"assistant","providerID":"openai","modelID":"gpt-x","time":{"completed":1778600000000},"tokens":{"input":10,"output":5,"cache":{"read":0}}}"#,
+            );
+        }
+        let events = read_events(&p, "openai").unwrap();
+        assert_eq!(events.len(), 1, "got: {:#?}", events);
+        assert_eq!(events[0].input_tokens, 10);
+    }
+
+    #[test]
+    fn excludes_rows_older_than_14_days() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("oc.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let ancient_ms = now_ms - 1000 * 60 * 60 * 24 * 30; // 30 days ago
+        let recent_ms = now_ms - 1000 * 60 * 60; // 1 hour ago
+        {
+            let conn = make_db(&p);
+            for (id, t) in [("ancient", ancient_ms), ("recent", recent_ms)] {
+                insert_row(
+                    &conn,
+                    id,
+                    t,
+                    &format!(
+                        r#"{{"role":"assistant","providerID":"openai","modelID":"x","time":{{"completed":{t}}},"tokens":{{"input":100,"output":1}}}}"#,
+                        t = t
+                    ),
+                );
+            }
+        }
+        let events = read_events(&p, "openai").unwrap();
+        assert_eq!(events.len(), 1, "old row must be filtered out: {:#?}", events);
+    }
+
+    #[test]
+    fn falls_back_to_time_created_when_completed_missing() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("oc.db");
+        let created_ms = chrono::Utc::now().timestamp_millis() - 60_000;
+        {
+            let conn = make_db(&p);
+            // No `time.completed` — must use time_created.
+            insert_row(
+                &conn,
+                "x",
+                created_ms,
+                r#"{"role":"assistant","providerID":"openai","modelID":"x","tokens":{"input":10,"output":1}}"#,
+            );
+        }
+        let events = read_events(&p, "openai").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].timestamp.timestamp_millis(), created_ms);
+    }
+
+    #[test]
+    fn skips_non_assistant_roles() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("oc.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let conn = make_db(&p);
+            insert_row(
+                &conn,
+                "u",
+                now_ms,
+                r#"{"role":"user","providerID":"openai","modelID":"x","tokens":{"input":100,"output":0}}"#,
+            );
+            insert_row(
+                &conn,
+                "a",
+                now_ms,
+                r#"{"role":"assistant","providerID":"openai","modelID":"x","tokens":{"input":5,"output":3}}"#,
+            );
+        }
+        let events = read_events(&p, "openai").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].input_tokens, 5);
+    }
+
+    #[test]
+    fn cached_tokens_count_toward_non_zero_check() {
+        // A row with input=output=0 but a non-zero cache.read is still
+        // a real turn — should NOT be filtered.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("oc.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let conn = make_db(&p);
+            insert_row(
+                &conn,
+                "c",
+                now_ms,
+                r#"{"role":"assistant","providerID":"openai","modelID":"x","tokens":{"input":0,"output":0,"cache":{"read":500}}}"#,
+            );
+        }
+        let events = read_events(&p, "openai").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].cached_tokens, 500);
+    }
+
+    #[test]
+    fn nested_provider_id_under_model_object_works() {
+        // Newer opencode versions sometimes stash providerID inside
+        // a `model` sub-object instead of at the root. The reader
+        // accepts either shape.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("oc.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let conn = make_db(&p);
+            insert_row(
+                &conn,
+                "n",
+                now_ms,
+                r#"{"role":"assistant","model":{"providerID":"anthropic","modelID":"claude-x"},"tokens":{"input":1,"output":1}}"#,
+            );
+        }
+        let events = read_events(&p, "anthropic").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].model, "claude-x");
+    }
+
+    #[test]
+    fn non_sqlite_file_returns_err() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("not-a-db.db");
+        std::fs::write(&p, b"plain text, not sqlite").unwrap();
+        assert!(read_events(&p, "openai").is_err());
+    }
+
+    #[test]
+    fn schema_missing_message_table_returns_err() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("oc.db");
+        let conn = Connection::open(&p).unwrap();
+        // Valid SQLite file, but no `message` table — open succeeds,
+        // prepare fails. Confirm the error surfaces rather than
+        // silently returning an empty event list.
+        conn.execute_batch("CREATE TABLE not_message (x INTEGER);").unwrap();
+        drop(conn);
+        assert!(read_events(&p, "openai").is_err());
+    }
+
+    #[test]
+    fn aggregates_multiple_rows() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("oc.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let conn = make_db(&p);
+            for (i, tokens) in [(1, 10), (2, 20), (3, 30)].iter().enumerate() {
+                let blob = format!(
+                    r#"{{"role":"assistant","providerID":"openai","modelID":"m","time":{{"completed":{}}},"tokens":{{"input":{},"output":1}}}}"#,
+                    now_ms - i as i64 * 60_000,
+                    tokens.1,
+                );
+                insert_row(&conn, &format!("r{}", tokens.0), now_ms - i as i64 * 60_000, &blob);
+            }
+        }
+        let events = read_events(&p, "openai").unwrap();
+        assert_eq!(events.len(), 3);
+        let total_input: u64 = events.iter().map(|e| e.input_tokens).sum();
+        assert_eq!(total_input, 60);
+    }
+
+    #[test]
+    fn negative_cost_field_is_treated_as_unset() {
+        // Defensive: opencode shouldn't emit negative costs, but a
+        // signed-int wrap or bad import script could. The reader
+        // filters `cost > 0`, so a negative or zero cost reads as
+        // `None` rather than misrepresenting spend.
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("oc.db");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        {
+            let conn = make_db(&p);
+            insert_row(
+                &conn,
+                "neg",
+                now_ms,
+                r#"{"role":"assistant","providerID":"openai","modelID":"m","tokens":{"input":1,"output":1},"cost":-0.5}"#,
+            );
+            insert_row(
+                &conn,
+                "zero",
+                now_ms,
+                r#"{"role":"assistant","providerID":"openai","modelID":"m","tokens":{"input":1,"output":1},"cost":0.0}"#,
+            );
+        }
+        let events = read_events(&p, "openai").unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.cost_usd.is_none()));
+    }
 }
