@@ -146,12 +146,24 @@ pub struct ExtraUsage {
 
 pub async fn fetch_usage(client: &reqwest::Client) -> Result<OAuthUsageResponse, OAuthError> {
     let creds = OAuthCredentials::load()?;
+    fetch_usage_with(client, OAUTH_USAGE_URL, &creds).await
+}
+
+/// Same as [`fetch_usage`] but with the URL and credentials supplied
+/// explicitly. The `fetch_usage` shim reads credentials from disk; this
+/// variant lets tests (and any future caller that already has fresh
+/// credentials in memory) skip the file IO and target a stub server.
+pub async fn fetch_usage_with(
+    client: &reqwest::Client,
+    url: &str,
+    creds: &OAuthCredentials,
+) -> Result<OAuthUsageResponse, OAuthError> {
     if creds.is_expired() {
         return Err(OAuthError::Expired);
     }
-    let token = creds.claude_ai_oauth.access_token;
+    let token = creds.claude_ai_oauth.access_token.clone();
     let resp = client
-        .get(OAUTH_USAGE_URL)
+        .get(url)
         .bearer_auth(token)
         .header("anthropic-beta", OAUTH_BETA_HEADER)
         .header("content-type", "application/json")
@@ -369,5 +381,151 @@ mod tests {
         b.record_429(now);
         let later = now + chrono::Duration::seconds(b.current_cooldown_secs + 60);
         assert_eq!(b.cooldown_remaining(later), 0);
+    }
+
+    #[test]
+    fn is_rate_limited_only_true_for_that_variant() {
+        let e: OAuthError = OAuthError::RateLimited;
+        assert!(e.is_rate_limited());
+        let other: OAuthError = OAuthError::Expired;
+        assert!(!other.is_rate_limited());
+    }
+
+    #[test]
+    fn credentials_path_includes_dot_claude_dot_credentials_json() {
+        // We don't assert the exact home path (varies per-machine) but
+        // the trailing two components must match what Claude Code
+        // writes to. A typo here is a silent "couldn't read
+        // credentials" at runtime.
+        let p = credentials_path().expect("credentials_path");
+        let s = p.to_string_lossy();
+        assert!(s.ends_with(".claude/.credentials.json"), "got: {s}");
+    }
+
+    // ---- HTTP-layer tests against wiremock ----
+
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn fresh_creds() -> OAuthCredentials {
+        OAuthCredentials {
+            claude_ai_oauth: OAuthBody {
+                access_token: "test-token".into(),
+                // Not expired — well in the future.
+                expires_at_ms: Some(
+                    (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp_millis(),
+                ),
+                subscription_type: Some("max".into()),
+                rate_limit_tier: Some("default_claude_max_5x".into()),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_usage_parses_full_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header("authorization", "Bearer test-token"))
+            .and(header("anthropic-beta", OAUTH_BETA_HEADER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "five_hour": {"utilization": 55.0, "resets_at": "2026-05-12T05:00:00Z"},
+                "seven_day": {"utilization": 58.0, "resets_at": "2026-05-13T15:00:00Z"},
+                "seven_day_opus": null,
+                "seven_day_sonnet": {"utilization": 31.0, "resets_at": "2026-05-13T15:00:00Z"},
+                "extra_usage": {
+                    "is_enabled": true,
+                    "monthly_limit": 100.0,
+                    "used_credits": 12.34,
+                    "utilization": 12.34,
+                    "currency": "USD"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let body = fetch_usage_with(&client, &server.uri(), &fresh_creds())
+            .await
+            .unwrap();
+        assert!((body.five_hour.unwrap().utilization - 55.0).abs() < 1e-6);
+        assert!((body.seven_day.unwrap().utilization - 58.0).abs() < 1e-6);
+        assert!(body.seven_day_opus.is_none());
+        assert!((body.seven_day_sonnet.unwrap().utilization - 31.0).abs() < 1e-6);
+        assert_eq!(body.extra_usage.unwrap().currency.as_deref(), Some("USD"));
+    }
+
+    #[tokio::test]
+    async fn fetch_usage_handles_missing_optional_buckets() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let body = fetch_usage_with(&reqwest::Client::new(), &server.uri(), &fresh_creds())
+            .await
+            .unwrap();
+        assert!(body.five_hour.is_none());
+        assert!(body.seven_day.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_usage_429_returns_rate_limited_variant() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        let err = fetch_usage_with(&reqwest::Client::new(), &server.uri(), &fresh_creds())
+            .await
+            .unwrap_err();
+        assert!(err.is_rate_limited(), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_usage_500_returns_http_variant() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let err = fetch_usage_with(&reqwest::Client::new(), &server.uri(), &fresh_creds())
+            .await
+            .unwrap_err();
+        match err {
+            OAuthError::Http(code) => assert_eq!(code.as_u16(), 503),
+            other => panic!("expected Http variant; got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_usage_short_circuits_when_creds_expired() {
+        let server = MockServer::start().await;
+        // No mock registered: if we made the request the test would
+        // produce an "unexpected request" warning.
+        let mut creds = fresh_creds();
+        creds.claude_ai_oauth.expires_at_ms = Some(
+            (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis(),
+        );
+        let err = fetch_usage_with(&reqwest::Client::new(), &server.uri(), &creds)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OAuthError::Expired));
+    }
+
+    #[tokio::test]
+    async fn fetch_usage_malformed_body_returns_transport_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("definitely not json"),
+            )
+            .mount(&server)
+            .await;
+        let err = fetch_usage_with(&reqwest::Client::new(), &server.uri(), &fresh_creds())
+            .await
+            .unwrap_err();
+        // The reqwest `.json()` failure surfaces as Transport.
+        assert!(matches!(err, OAuthError::Transport(_)));
     }
 }
