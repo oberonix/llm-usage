@@ -106,20 +106,33 @@ fn try_acquire_singleton(name: &str) -> SingletonOutcome {
     };
     let focus_path = llm_usage_core::config::singleton_focus_trigger_path(name)
         .unwrap_or_default();
+    try_acquire_singleton_at(&pid_path, &focus_path, std::process::id(), is_our_process)
+}
+
+/// Pure version: same logic but with explicit paths and a process
+/// liveness probe. Public so tests can drive it with tempdir paths and
+/// a fake liveness function; the production wrapper resolves the
+/// real paths via `ProjectDirs` and uses `is_our_process`.
+fn try_acquire_singleton_at(
+    pid_path: &std::path::Path,
+    focus_path: &std::path::Path,
+    my_pid: u32,
+    is_alive: fn(u32) -> bool,
+) -> SingletonOutcome {
     if let Some(parent) = pid_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
 
-    if let Ok(s) = std::fs::read_to_string(&pid_path) {
+    if let Ok(s) = std::fs::read_to_string(pid_path) {
         if let Ok(pid) = s.trim().parse::<u32>() {
-            if is_our_process(pid) {
-                let _ = std::fs::write(&focus_path, chrono::Utc::now().to_rfc3339());
+            if is_alive(pid) {
+                let _ = std::fs::write(focus_path, chrono::Utc::now().to_rfc3339());
                 return SingletonOutcome::Forwarded;
             }
         }
     }
-    let _ = std::fs::write(&pid_path, std::process::id().to_string());
-    SingletonOutcome::Acquired(pid_path)
+    let _ = std::fs::write(pid_path, my_pid.to_string());
+    SingletonOutcome::Acquired(pid_path.to_path_buf())
 }
 
 /// Return true only when `pid` names a live process whose command line
@@ -1058,6 +1071,112 @@ mod tests {
         assert_eq!(fmt_age(chrono::Duration::seconds(2 * 86_400)), "2d ago");
         // Negative durations (clock skew) clamp to 0.
         assert_eq!(fmt_age(chrono::Duration::seconds(-30)), "0s ago");
+    }
+
+    // ---- Singleton acquire / PID-reuse tests ----
+    //
+    // The PID-reuse bug we fixed earlier is the kind of thing that
+    // gets quietly reintroduced by a refactor and never noticed in
+    // testing (it only manifests when an old PID happens to collide
+    // with an unrelated live process). These tests pin down the
+    // behaviour of the pure helper with a fake `is_alive` so the
+    // outcomes are deterministic.
+
+    use tempfile::TempDir;
+
+    fn always_alive(_pid: u32) -> bool {
+        true
+    }
+    fn always_dead(_pid: u32) -> bool {
+        false
+    }
+
+    #[test]
+    fn singleton_acquires_when_no_pid_file_exists() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("dashboard.pid");
+        let focus_path = dir.path().join("dashboard.focus");
+        let outcome = try_acquire_singleton_at(&pid_path, &focus_path, 12345, always_alive);
+        match outcome {
+            SingletonOutcome::Acquired(p) => assert_eq!(p, pid_path),
+            SingletonOutcome::Forwarded => panic!("expected Acquired"),
+        }
+        // PID file now contains our PID.
+        let s = std::fs::read_to_string(&pid_path).unwrap();
+        assert_eq!(s.trim(), "12345");
+        // Focus trigger was NOT touched on first acquire.
+        assert!(!focus_path.exists());
+    }
+
+    #[test]
+    fn singleton_forwards_when_recorded_pid_is_alive() {
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("dashboard.pid");
+        let focus_path = dir.path().join("dashboard.focus");
+        // Pretend an earlier instance recorded its PID.
+        std::fs::write(&pid_path, "999").unwrap();
+        let outcome = try_acquire_singleton_at(&pid_path, &focus_path, 12345, always_alive);
+        assert!(matches!(outcome, SingletonOutcome::Forwarded));
+        // PID file unchanged (still the previous instance's PID).
+        assert_eq!(std::fs::read_to_string(&pid_path).unwrap().trim(), "999");
+        // Focus trigger was written to ping the running instance.
+        assert!(focus_path.exists());
+    }
+
+    #[test]
+    fn singleton_claims_slot_when_recorded_pid_is_dead() {
+        // The PID-reuse defence: an old PID file from a crashed
+        // instance must not block us. With `always_dead` standing in
+        // for "the PID is no longer ours / no longer alive", we take
+        // the slot.
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("dashboard.pid");
+        let focus_path = dir.path().join("dashboard.focus");
+        std::fs::write(&pid_path, "999").unwrap();
+        let outcome = try_acquire_singleton_at(&pid_path, &focus_path, 22222, always_dead);
+        assert!(matches!(outcome, SingletonOutcome::Acquired(_)));
+        // PID file now belongs to us.
+        assert_eq!(std::fs::read_to_string(&pid_path).unwrap().trim(), "22222");
+        // No focus ping (we didn't hand off to anyone).
+        assert!(!focus_path.exists());
+    }
+
+    #[test]
+    fn singleton_creates_parent_dir() {
+        let dir = TempDir::new().unwrap();
+        // Parent directory doesn't exist yet — the helper must create
+        // it before the write.
+        let pid_path = dir.path().join("nested").join("subdir").join("dashboard.pid");
+        let focus_path = dir.path().join("nested").join("subdir").join("dashboard.focus");
+        let outcome = try_acquire_singleton_at(&pid_path, &focus_path, 1, always_dead);
+        assert!(matches!(outcome, SingletonOutcome::Acquired(_)));
+        assert!(pid_path.exists());
+    }
+
+    #[test]
+    fn singleton_tolerates_garbage_in_pid_file() {
+        // A truncated / non-numeric PID file from a botched write
+        // must not be treated as "another instance is alive". We
+        // claim the slot and overwrite.
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("dashboard.pid");
+        let focus_path = dir.path().join("dashboard.focus");
+        std::fs::write(&pid_path, "not a pid").unwrap();
+        let outcome = try_acquire_singleton_at(&pid_path, &focus_path, 7, always_alive);
+        assert!(matches!(outcome, SingletonOutcome::Acquired(_)));
+        assert_eq!(std::fs::read_to_string(&pid_path).unwrap().trim(), "7");
+    }
+
+    #[test]
+    fn singleton_pid_with_surrounding_whitespace_is_parsed() {
+        // The trim() in the helper handles trailing newlines (some
+        // editors / shells append one).
+        let dir = TempDir::new().unwrap();
+        let pid_path = dir.path().join("dashboard.pid");
+        let focus_path = dir.path().join("dashboard.focus");
+        std::fs::write(&pid_path, "  4242\n").unwrap();
+        let outcome = try_acquire_singleton_at(&pid_path, &focus_path, 7, always_alive);
+        assert!(matches!(outcome, SingletonOutcome::Forwarded));
     }
 }
 
