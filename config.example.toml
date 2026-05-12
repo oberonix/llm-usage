@@ -57,5 +57,11 @@ enabled = false
 warn_at = [0.75, 0.9]
 
 [alerts]
+# Currently informational — alerts are throttled by window_id
+# (one alert per provider × threshold × hour/week/month bucket)
+# rather than by a time-based debounce. The field is kept so a
+# future time-throttle has somewhere to live, and so existing
+# configs don't fail to parse. Default = 3600s.
 debounce_secs = 3600
+# Set true to silence all desktop notifications.
 disabled = false

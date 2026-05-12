@@ -140,10 +140,23 @@ impl Default for OllamaCloudConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AlertsConfig {
-    /// Minimum gap (seconds) between two notifications for the same provider+threshold.
+    /// Reserved for a future time-based debounce. The current throttle
+    /// is window-id based: `quota::window_id_for` derives a key like
+    /// `"2026-05-12T14"` for 5h/1h or `"2026-W19"` for week, and the
+    /// engine refuses to re-fire the same (provider, window_kind,
+    /// window_id, threshold) tuple. In practice that means at most
+    /// one alert per hour for 5h/1h windows, per ISO week for week,
+    /// etc. — close to what `debounce_secs = 3600` would suggest.
+    /// We keep the field so existing user configs don't break; once
+    /// time-based throttling is wired up this comment will move.
+    #[serde(default = "default_debounce_secs")]
     pub debounce_secs: u64,
     /// Skip notifications entirely (useful for tests/CI).
     pub disabled: bool,
+}
+
+fn default_debounce_secs() -> u64 {
+    3600
 }
 
 impl Default for AlertsConfig {
