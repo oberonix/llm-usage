@@ -126,14 +126,25 @@ async fn run_once(use_color: bool) -> Result<()> {
 
 /// Live mode — watch `snapshots.json` for writes and redraw on each
 /// change. Blocks until Ctrl+C; the final render stays on screen.
+///
+/// Two redraw triggers feed into the same paint:
+///   1. `snapshots.json` was written (provider poll completed).
+///   2. `TICK` elapsed with no write — repaint with the last-seen data
+///      so the pace marker and "last refreshed" clock keep ticking
+///      between the (typically 15-minute) poll intervals.
 async fn run_live(use_color: bool) -> Result<()> {
+    /// Repaint cadence in the absence of a fresh snapshot. Fast
+    /// enough that the 5h pace marker moves at most ~1 cell per 30
+    /// real minutes — and the footer's wall-clock looks live.
+    const TICK: Duration = Duration::from_secs(30);
+
     // Initial paint — try cache first; fall back to a live poll so the
     // user isn't staring at "no data" while the tray's first poll runs.
-    let initial = match cached_snapshots() {
+    let mut latest = match cached_snapshots() {
         Some(s) => s,
         None => poll_fresh().await.unwrap_or_default(),
     };
-    render_screen(&initial, use_color);
+    render_screen(&latest, use_color);
 
     let snap_path = llm_usage_core::config::snapshots_path()?;
     let parent = snap_path
@@ -157,10 +168,8 @@ async fn run_live(use_color: bool) -> Result<()> {
     })?;
     watcher.watch(&parent, RecursiveMode::NonRecursive)?;
 
-    // Block on incoming events. recv_timeout with a generous duration
-    // is just there so a missed signal can't permanently wedge the loop.
     loop {
-        match rx.recv_timeout(Duration::from_secs(60)) {
+        match rx.recv_timeout(TICK) {
             Ok(()) => {
                 // Coalesce a burst of writes (atomic save = temp+rename
                 // fires more than one event) into one redraw.
@@ -171,10 +180,15 @@ async fn run_live(use_color: bool) -> Result<()> {
                     }
                 }
                 if let Ok(Some(file)) = llm_usage_core::read_snapshots() {
-                    render_screen(&file.snapshots, use_color);
+                    latest = file.snapshots;
                 }
+                render_screen(&latest, use_color);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Periodic tick — same data, fresh `now`. Cheap: one
+                // ANSI clear + ~30 lines of stdout.
+                render_screen(&latest, use_color);
+            }
             Err(_) => break,
         }
     }
