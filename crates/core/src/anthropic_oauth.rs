@@ -62,11 +62,54 @@ pub struct OAuthBody {
 
 impl OAuthCredentials {
     pub fn load() -> Result<Self, OAuthError> {
-        let path = credentials_path()?;
-        let s = std::fs::read_to_string(&path)
+        if let Ok(path) = credentials_path() {
+            if path.exists() {
+                match Self::load_from_file(&path) {
+                    Ok(creds) => return Ok(creds),
+                    Err(_) => {}
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            match Self::load_from_keychain() {
+                Ok(creds) => return Ok(creds),
+                Err(_) => {}
+            }
+        }
+        Err(OAuthError::Credentials(
+            "no credentials found (checked ~/.claude/.credentials.json and system keychain)"
+                .into(),
+        ))
+    }
+
+    fn load_from_file(path: &std::path::Path) -> Result<Self, OAuthError> {
+        let s = std::fs::read_to_string(path)
             .map_err(|e| OAuthError::Credentials(format!("read {}: {}", path.display(), e)))?;
         let creds: OAuthCredentials = serde_json::from_str(&s)
             .map_err(|e| OAuthError::Credentials(format!("parse {}: {}", path.display(), e)))?;
+        Ok(creds)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_from_keychain() -> Result<Self, OAuthError> {
+        let output = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ])
+            .output()
+            .map_err(|e| OAuthError::Credentials(format!("keychain command: {}", e)))?;
+        if !output.status.success() {
+            return Err(OAuthError::Credentials(
+                "Claude Code-credentials not found in keychain".into(),
+            ));
+        }
+        let s = String::from_utf8_lossy(&output.stdout);
+        let creds: OAuthCredentials = serde_json::from_str(s.trim())
+            .map_err(|e| OAuthError::Credentials(format!("parse keychain: {}", e)))?;
         Ok(creds)
     }
 

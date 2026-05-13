@@ -43,6 +43,10 @@ fn window_order(label: &str) -> u32 {
     }
 }
 
+/// macOS terminals render the ▰/▱ block characters with tighter
+/// horizontal metrics; a space between cells keeps the bar readable.
+const BAR_SPACING: bool = cfg!(target_os = "macos");
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -478,7 +482,11 @@ fn colored_bar(
     const RESET: &str = "\x1b[0m";
     let fill_color = if stale { DIM_GRAY } else { color_for(frac) };
     let mut s = String::with_capacity(cells * 8);
+    let sep = if BAR_SPACING { " " } else { "" };
     for i in 0..cells {
+        if i > 0 {
+            s.push_str(sep);
+        }
         if pace_idx == Some(i) {
             let glyph = if i < filled { '▰' } else { '▱' };
             s.push_str(PACE);
@@ -520,12 +528,17 @@ fn quota_suffix(w: &WindowUsage, now: chrono::DateTime<chrono::Utc>) -> String {
 
 fn unicode_bar(fraction: f64, cells: usize) -> String {
     let filled = ((fraction.clamp(0.0, 1.0) * cells as f64).round() as usize).min(cells);
+    let sep = if BAR_SPACING { " " } else { "" };
     let mut s = String::with_capacity(cells * 3);
-    for _ in 0..filled {
-        s.push('▰');
-    }
-    for _ in filled..cells {
-        s.push('▱');
+    for i in 0..cells {
+        if i > 0 {
+            s.push_str(sep);
+        }
+        if i < filled {
+            s.push('▰');
+        } else {
+            s.push('▱');
+        }
     }
     s
 }
@@ -555,30 +568,43 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    /// Build a string of `ch` repeated `n` times, with spaces between
+    /// when `BAR_SPACING` is on.
+    fn bar_str(ch: &str, n: usize) -> String {
+        bar_seq(&vec![ch; n])
+    }
+
+    fn bar_seq(seq: &[&str]) -> String {
+        let sep = if BAR_SPACING { " " } else { "" };
+        seq.join(sep)
+    }
+
     #[test]
     fn unicode_bar_zero_is_all_empty() {
-        assert_eq!(unicode_bar(0.0, 10), "▱▱▱▱▱▱▱▱▱▱");
+        assert_eq!(unicode_bar(0.0, 10), bar_str("▱", 10));
     }
 
     #[test]
     fn unicode_bar_full_is_all_filled() {
-        assert_eq!(unicode_bar(1.0, 10), "▰▰▰▰▰▰▰▰▰▰");
+        assert_eq!(unicode_bar(1.0, 10), bar_str("▰", 10));
     }
 
     #[test]
     fn unicode_bar_half() {
-        assert_eq!(unicode_bar(0.5, 10), "▰▰▰▰▰▱▱▱▱▱");
+        assert_eq!(
+            unicode_bar(0.5, 10),
+            bar_seq(&["▰", "▰", "▰", "▰", "▰", "▱", "▱", "▱", "▱", "▱"])
+        );
     }
 
     #[test]
     fn unicode_bar_clamps_above_one() {
-        // Over-cap input should still produce a clean fully-filled bar.
-        assert_eq!(unicode_bar(1.5, 8), "▰▰▰▰▰▰▰▰");
+        assert_eq!(unicode_bar(1.5, 8), bar_str("▰", 8));
     }
 
     #[test]
     fn unicode_bar_clamps_below_zero() {
-        assert_eq!(unicode_bar(-0.2, 5), "▱▱▱▱▱");
+        assert_eq!(unicode_bar(-0.2, 5), bar_str("▱", 5));
     }
 
     #[test]
@@ -811,7 +837,7 @@ mod tests {
         w.fraction_used = Some(1.0);
         w.ends_at = Some(chrono::Utc::now() + chrono::Duration::minutes(125));
         w.stale = true;
-        let s = format_quota_row("5h", &w, /*use_color*/ false);
+        let s = format_quota_row("5h", &w, false);
         assert!(s.contains("100%"), "got: {}", s);
         assert!(s.contains("2h"), "got: {}", s);
         assert!(
@@ -828,7 +854,7 @@ mod tests {
         snap.windows.get_mut("5h").unwrap().stale = true;
         let mut snaps = BTreeMap::new();
         snaps.insert(ProviderId::Anthropic, snap);
-        let s = build_screen(&snaps, None, /*use_color*/ false, false);
+        let s = build_screen(&snaps, None, false, false);
         // First non-empty line is the header: "Anthropic · Plus ⚠".
         let header = s.lines().next().unwrap_or("");
         assert!(header.contains("Anthropic"), "got: {}", header);
@@ -885,7 +911,7 @@ mod tests {
     fn build_screen_includes_header_bars_and_footer() {
         let mut snaps = BTreeMap::new();
         snaps.insert(ProviderId::CodexCli, make_snapshot(ProviderId::CodexCli));
-        let s = build_screen(&snaps, None, /*use_color*/ false, /*clear*/ false);
+        let s = build_screen(&snaps, None, false, false);
         assert!(s.contains("Codex"), "expected provider name in: {}", s);
         assert!(s.contains("Plus"), "expected plan tag in: {}", s);
         assert!(s.contains("5h"), "expected window label in: {}", s);
@@ -946,8 +972,8 @@ mod tests {
     fn build_screen_with_color_includes_ansi_clear_when_requested() {
         let mut snaps = BTreeMap::new();
         snaps.insert(ProviderId::CodexCli, make_snapshot(ProviderId::CodexCli));
-        let with_clear = build_screen(&snaps, None, /*color*/ true, /*clear*/ true);
-        let without_clear = build_screen(&snaps, None, /*color*/ true, /*clear*/ false);
+        let with_clear = build_screen(&snaps, None, true, true);
+        let without_clear = build_screen(&snaps, None, true, false);
         // Clear sequence at the top of one but not the other.
         assert!(with_clear.starts_with("\x1b[2J\x1b[H"));
         assert!(!without_clear.starts_with("\x1b[2J\x1b[H"));

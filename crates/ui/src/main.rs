@@ -213,9 +213,7 @@ fn main() -> Result<()> {
             ..
         }) = tray_channel.try_recv()
         {
-            // Spawn (or focus, if already running) the popup
-            // window with the graphical quota view.
-            spawn_dashboard(&["--popup"]);
+            spawn_dashboard(&[]);
         }
     });
 }
