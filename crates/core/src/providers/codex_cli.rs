@@ -405,12 +405,9 @@ impl Provider for CodexCliProvider {
             if let Some(secondary) = rl.secondary {
                 apply_rate_limits(snap.window_mut(WindowKind::ThisWeek), secondary, now);
             }
-            if rl.rate_limit_reached_type.is_some() {
+            if let Some(kind) = rl.rate_limit_reached_type.as_deref() {
                 snap.status = ProviderStatus::Degraded;
-                snap.error = Some(format!(
-                    "rate limit hit: {}",
-                    rl.rate_limit_reached_type.as_deref().unwrap_or("?")
-                ));
+                snap.error = Some(format_rate_limit_error(kind));
             }
         }
 
@@ -445,10 +442,16 @@ impl Provider for CodexCliProvider {
                     if let Some(rl) = &usage.rate_limit_reached_type {
                         if usage.rate_limit.limit_reached {
                             snap.status = ProviderStatus::Degraded;
-                            snap.error = Some(format!(
-                                "rate limit hit: {}",
-                                rl.details.as_deref().unwrap_or(rl.kind.as_str())
-                            ));
+                            // wham emits `details: "default"` for the
+                            // 5h window and `"weekly"` for the 7d
+                            // window. The rollouts use `"primary"` /
+                            // `"secondary"` / `"session"` for the
+                            // same concepts. `format_rate_limit_error`
+                            // unifies the vocabulary so the user sees
+                            // "Session rate limit hit" regardless of
+                            // which source the error came from.
+                            let kind = rl.details.as_deref().unwrap_or(rl.kind.as_str());
+                            snap.error = Some(format_rate_limit_error(kind));
                         } else {
                             // Reachedness has cleared since the last
                             // rollouts-derived error — wipe the
@@ -498,6 +501,20 @@ impl Provider for CodexCliProvider {
 /// invocation that would refresh the snapshot — short enough not to
 /// hide real staleness, long enough to absorb a clock-skew tick.
 const STALE_GRACE_SECS: i64 = 5 * 60;
+
+/// Turn a raw rate-limit-reached kind (varies by upstream: wham uses
+/// `"default"` / `"weekly"`; rollouts use `"primary"` / `"secondary"`
+/// / `"session"`) into a phrase the user actually recognises. The
+/// vocabulary follows what chatgpt.com itself shows on the Codex
+/// Cloud Settings analytics page — "Session" for the 5-hour rolling
+/// window, "Weekly" for the 7-day window.
+fn format_rate_limit_error(kind: &str) -> String {
+    match kind.to_ascii_lowercase().as_str() {
+        "default" | "primary" | "session" | "5h" => "Session rate limit hit".to_string(),
+        "weekly" | "secondary" | "7d" | "week" => "Weekly rate limit hit".to_string(),
+        other => format!("Rate limit hit ({})", other),
+    }
+}
 
 fn apply_rate_limits(
     w: &mut crate::model::WindowUsage,
@@ -1348,6 +1365,32 @@ mod tests {
         assert!(p.collect_events().unwrap().events.is_empty());
         let p = CodexCliProvider::with_opencode_db(cfg, Some(PathBuf::new()));
         assert!(p.collect_events().unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn format_rate_limit_error_maps_known_kinds_to_friendly_phrases() {
+        // The wham endpoint emits `"default"` / `"weekly"`; the codex
+        // CLI rollouts emit `"primary"` / `"secondary"` / `"session"`.
+        // Both surface as the same human phrase so the user reads
+        // "Session rate limit hit" regardless of which source the
+        // status came from.
+        for s in ["default", "primary", "session", "5h", "DEFAULT", "Session"] {
+            assert_eq!(format_rate_limit_error(s), "Session rate limit hit");
+        }
+        for w in ["weekly", "secondary", "7d", "week", "WEEKLY"] {
+            assert_eq!(format_rate_limit_error(w), "Weekly rate limit hit");
+        }
+    }
+
+    #[test]
+    fn format_rate_limit_error_falls_back_to_raw_when_unknown() {
+        // A new upstream value we haven't mapped yet still surfaces
+        // in the UI rather than silently rendering as "Rate limit hit"
+        // alone — the raw kind helps the user file a bug.
+        assert_eq!(
+            format_rate_limit_error("organizational_limit"),
+            "Rate limit hit (organizational_limit)"
+        );
     }
 
     #[test]
