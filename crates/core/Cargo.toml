@@ -31,6 +31,9 @@ tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 wiremock = "0.6"
+# Only the `dump_codex_cloud` recon example uses this; not linked
+# into the library or any binary.
+rookie = { workspace = true }
 
 
 [lints]
