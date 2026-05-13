@@ -549,13 +549,7 @@ fn process_codex_line(line: &str, state: &mut FileState, cache: &mut ScanCache) 
                 if let (Some(ts), Some(record)) =
                     (record_ts, parse_rate_limits(rl, record_ts))
                 {
-                    let take = match &cache.latest_rate_limits {
-                        None => true,
-                        Some(prev) => ts > prev.record_at,
-                    };
-                    if take {
-                        cache.latest_rate_limits = Some(record);
-                    }
+                    maybe_update_latest_rate_limits(&mut cache.latest_rate_limits, ts, record);
                 }
             }
 
@@ -594,6 +588,51 @@ fn process_codex_line(line: &str, state: &mut FileState, cache: &mut ScanCache) 
             });
         }
         _ => {}
+    }
+}
+
+/// Decide whether to install `record` as the new `latest_rate_limits`.
+/// The naive rule "newer record_at wins" produces visible flipping
+/// around quota-exhaustion time on Codex CLI v0.129+: that version
+/// alternates between bucket-bearing records (`primary: {used_percent
+/// : 82.0, ...}`) and "credits-only" records (`primary: null,
+/// secondary: null` with a sibling `credits` block). Letting a
+/// credits-only record blow away a meaningful cached one strips the
+/// snapshot's `fraction_used` for that poll; the runtime's
+/// `merge_stale_from` then grafts back the previous fraction with
+/// `stale = true`, only to flip back to "fresh" on the next
+/// bucket-bearing record. Net effect: the user sees the bar tier
+/// oscillating between live colours and the stale grey poll-by-poll
+/// despite no real change in their quota state.
+///
+/// Two rules:
+///
+/// 1. Always reject older records (strict `>` on `record_at`).
+/// 2. Reject a newer record that has NEITHER primary nor secondary
+///    buckets when the cached one has at least one. The cached
+///    record's `plan_type` and `rate_limit_reached_type` are
+///    preserved alongside its buckets, which is what the caller
+///    actually renders. (We still accept a null-null record when
+///    the cache itself is empty or null-null — the original
+///    "fresh session supersedes ancient stale" rationale still
+///    applies in that case.)
+fn maybe_update_latest_rate_limits(
+    slot: &mut Option<RateLimitsRecord>,
+    new_at: DateTime<Utc>,
+    new_record: RateLimitsRecord,
+) {
+    let take = match slot {
+        None => true,
+        Some(prev) => {
+            let is_strictly_newer = new_at > prev.record_at;
+            let demotes_to_null_null = new_record.primary.is_none()
+                && new_record.secondary.is_none()
+                && (prev.primary.is_some() || prev.secondary.is_some());
+            is_strictly_newer && !demotes_to_null_null
+        }
+    };
+    if take {
+        *slot = Some(new_record);
     }
 }
 
@@ -871,6 +910,110 @@ mod tests {
             "primary": {"used_percent": 1.0, "window_minutes": 300, "resets_at": 1778000000},
         }));
         assert!(parse_rate_limits(&v, None).is_none());
+    }
+
+    // ---- maybe_update_latest_rate_limits ----
+    //
+    // Regression tests for the "Codex bar flipping at quota
+    // exhaustion" symptom: Codex CLI v0.129+ alternates between
+    // bucket-bearing records and credits-only (null/null) records,
+    // and the previous "newer wins unconditionally" rule made the
+    // bar oscillate between fresh + stale every other poll.
+
+    fn rec_with_buckets(record_at: DateTime<Utc>, primary_pct: f64) -> RateLimitsRecord {
+        RateLimitsRecord {
+            record_at,
+            primary: Some(RateLimitsBucket {
+                used_percent: primary_pct,
+                window_minutes: 300,
+                resets_at: Some(record_at + chrono::Duration::hours(2)),
+            }),
+            secondary: Some(RateLimitsBucket {
+                used_percent: 50.0,
+                window_minutes: 10_080,
+                resets_at: Some(record_at + chrono::Duration::days(3)),
+            }),
+            plan_type: Some("plus".into()),
+            rate_limit_reached_type: None,
+        }
+    }
+
+    fn rec_null_null(record_at: DateTime<Utc>) -> RateLimitsRecord {
+        RateLimitsRecord {
+            record_at,
+            primary: None,
+            secondary: None,
+            plan_type: Some("plus".into()),
+            rate_limit_reached_type: None,
+        }
+    }
+
+    #[test]
+    fn update_latest_rate_limits_takes_first_record() {
+        let mut slot: Option<RateLimitsRecord> = None;
+        let now = Utc::now();
+        maybe_update_latest_rate_limits(&mut slot, now, rec_with_buckets(now, 80.0));
+        assert!(slot.as_ref().unwrap().primary.is_some());
+    }
+
+    #[test]
+    fn update_latest_rate_limits_takes_newer_buckets() {
+        let now = Utc::now();
+        let mut slot = Some(rec_with_buckets(now - chrono::Duration::seconds(60), 70.0));
+        maybe_update_latest_rate_limits(&mut slot, now, rec_with_buckets(now, 80.0));
+        let p = slot.as_ref().unwrap().primary.unwrap();
+        assert!((p.used_percent - 80.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn update_latest_rate_limits_rejects_older_record() {
+        let now = Utc::now();
+        let mut slot = Some(rec_with_buckets(now, 80.0));
+        let older_at = now - chrono::Duration::seconds(60);
+        maybe_update_latest_rate_limits(&mut slot, older_at, rec_with_buckets(older_at, 50.0));
+        let p = slot.as_ref().unwrap().primary.unwrap();
+        assert!((p.used_percent - 80.0).abs() < 1e-9, "older record must not win");
+    }
+
+    #[test]
+    fn update_latest_rate_limits_keeps_buckets_when_newer_is_null_null() {
+        // The flip-fix regression test. Cache has fresh 80 %; a newer
+        // credits-only record arrives. We must NOT install the
+        // null-null record over the meaningful one — otherwise the
+        // next call to `apply_rate_limits` does nothing and the
+        // bar disappears for the poll.
+        let now = Utc::now();
+        let mut slot = Some(rec_with_buckets(now - chrono::Duration::seconds(30), 80.0));
+        maybe_update_latest_rate_limits(&mut slot, now, rec_null_null(now));
+        let kept = slot.as_ref().unwrap();
+        assert!(kept.primary.is_some(), "buckets must be preserved");
+        let p = kept.primary.unwrap();
+        assert!((p.used_percent - 80.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn update_latest_rate_limits_accepts_null_null_when_cache_is_already_null_null() {
+        // The original "fresh session supersedes ancient stale"
+        // rationale: when the cached record itself has no buckets,
+        // a fresh null-null is a legitimate signal that the prior
+        // session's data is gone.
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(3);
+        let mut slot = Some(rec_null_null(old));
+        maybe_update_latest_rate_limits(&mut slot, now, rec_null_null(now));
+        assert_eq!(slot.as_ref().unwrap().record_at, now);
+    }
+
+    #[test]
+    fn update_latest_rate_limits_takes_newer_record_when_it_has_buckets() {
+        // Symmetric to the keep-meaningful case: a newer record
+        // that DOES have buckets always wins, even if the cache
+        // also had buckets.
+        let now = Utc::now();
+        let mut slot = Some(rec_with_buckets(now - chrono::Duration::seconds(30), 80.0));
+        maybe_update_latest_rate_limits(&mut slot, now, rec_with_buckets(now, 85.0));
+        let p = slot.as_ref().unwrap().primary.unwrap();
+        assert!((p.used_percent - 85.0).abs() < 1e-9);
     }
 
     #[test]
