@@ -709,7 +709,7 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
             if let Some(ends) = w.ends_at {
                 let secs = (ends - chrono::Utc::now()).num_seconds();
                 if secs > 0 || w.stale {
-                    ui.weak(reset_label(secs.max(0)));
+                    ui.weak(reset_label(secs.max(0), ends));
                 }
             }
             if let Some(spend) = w.spend_usd {
@@ -756,14 +756,28 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
     }
 }
 
-fn reset_label(secs: i64) -> String {
-    if secs < 3600 {
-        format!("resets {}m", secs / 60)
+fn reset_label(secs: i64, ends_at: chrono::DateTime<chrono::Utc>) -> String {
+    // Relative chip first (the at-a-glance "how soon").
+    let rel = if secs < 3600 {
+        format!("{}m", secs / 60)
     } else if secs < 86_400 {
-        format!("resets {}h", secs / 3600)
+        format!("{}h", secs / 3600)
     } else {
-        format!("resets {}d", secs / 86_400)
-    }
+        format!("{}d", secs / 86_400)
+    };
+    // Absolute time alongside so the user doesn't have to do
+    // arithmetic — "resets in 23m" is fine, but "resets in 23m
+    // (15:14)" lets you decide whether to wait it out or run a
+    // long task now. Format scales with distance: same-day shows
+    // just the wall clock; multi-day adds the weekday + month/day
+    // so "3d (Tue May 19, 15:14)" is unambiguous.
+    let local = ends_at.with_timezone(&chrono::Local);
+    let abs = if secs < 86_400 {
+        local.format("%H:%M").to_string()
+    } else {
+        local.format("%a %b %-d, %H:%M").to_string()
+    };
+    format!("resets {} ({})", rel, abs)
 }
 
 fn window_order(label: &str) -> u32 {
@@ -1088,6 +1102,46 @@ mod tests {
         assert_eq!(fraction_color(0.84), a);
         assert_eq!(fraction_color(0.85), r);
         assert_eq!(fraction_color(1.0), r);
+    }
+
+    #[test]
+    fn reset_label_includes_relative_and_absolute_within_one_day() {
+        // Same-day reset: 23 min from now → "resets 23m (HH:MM)".
+        // We don't pin the exact HH:MM (depends on test-runner clock
+        // + timezone) but the shape is deterministic.
+        let ends_at = chrono::Utc::now() + chrono::Duration::minutes(23);
+        let s = reset_label(23 * 60, ends_at);
+        assert!(s.starts_with("resets 23m ("), "got: {}", s);
+        assert!(s.ends_with(')'), "got: {}", s);
+        // The wall-clock format is `%H:%M` — exactly five chars
+        // plus the colon. Absolute portion lives between "(" and ")".
+        let abs = s
+            .rsplit_once('(')
+            .and_then(|(_, rest)| rest.strip_suffix(')'))
+            .unwrap();
+        assert_eq!(abs.len(), 5, "got abs={:?}", abs);
+        assert!(abs.contains(':'));
+    }
+
+    #[test]
+    fn reset_label_multi_day_includes_weekday_and_date() {
+        // 3 days out: format switches to "Mon May 19, 15:14" shape.
+        let ends_at = chrono::Utc::now() + chrono::Duration::days(3);
+        let s = reset_label(3 * 86_400, ends_at);
+        assert!(s.starts_with("resets 3d ("), "got: {}", s);
+        // Comma-separated weekday/month/day + clock.
+        assert!(s.contains(", "), "got: {}", s);
+    }
+
+    #[test]
+    fn reset_label_zero_seconds_still_emits_absolute_time() {
+        // The "0m" floor used for stale rows with a lapsed
+        // resets_at — caller decides whether to display this at
+        // all; we just have to not panic.
+        let ends_at = chrono::Utc::now();
+        let s = reset_label(0, ends_at);
+        assert!(s.starts_with("resets 0m ("), "got: {}", s);
+        assert!(s.ends_with(')'), "got: {}", s);
     }
 
     #[test]
