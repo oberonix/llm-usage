@@ -28,8 +28,7 @@ enum Tab {
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -105,8 +104,7 @@ fn try_acquire_singleton(name: &str) -> SingletonOutcome {
         Ok(p) => p,
         Err(_) => return SingletonOutcome::Acquired(std::path::PathBuf::new()),
     };
-    let focus_path = llm_usage_core::config::singleton_focus_trigger_path(name)
-        .unwrap_or_default();
+    let focus_path = llm_usage_core::config::singleton_focus_trigger_path(name).unwrap_or_default();
     try_acquire_singleton_at(&pid_path, &focus_path, std::process::id(), is_our_process)
 }
 
@@ -286,29 +284,30 @@ fn spawn_focus_watcher(mode_name: &str, ctx: egui::Context) -> Option<Recommende
 
     let last_fire = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60)));
     let target = trigger_path.clone();
-    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let event = match res {
-            Ok(e) => e,
-            Err(_) => return,
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let event = match res {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                return;
+            }
+            if !event.paths.iter().any(|p| p == &target) {
+                return;
+            }
+            let now = Instant::now();
+            let mut guard = last_fire.lock().expect("poisoned");
+            if now.duration_since(*guard) < Duration::from_millis(150) {
+                return;
+            }
+            *guard = now;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ctx.request_repaint();
+        }) {
+            Ok(w) => w,
+            Err(_) => return None,
         };
-        if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
-            return;
-        }
-        if !event.paths.iter().any(|p| p == &target) {
-            return;
-        }
-        let now = Instant::now();
-        let mut guard = last_fire.lock().expect("poisoned");
-        if now.duration_since(*guard) < Duration::from_millis(150) {
-            return;
-        }
-        *guard = now;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        ctx.request_repaint();
-    }) {
-        Ok(w) => w,
-        Err(_) => return None,
-    };
     if watcher.watch(&parent, RecursiveMode::NonRecursive).is_err() {
         return None;
     }
@@ -410,30 +409,23 @@ impl DashboardApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let title = ui.label(
-                        RichText::new("LLM Usage").strong().size(14.0),
-                    );
+                    let title = ui.label(RichText::new("LLM Usage").strong().size(14.0));
                     // Dragging the title bar moves the window — egui's
                     // standard pattern when running without decorations.
                     if title.interact(egui::Sense::drag()).dragged() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            let close = ui.add(
-                                egui::Button::new(
-                                    RichText::new("✕")
-                                        .size(13.0)
-                                        .color(Color32::from_gray(180)),
-                                )
-                                .frame(false),
-                            );
-                            if close.clicked() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close = ui.add(
+                            egui::Button::new(
+                                RichText::new("✕").size(13.0).color(Color32::from_gray(180)),
+                            )
+                            .frame(false),
+                        );
+                        if close.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
                 });
             });
 
@@ -466,14 +458,11 @@ impl DashboardApp {
     /// without needing the OS theme to draw a selection state.
     fn tab_button(&mut self, ui: &mut egui::Ui, tab: Tab, label: &str) {
         let active = self.tab == tab;
-        let text = RichText::new(label)
-            .size(15.0)
-            .strong()
-            .color(if active {
-                ui.visuals().strong_text_color()
-            } else {
-                Color32::from_gray(160)
-            });
+        let text = RichText::new(label).size(15.0).strong().color(if active {
+            ui.visuals().strong_text_color()
+        } else {
+            Color32::from_gray(160)
+        });
         let resp = ui.add(
             egui::Button::new(text)
                 .frame(false)
@@ -488,7 +477,10 @@ impl DashboardApp {
             let y = rect.bottom() + 2.0;
             let stroke = egui::Stroke::new(3.0, underline_color);
             ui.painter().line_segment(
-                [egui::pos2(rect.left() + 8.0, y), egui::pos2(rect.right() - 8.0, y)],
+                [
+                    egui::pos2(rect.left() + 8.0, y),
+                    egui::pos2(rect.right() - 8.0, y),
+                ],
                 stroke,
             );
         }
@@ -693,14 +685,14 @@ fn render_windows_table(
                         .color(Color32::from_gray(210)),
                 );
                 ui.horizontal(|ui| {
-                    render_window_usage(ui, w);
+                    render_window_usage(ui, label, w);
                 });
                 ui.end_row();
             }
         });
 }
 
-fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage) {
+fn render_window_usage(ui: &mut egui::Ui, label: &str, w: &llm_usage_core::model::WindowUsage) {
     match w.fraction_used {
         Some(frac) => {
             // Stale rows drop to grey across all tiers — the colour
@@ -720,7 +712,29 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
                         .size(11.0)
                         .strong(),
                 );
-            ui.add(bar);
+            let bar_resp = ui.add(bar);
+            // Pace marker overlay: a 2px vertical line at the
+            // elapsed-fraction-of-window position. Matches the tray
+            // icon and CLI pace markers so the three surfaces tell
+            // the same time-vs-usage story. White over a red bar
+            // for contrast; red otherwise.
+            if let Some(pace) = pace_fraction(label, w, chrono::Utc::now()) {
+                let rect = bar_resp.rect;
+                let x = rect.left() + (rect.width() * pace.clamp(0.0, 1.0) as f32);
+                let pace_color = if !w.stale && frac >= 0.85 {
+                    Color32::WHITE
+                } else {
+                    Color32::from_rgb(0xFF, 0x20, 0x20)
+                };
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x, rect.top()),
+                        egui::pos2(x + 2.0, rect.bottom()),
+                    ),
+                    0.0,
+                    pace_color,
+                );
+            }
             // Reset countdown still shows when we know it, even for
             // stale rows — the user wants to know when fresh data
             // should be arriving. `secs.max(0)` clamps a lapsed
@@ -743,6 +757,24 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
             }
             if let Some(limit) = w.limit_usd {
                 ui.weak(format!("of ${:.0}", limit));
+            }
+            let mut parts: Vec<String> = Vec::new();
+            if w.tokens_in > 0 {
+                parts.push(format!("{} in", fmt_tokens(w.tokens_in)));
+            }
+            if w.tokens_out > 0 {
+                parts.push(format!("{} out", fmt_tokens(w.tokens_out)));
+            }
+            if w.request_count > 0 {
+                parts.push(format!("{} reqs", w.request_count));
+            }
+            if !parts.is_empty() {
+                for (i, p) in parts.iter().enumerate() {
+                    if i > 0 {
+                        ui.weak(RichText::new("|").color(Color32::from_gray(90)));
+                    }
+                    ui.weak(p);
+                }
             }
         }
         None => {
@@ -767,9 +799,7 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
             } else {
                 for (i, p) in parts.iter().enumerate() {
                     if i > 0 {
-                        ui.weak(
-                            RichText::new("|").color(Color32::from_gray(90)),
-                        );
+                        ui.weak(RichText::new("|").color(Color32::from_gray(90)));
                     }
                     ui.weak(p);
                 }
@@ -789,11 +819,7 @@ const REPO_URL: &str = "https://github.com/oberonix/llm-usage";
 /// throttles interact, and the visual conventions (colours, ⚠
 /// markers, gray = stale).
 fn render_help_body(ui: &mut egui::Ui) {
-    ui.label(
-        RichText::new("How llm-usage works")
-            .strong()
-            .size(20.0),
-    );
+    ui.label(RichText::new("How llm-usage works").strong().size(20.0));
     ui.add_space(2.0);
     ui.weak(
         "Reference for what's being tracked, where each number comes from, \
@@ -970,8 +996,19 @@ fn render_help_body(ui: &mut egui::Ui) {
     help_para(
         ui,
         "`llm-usage` in a terminal renders the same data as the tray, \
-         in colour, with a pace marker. Plays well with tmux. Flags:",
+         in colour, with a pace marker. Plays well with tmux.",
     );
+    help_subhead(ui, "Installing");
+    help_bullets(
+        ui,
+        &[
+            "cargo install --path crates/cli — easiest for rustup users; \
+             lands in ~/.cargo/bin/ which is already on PATH.",
+            "Or symlink target/release/llm-usage into ~/.local/bin/.",
+            "Then run `llm-usage` anywhere in a terminal.",
+        ],
+    );
+    help_subhead(ui, "Flags");
     help_bullets(
         ui,
         &[
@@ -985,6 +1022,21 @@ fn render_help_body(ui: &mut egui::Ui) {
             "--refresh — touches the tray's refresh-trigger file so \
              the next poll fires immediately.",
             "--help / --version — standard.",
+        ],
+    );
+    help_subhead(ui, "Setup binary");
+    help_bullets(
+        ui,
+        &[
+            "`llm-usage-setup` is a companion binary that opens an \
+             embedded browser at ollama.com/signin. After sign-in, \
+             cookies are captured and saved to config.toml automatically.",
+            "It is normally spawned by the Settings tab (Ollama Cloud \
+             → \"Sign in via popup window\") — you seldom need to \
+             run it directly.",
+            "Pass `--help` to it for standalone usage notes.",
+            "Build it alongside the tray: \
+             `cargo build --release -p llm-usage-setup`.",
         ],
     );
 
@@ -1042,7 +1094,14 @@ fn help_subhead(ui: &mut egui::Ui, title: &str) {
 
 fn help_para(ui: &mut egui::Ui, text: &str) {
     ui.add_space(2.0);
-    ui.label(RichText::new(text).size(12.5).color(Color32::from_gray(210)));
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .size(12.5)
+                .color(Color32::from_gray(210)),
+        )
+        .wrap(),
+    );
 }
 
 fn help_bullets(ui: &mut egui::Ui, items: &[&str]) {
@@ -1051,10 +1110,38 @@ fn help_bullets(ui: &mut egui::Ui, items: &[&str]) {
         ui.horizontal_top(|ui| {
             ui.add_space(4.0);
             ui.weak("•");
-            ui.label(RichText::new(*item).size(12.5).color(Color32::from_gray(210)));
+            ui.add(
+                egui::Label::new(
+                    RichText::new(*item)
+                        .size(12.5)
+                        .color(Color32::from_gray(210)),
+                )
+                .wrap(),
+            );
         });
         ui.add_space(3.0);
     }
+}
+
+/// Where (0..1) the time window currently sits, for the pace
+/// marker overlay. Mirrors `pace_index` in the CLI crate and the
+/// `bar_slot_for` logic in the tray icon — those three need to
+/// agree on what a "5h window" or "weekly window" means so the
+/// three surfaces show the same marker.
+fn pace_fraction(
+    label: &str,
+    w: &llm_usage_core::model::WindowUsage,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<f64> {
+    let window_secs: i64 = match label {
+        "5h" => 5 * 3600,
+        "week" | "Sonnet" | "Opus" => 7 * 86_400,
+        _ => return None,
+    };
+    let ends = w.ends_at?;
+    let remaining = (ends - now).num_seconds().max(0).min(window_secs);
+    let elapsed = window_secs - remaining;
+    Some(elapsed as f64 / window_secs as f64)
 }
 
 fn reset_label(secs: i64, ends_at: chrono::DateTime<chrono::Utc>) -> String {
@@ -1292,39 +1379,37 @@ fn spawn_snapshots_watcher(
 
     let last_fire = Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60)));
     let path_match = target.clone();
-    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let event = match res {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(error = %err, "snapshots watcher error");
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let event = match res {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::warn!(error = %err, "snapshots watcher error");
+                    return;
+                }
+            };
+            let interesting = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+            if !interesting {
                 return;
             }
+            if !event.paths.iter().any(|p| p == &path_match) {
+                return;
+            }
+            let now = Instant::now();
+            let mut guard = last_fire.lock().expect("poisoned");
+            if now.duration_since(*guard) < Duration::from_millis(150) {
+                return;
+            }
+            *guard = now;
+            reload_snapshots(&snapshots, &last_updated, &refresh_pending);
+            ctx.request_repaint();
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start snapshots watcher");
+                return None;
+            }
         };
-        let interesting = matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(_)
-        );
-        if !interesting {
-            return;
-        }
-        if !event.paths.iter().any(|p| p == &path_match) {
-            return;
-        }
-        let now = Instant::now();
-        let mut guard = last_fire.lock().expect("poisoned");
-        if now.duration_since(*guard) < Duration::from_millis(150) {
-            return;
-        }
-        *guard = now;
-        reload_snapshots(&snapshots, &last_updated, &refresh_pending);
-        ctx.request_repaint();
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not start snapshots watcher");
-            return None;
-        }
-    };
     if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
         tracing::warn!(error = %e, path = %parent.display(), "snapshots watcher subscribe failed");
         return None;
@@ -1353,27 +1438,15 @@ mod tests {
     #[test]
     fn window_order_groups_quota_first_then_activity() {
         let mut labels = vec![
-            "month",
-            "today",
-            "1h",
-            "Sonnet",
-            "5h",
-            "week",
-            "Opus",
-            "unknown",
+            "month", "today", "1h", "Sonnet", "5h", "week", "Opus", "unknown",
         ];
         labels.sort_by_key(|l| window_order(l));
         assert_eq!(
             labels,
             vec![
-                "5h",
-                "week",
-                "Sonnet",
-                "Opus",
-                "unknown",   // bucketed between quota & activity (50)
-                "1h",
-                "today",
-                "month",
+                "5h", "week", "Sonnet", "Opus",
+                "unknown", // bucketed between quota & activity (50)
+                "1h", "today", "month",
             ]
         );
     }
@@ -1528,8 +1601,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Parent directory doesn't exist yet — the helper must create
         // it before the write.
-        let pid_path = dir.path().join("nested").join("subdir").join("dashboard.pid");
-        let focus_path = dir.path().join("nested").join("subdir").join("dashboard.focus");
+        let pid_path = dir
+            .path()
+            .join("nested")
+            .join("subdir")
+            .join("dashboard.pid");
+        let focus_path = dir
+            .path()
+            .join("nested")
+            .join("subdir")
+            .join("dashboard.focus");
         let outcome = try_acquire_singleton_at(&pid_path, &focus_path, 1, always_dead);
         assert!(matches!(outcome, SingletonOutcome::Acquired(_)));
         assert!(pid_path.exists());

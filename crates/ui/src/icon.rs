@@ -48,13 +48,43 @@ pub fn render(provider: ProviderId, session: BarSlot, weekly: BarSlot) -> Icon {
     fill_rect(&mut buf, 0, DIVIDER_Y, SIZE_U, 1, tint);
 
     draw_label(&mut buf, provider_label(provider), (0xFF, 0xFF, 0xFF));
-    draw_bar(&mut buf, 0, SESSION_Y, SIZE_U, SESSION_HEIGHT, session.fraction);
+    draw_bar(
+        &mut buf,
+        0,
+        SESSION_Y,
+        SIZE_U,
+        SESSION_HEIGHT,
+        session.fraction,
+    );
     if let Some(p) = session.pace {
-        draw_pace_marker(&mut buf, 0, SESSION_Y, SIZE_U, SESSION_HEIGHT, p);
+        draw_pace_marker(
+            &mut buf,
+            0,
+            SESSION_Y,
+            SIZE_U,
+            SESSION_HEIGHT,
+            p,
+            session.fraction,
+        );
     }
-    draw_bar(&mut buf, 0, WEEKLY_Y, SIZE_U, WEEKLY_HEIGHT, weekly.fraction);
+    draw_bar(
+        &mut buf,
+        0,
+        WEEKLY_Y,
+        SIZE_U,
+        WEEKLY_HEIGHT,
+        weekly.fraction,
+    );
     if let Some(p) = weekly.pace {
-        draw_pace_marker(&mut buf, 0, WEEKLY_Y, SIZE_U, WEEKLY_HEIGHT, p);
+        draw_pace_marker(
+            &mut buf,
+            0,
+            WEEKLY_Y,
+            SIZE_U,
+            WEEKLY_HEIGHT,
+            p,
+            weekly.fraction,
+        );
     }
 
     Icon::from_rgba(buf, SIZE, SIZE).expect("icon construction")
@@ -84,26 +114,41 @@ fn draw_bar(buf: &mut [u8], x: usize, y: usize, w: usize, h: usize, frac: Option
     }
 }
 
-/// Vertical 1 px red line across a bar at the given pace (0..1). Drawn
-/// on top of the fill so it's always visible.
-fn draw_pace_marker(buf: &mut [u8], x: usize, y: usize, w: usize, h: usize, pace: f64) {
+/// Vertical 1 px line across a bar at the given pace (0..1).
+/// Red over green/amber bars; white over red-tier bars (≥ 85 %
+/// fill) for contrast against the dominant fill colour. Drawn on
+/// top of the fill so it's always visible regardless of where it
+/// sits in the bar.
+fn draw_pace_marker(
+    buf: &mut [u8],
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    pace: f64,
+    fraction: Option<f64>,
+) {
     if w == 0 {
         return;
     }
     let pace = pace.clamp(0.0, 1.0);
-    // Clamp the marker x to within the bar so an at-end window
-    // still shows a visible 1 px line rather than spilling off.
     let pos = ((pace * (w - 1) as f64).round() as usize).min(w - 1);
-    let red = (0xFF, 0x20, 0x20);
+    // If the bar is in the red tier the marker is on a saturated
+    // red background — switch to white so it stays legible.
+    let color = if fraction.is_some_and(|f| f >= 0.85) {
+        (0xFF, 0xFF, 0xFF)
+    } else {
+        (0xFF, 0x20, 0x20)
+    };
     for yy in y..(y + h).min(SIZE_U) {
         let xx = x + pos;
         if xx >= SIZE_U {
             break;
         }
         let i = (yy * SIZE_U + xx) * 4;
-        buf[i] = red.0;
-        buf[i + 1] = red.1;
-        buf[i + 2] = red.2;
+        buf[i] = color.0;
+        buf[i + 1] = color.1;
+        buf[i + 2] = color.2;
         buf[i + 3] = 0xFF;
     }
 }
@@ -373,9 +418,18 @@ mod tests {
     fn provider_tint_matches_core_table() {
         // The icon and the dashboard share `ProviderId::tint_rgb()` —
         // this test catches the case where the tray helper drifts.
-        assert_eq!(provider_tint(ProviderId::Anthropic), ProviderId::Anthropic.tint_rgb());
-        assert_eq!(provider_tint(ProviderId::CodexCli), ProviderId::CodexCli.tint_rgb());
-        assert_eq!(provider_tint(ProviderId::OllamaCloud), ProviderId::OllamaCloud.tint_rgb());
+        assert_eq!(
+            provider_tint(ProviderId::Anthropic),
+            ProviderId::Anthropic.tint_rgb()
+        );
+        assert_eq!(
+            provider_tint(ProviderId::CodexCli),
+            ProviderId::CodexCli.tint_rgb()
+        );
+        assert_eq!(
+            provider_tint(ProviderId::OllamaCloud),
+            ProviderId::OllamaCloud.tint_rgb()
+        );
     }
 
     #[test]
@@ -472,8 +526,14 @@ mod tests {
     fn render_produces_correct_size_rgba_buffer() {
         // Smoke: rendering shouldn't panic and the size const should be
         // honoured. (Icon::from_rgba would panic if the dims were off.)
-        let session = BarSlot { fraction: Some(0.5), pace: Some(0.3) };
-        let weekly = BarSlot { fraction: None, pace: None };
+        let session = BarSlot {
+            fraction: Some(0.5),
+            pace: Some(0.3),
+        };
+        let weekly = BarSlot {
+            fraction: None,
+            pace: None,
+        };
         let _ = render(ProviderId::Anthropic, session, weekly);
         let _ = render_placeholder();
     }

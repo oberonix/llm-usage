@@ -23,6 +23,9 @@ pub struct Config {
     /// entirely. The only outbound traffic that isn't to a data
     /// provider — see SECURITY.md.
     pub check_for_updates: bool,
+    /// Install/remove an OS login item that starts the tray app when
+    /// the user signs in.
+    pub start_at_login: bool,
     /// Optional path to opencode's SQLite store. Every provider
     /// (Anthropic, Codex, Ollama Cloud) consults this file for
     /// per-message token activity scoped to its own `providerID` and
@@ -48,6 +51,7 @@ impl Default for Config {
             icon_rotation_secs: 15,
             show_pace_marker: true,
             check_for_updates: true,
+            start_at_login: false,
             opencode_db: None,
             anthropic: AnthropicConfig::default(),
             codex_cli: CodexCliConfig::default(),
@@ -201,8 +205,8 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("read config {}", path.display()))?;
-        let cfg: Self = toml::from_str(&s)
-            .with_context(|| format!("parse config {}", path.display()))?;
+        let cfg: Self =
+            toml::from_str(&s).with_context(|| format!("parse config {}", path.display()))?;
         Ok(cfg)
     }
 
@@ -217,18 +221,15 @@ impl Config {
         // a real risk; the rename guarantees the user never sees
         // a half-written config.toml.
         let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, s)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        std::fs::rename(&tmp, path).with_context(|| {
-            format!("rename {} -> {}", tmp.display(), path.display())
-        })?;
+        std::fs::write(&tmp, s).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
         Ok(())
     }
 }
 
 pub fn project_dirs() -> Result<ProjectDirs> {
-    ProjectDirs::from("dev", "buffbit", "llm-usage")
-        .context("could not resolve OS project dirs")
+    ProjectDirs::from("dev", "buffbit", "llm-usage").context("could not resolve OS project dirs")
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -258,17 +259,13 @@ pub fn refresh_trigger_path() -> Result<PathBuf> {
 /// "dashboard" or "popup"). A second instance writes the matching
 /// focus-trigger file and exits.
 pub fn singleton_pid_path(name: &str) -> Result<PathBuf> {
-    Ok(project_dirs()?
-        .data_dir()
-        .join(format!("{}.pid", name)))
+    Ok(project_dirs()?.data_dir().join(format!("{}.pid", name)))
 }
 
 /// Companion file to `singleton_pid_path`. The running instance watches
 /// for writes here and brings its window to the foreground.
 pub fn singleton_focus_trigger_path(name: &str) -> Result<PathBuf> {
-    Ok(project_dirs()?
-        .data_dir()
-        .join(format!("{}.focus", name)))
+    Ok(project_dirs()?.data_dir().join(format!("{}.focus", name)))
 }
 
 #[cfg(test)]
@@ -285,6 +282,7 @@ mod tests {
         assert_eq!(parsed.icon_rotation_secs, cfg.icon_rotation_secs);
         assert_eq!(parsed.show_pace_marker, cfg.show_pace_marker);
         assert_eq!(parsed.check_for_updates, cfg.check_for_updates);
+        assert_eq!(parsed.start_at_login, cfg.start_at_login);
         assert_eq!(parsed.anthropic.enabled, cfg.anthropic.enabled);
         assert_eq!(parsed.anthropic.warn_at, cfg.anthropic.warn_at);
         assert_eq!(parsed.codex_cli.warn_at, cfg.codex_cli.warn_at);
@@ -298,12 +296,14 @@ mod tests {
         let mut cfg = Config::default();
         cfg.icon_rotation_secs = 42;
         cfg.show_pace_marker = false;
+        cfg.start_at_login = true;
         cfg.anthropic.show_spend = true;
         cfg.codex_cli.warn_at = vec![0.5, 0.9];
         cfg.save(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.icon_rotation_secs, 42);
         assert!(!loaded.show_pace_marker);
+        assert!(loaded.start_at_login);
         assert!(loaded.anthropic.show_spend);
         assert_eq!(loaded.codex_cli.warn_at, vec![0.5, 0.9]);
     }

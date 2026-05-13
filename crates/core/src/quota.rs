@@ -57,12 +57,7 @@ impl QuotaEngine {
                 let pct = (t * 100.0).round() as u32;
                 let already = self
                     .store
-                    .alert_already_fired(
-                        &snapshot.provider.to_string(),
-                        label,
-                        &window_id,
-                        pct,
-                    )
+                    .alert_already_fired(&snapshot.provider.to_string(), label, &window_id, pct)
                     .ok()
                     .flatten()
                     .is_some();

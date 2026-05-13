@@ -259,7 +259,10 @@ mod tests {
     /// real domain shape on a localhost mock by using `reqwest`
     /// directly with the mock's full URL.
     fn http_against(server: &MockServer) -> (reqwest::Client, String) {
-        let client = reqwest::Client::builder().user_agent(BROWSER_UA).build().unwrap();
+        let client = reqwest::Client::builder()
+            .user_agent(BROWSER_UA)
+            .build()
+            .unwrap();
         (client, server.uri())
     }
 
@@ -354,7 +357,10 @@ mod tests {
         let now = Utc::now();
         usage.apply_to(&mut five_h, &mut week, now);
         assert!((five_h.fraction_used.unwrap() - 0.42).abs() < 1e-9);
-        assert_eq!(five_h.ends_at, Some(Utc.timestamp_opt(1_900_000_000, 0).single().unwrap()));
+        assert_eq!(
+            five_h.ends_at,
+            Some(Utc.timestamp_opt(1_900_000_000, 0).single().unwrap())
+        );
         assert!(!five_h.stale, "wham data is by definition fresh");
         assert!((week.fraction_used.unwrap() - 0.80).abs() < 1e-9);
     }
@@ -430,7 +436,12 @@ mod tests {
         assert_eq!(parsed.plan_type.as_deref(), Some("plus"));
         assert!(parsed.rate_limit.limit_reached);
         assert_eq!(
-            parsed.rate_limit.primary_window.as_ref().unwrap().used_percent as u32,
+            parsed
+                .rate_limit
+                .primary_window
+                .as_ref()
+                .unwrap()
+                .used_percent as u32,
             100
         );
         assert_eq!(

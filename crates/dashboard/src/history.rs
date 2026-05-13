@@ -22,14 +22,11 @@ pub fn anthropic_daily_spend_at(
     days: i64,
     now: DateTime<Utc>,
 ) -> Vec<(NaiveDate, f64)> {
-    let projects_dir = cfg
-        .claude_projects_dir
-        .clone()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .map(|h| h.join(".claude").join("projects"))
-                .unwrap_or_else(|| PathBuf::from(".claude/projects"))
-        });
+    let projects_dir = cfg.claude_projects_dir.clone().unwrap_or_else(|| {
+        dirs::home_dir()
+            .map(|h| h.join(".claude").join("projects"))
+            .unwrap_or_else(|| PathBuf::from(".claude/projects"))
+    });
     if !projects_dir.exists() {
         return Vec::new();
     }
@@ -48,10 +45,7 @@ pub fn anthropic_daily_spend_at(
     for entry in WalkDir::new(&projects_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_type().is_file()
-                && e.path().extension().is_some_and(|x| x == "jsonl")
-        })
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
     {
         let Ok(content) = std::fs::read_to_string(entry.path()) else {
             continue;
@@ -66,9 +60,13 @@ pub fn anthropic_daily_spend_at(
             if record.entry_type.as_deref() != Some("assistant") {
                 continue;
             }
-            let Some(message) = record.message else { continue };
+            let Some(message) = record.message else {
+                continue;
+            };
             let Some(usage) = message.usage else { continue };
-            let Some(ts_str) = record.timestamp else { continue };
+            let Some(ts_str) = record.timestamp else {
+                continue;
+            };
             let Ok(ts_fixed) = DateTime::parse_from_rfc3339(&ts_str) else {
                 continue;
             };
@@ -354,9 +352,17 @@ mod tests {
         writeln!(f, "not json at all").unwrap();
         writeln!(f, "{{ truncated json").unwrap();
         writeln!(f).unwrap(); // empty line
-        // …followed by one valid record that must still be counted.
+                              // …followed by one valid record that must still be counted.
         let ts = Utc::now().to_rfc3339();
-        write_assistant(&mut f, &ts, "req_good", "msg_good", "claude-opus-4-7", 100, 100);
+        write_assistant(
+            &mut f,
+            &ts,
+            "req_good",
+            "msg_good",
+            "claude-opus-4-7",
+            100,
+            100,
+        );
 
         let cfg = cfg_for(dir.path());
         let out = anthropic_daily_spend_at(&cfg, 1, Utc::now() + Duration::seconds(1));
@@ -441,8 +447,24 @@ mod tests {
         // sort isn't accidentally insertion-order.
         let t0 = Utc::now() - Duration::days(5);
         let t1 = Utc::now() - Duration::days(2);
-        write_assistant(&mut f, &t1.to_rfc3339(), "r1", "m1", "claude-opus-4-7", 50, 50);
-        write_assistant(&mut f, &t0.to_rfc3339(), "r0", "m0", "claude-opus-4-7", 50, 50);
+        write_assistant(
+            &mut f,
+            &t1.to_rfc3339(),
+            "r1",
+            "m1",
+            "claude-opus-4-7",
+            50,
+            50,
+        );
+        write_assistant(
+            &mut f,
+            &t0.to_rfc3339(),
+            "r0",
+            "m0",
+            "claude-opus-4-7",
+            50,
+            50,
+        );
 
         let cfg = cfg_for(dir.path());
         let out = anthropic_daily_spend_at(&cfg, 7, Utc::now());

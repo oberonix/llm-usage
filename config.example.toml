@@ -21,6 +21,10 @@ show_pace_marker = true
 # entirely.
 check_for_updates = true
 
+# When true, the dashboard creates an OS login item for llm-usage-tray
+# so the menu-bar icon starts again after you sign in.
+start_at_login = false
+
 # Optional path to opencode's SQLite store (https://opencode.ai). Each
 # provider consults it for per-message token activity scoped to its
 # own providerID and folds the result into its native aggregates.

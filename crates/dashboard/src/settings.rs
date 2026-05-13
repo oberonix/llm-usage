@@ -3,9 +3,7 @@
 //! similar power-user knobs stay edit-via-TOML.
 
 use eframe::egui::{self, Color32, RichText};
-use llm_usage_core::config::{
-    self, AnthropicConfig, CodexCliConfig, Config, OllamaCloudConfig,
-};
+use llm_usage_core::config::{self, AnthropicConfig, CodexCliConfig, Config, OllamaCloudConfig};
 use llm_usage_core::model::ProviderId;
 use std::path::PathBuf;
 
@@ -49,6 +47,8 @@ pub struct ConfigDraft {
     pub icon_rotation_secs: u64,
     pub show_pace_marker: bool,
     pub check_for_updates: bool,
+    pub start_at_login: bool,
+    pub start_at_login_status: Option<String>,
 
     pub anthropic_enabled: bool,
     pub anthropic_show_spend: bool,
@@ -88,6 +88,9 @@ impl ConfigDraft {
             icon_rotation_secs: c.icon_rotation_secs,
             show_pace_marker: c.show_pace_marker,
             check_for_updates: c.check_for_updates,
+            start_at_login: c.start_at_login
+                || llm_usage_core::autostart::is_start_at_login_enabled(),
+            start_at_login_status: None,
 
             anthropic_enabled: c.anthropic.enabled,
             anthropic_show_spend: c.anthropic.show_spend,
@@ -106,11 +109,7 @@ impl ConfigDraft {
             codex_chatgpt_setup_status: None,
 
             ollama_cloud_enabled: c.ollama_cloud.enabled,
-            ollama_cloud_session_cookie: c
-                .ollama_cloud
-                .session_cookie
-                .clone()
-                .unwrap_or_default(),
+            ollama_cloud_session_cookie: c.ollama_cloud.session_cookie.clone().unwrap_or_default(),
             ollama_cloud_warn_at: c.ollama_cloud.warn_at.clone(),
 
             ollama_cloud_setup_status: None,
@@ -127,6 +126,7 @@ impl ConfigDraft {
         c.icon_rotation_secs = self.icon_rotation_secs.max(5);
         c.show_pace_marker = self.show_pace_marker;
         c.check_for_updates = self.check_for_updates;
+        c.start_at_login = self.start_at_login;
 
         c.anthropic = AnthropicConfig {
             enabled: self.anthropic_enabled,
@@ -166,10 +166,8 @@ impl ConfigDraft {
         let exe = match resolve_setup_binary() {
             Some(p) => p,
             None => {
-                self.ollama_cloud_setup_status = Some(
-                    "Could not find llm-usage-setup binary next to the dashboard."
-                        .into(),
-                );
+                self.ollama_cloud_setup_status =
+                    Some("Could not find llm-usage-setup binary next to the dashboard.".into());
                 return;
             }
         };
@@ -182,10 +180,7 @@ impl ConfigDraft {
         std::thread::spawn(move || {
             let result = match std::process::Command::new(&exe).status() {
                 Ok(status) if status.success() => SetupResult::Captured,
-                Ok(status) => SetupResult::Failed(format!(
-                    "setup tool exited with {}",
-                    status
-                )),
+                Ok(status) => SetupResult::Failed(format!("setup tool exited with {}", status)),
                 Err(e) => SetupResult::Failed(format!("spawn failed: {}", e)),
             };
             let _ = tx.send(result);
@@ -201,8 +196,7 @@ impl ConfigDraft {
         let cookies = match rookie::load(Some(vec!["ollama.com".to_string()])) {
             Ok(c) => c,
             Err(e) => {
-                self.ollama_cloud_setup_status =
-                    Some(format!("Browser import failed: {}", e));
+                self.ollama_cloud_setup_status = Some(format!("Browser import failed: {}", e));
                 return;
             }
         };
@@ -255,11 +249,8 @@ impl ConfigDraft {
         match result {
             SetupResult::Captured => {
                 if let Ok(cfg) = config::Config::load_or_default() {
-                    self.ollama_cloud_session_cookie = cfg
-                        .ollama_cloud
-                        .session_cookie
-                        .clone()
-                        .unwrap_or_default();
+                    self.ollama_cloud_session_cookie =
+                        cfg.ollama_cloud.session_cookie.clone().unwrap_or_default();
                     self.ollama_cloud_enabled = cfg.ollama_cloud.enabled;
                 }
                 self.ollama_cloud_setup_status =
@@ -315,7 +306,36 @@ impl ConfigDraft {
                  as just the fill bars.",
             );
             ui.add_space(4.0);
-            ui.checkbox(&mut self.check_for_updates, "Check for new releases on GitHub");
+            let before = self.start_at_login;
+            ui.checkbox(&mut self.start_at_login, "Start tray at login");
+            if before != self.start_at_login {
+                match llm_usage_core::autostart::set_start_at_login(self.start_at_login) {
+                    Ok(()) => {
+                        self.start_at_login_status = Some(if self.start_at_login {
+                            "Login item installed for the tray app.".to_string()
+                        } else {
+                            "Login item removed.".to_string()
+                        });
+                    }
+                    Err(e) => {
+                        self.start_at_login_status =
+                            Some(format!("Could not update login item: {}", e));
+                    }
+                }
+            }
+            help(
+                ui,
+                "Creates an OS login item for llm-usage-tray so the menu-bar icon \
+                 comes back after you sign in.",
+            );
+            if let Some(msg) = &self.start_at_login_status {
+                ui.weak(msg);
+            }
+            ui.add_space(4.0);
+            ui.checkbox(
+                &mut self.check_for_updates,
+                "Check for new releases on GitHub",
+            );
             help(
                 ui,
                 "Once a day the tray asks GitHub whether a newer version has been released \
@@ -379,23 +399,26 @@ impl ConfigDraft {
                 ui,
                 "Quota (5h, 7d) comes from OpenAI's rate-limit headers, which the \
                  Codex CLI writes into your local rollouts on every turn. \
-                 Optionally also hit chatgpt.com directly for live quota \u{2014} \
-                 same data the Codex Cloud Settings page shows.",
+                 Importing chatgpt.com cookies below switches to the live \
+                 /backend-api/wham/usage source — same data the Codex Cloud \
+                 Settings analytics page shows, no rollout lag.",
             );
-            ui.add_space(6.0);
-            field_row(ui, "ChatGPT cookies", |ui| {
-                if ui.button("Import from browser \u{2014} recommended").clicked() {
-                    self.import_chatgpt_cookies_from_browser();
-                }
-                if !self.codex_chatgpt_session_cookie.is_empty() {
-                    ui.weak(format!(
-                        "\u{2713} {} chars saved",
-                        self.codex_chatgpt_session_cookie.len()
-                    ));
-                }
-            });
-            if let Some(msg) = &self.codex_chatgpt_setup_status {
-                help(ui, msg);
+
+            let captured = !self.codex_chatgpt_session_cookie.is_empty();
+            let mut import_now = false;
+            render_cookie_import_block(
+                ui,
+                "Sign in",
+                "chatgpt.com",
+                captured,
+                /*in_flight*/ false,
+                /*allow_popup*/ false,
+                /*on_import*/ &mut |_| import_now = true,
+                /*on_popup*/ &mut |_| {},
+                self.codex_chatgpt_setup_status.as_deref(),
+            );
+            if import_now {
+                self.import_chatgpt_cookies_from_browser();
             }
         });
     }
@@ -416,8 +439,7 @@ impl ConfigDraft {
         ])) {
             Ok(c) => c,
             Err(e) => {
-                self.codex_chatgpt_setup_status =
-                    Some(format!("Browser import failed: {}", e));
+                self.codex_chatgpt_setup_status = Some(format!("Browser import failed: {}", e));
                 return;
             }
         };
@@ -467,87 +489,27 @@ impl ConfigDraft {
                 alert_preset_combo(ui, "ollama_cloud_alert", &mut self.ollama_cloud_warn_at);
             });
 
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Sign in")
-                    .strong()
-                    .size(12.5)
-                    .color(Color32::from_gray(200)),
-            );
             let captured = !self.ollama_cloud_session_cookie.is_empty();
             let in_flight = self.ollama_cloud_setup_rx.is_some();
             let mut launch_now = false;
             let mut import_now = false;
-
-            // Cookie capture (rookie) is the recommended path — it's
-            // zero-click for anyone already logged in to ollama.com in
-            // a desktop browser. Rendered first and emphasised.
-            ui.horizontal(|ui| {
-                let label = if captured {
-                    "Re-import from browser"
-                } else {
-                    "Import from browser — recommended"
-                };
-                let button = egui::Button::new(
-                    RichText::new(label)
-                        .strong()
-                        .color(Color32::WHITE)
-                        .size(13.0),
-                )
-                .fill(Color32::from_rgb(0x4C, 0xAF, 0x50))
-                .min_size(egui::vec2(240.0, 28.0));
-                if ui
-                    .add_enabled(!in_flight, button)
-                    .on_hover_text(
-                        "Reads the ollama.com cookie from any already-logged-in desktop \
-                         browser (Chrome / Firefox / Edge / Brave / Safari / Vivaldi). \
-                         Zero clicks beyond this button.",
-                    )
-                    .clicked()
-                {
-                    import_now = true;
-                }
-                if captured && !in_flight {
-                    ui.colored_label(
-                        Color32::from_rgb(0x4C, 0xAF, 0x50),
-                        "✓ captured",
-                    );
-                }
-            });
-            ui.add_space(4.0);
-
-            // Fallback: spawn a webview if the user isn't logged in to
-            // ollama.com in any local browser, or the browser path
-            // hits a keyring/permission snag.
-            ui.horizontal(|ui| {
-                let popup_label = if in_flight {
-                    "Setup window open…"
-                } else if captured {
-                    "Re-run popup sign-in (backup)"
-                } else {
-                    "Sign in via popup window (backup)"
-                };
-                if ui
-                    .add_enabled(!in_flight, egui::Button::new(popup_label))
-                    .on_hover_text(
-                        "Backup: opens an embedded browser at ollama.com/signin and \
-                         captures the cookie automatically once you reach /settings.",
-                    )
-                    .clicked()
-                {
-                    launch_now = true;
-                }
-            });
+            render_cookie_import_block(
+                ui,
+                "Sign in",
+                "ollama.com",
+                captured,
+                in_flight,
+                /*allow_popup*/ true,
+                /*on_import*/ &mut |_| import_now = true,
+                /*on_popup*/ &mut |_| launch_now = true,
+                self.ollama_cloud_setup_status.as_deref(),
+            );
 
             if launch_now {
                 self.start_setup_tool();
             }
             if import_now {
                 self.import_from_browser();
-            }
-            if let Some(msg) = &self.ollama_cloud_setup_status {
-                ui.add_space(2.0);
-                ui.weak(msg);
             }
 
             ui.add_space(2.0);
@@ -629,12 +591,7 @@ fn field_row(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::Ui)) {
 /// A dropdown over a fixed set of `(seconds, human label)` options.
 /// Hand-edited TOML values not in the list survive as a "Custom (Ns)"
 /// entry at the top so round-tripping never silently overwrites.
-fn interval_combo(
-    ui: &mut egui::Ui,
-    id: &str,
-    value: &mut u64,
-    options: &[(u64, &str)],
-) {
+fn interval_combo(ui: &mut egui::Ui, id: &str, value: &mut u64, options: &[(u64, &str)]) {
     let in_list = options.iter().any(|(v, _)| *v == *value);
     let selected_label = options
         .iter()
@@ -647,11 +604,7 @@ fn interval_combo(
         .width(160.0)
         .show_ui(ui, |ui| {
             if !in_list {
-                ui.selectable_value(
-                    value,
-                    *value,
-                    format!("Custom ({} s)", value),
-                );
+                ui.selectable_value(value, *value, format!("Custom ({} s)", value));
                 ui.separator();
             }
             for (secs, label) in options {
@@ -683,7 +636,9 @@ fn alert_preset_combo(ui: &mut egui::Ui, id: &str, value: &mut Vec<f64>) {
         .find(|(_, _, m)| *m)
         .map(|(l, _, _)| (*l).to_string());
     let custom_label = format!("Custom ({})", format_thresholds(value));
-    let selected_label = matched_label.clone().unwrap_or_else(|| custom_label.clone());
+    let selected_label = matched_label
+        .clone()
+        .unwrap_or_else(|| custom_label.clone());
 
     egui::ComboBox::from_id_salt(id)
         .selected_text(selected_label)
@@ -706,11 +661,14 @@ fn alert_preset_combo(ui: &mut egui::Ui, id: &str, value: &mut Vec<f64>) {
 
 fn help(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
-    ui.label(
-        RichText::new(text)
-            .size(11.5)
-            .color(Color32::from_gray(150))
-            .italics(),
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .size(11.5)
+                .color(Color32::from_gray(150))
+                .italics(),
+        )
+        .wrap(),
     );
 }
 
@@ -731,6 +689,108 @@ fn resolve_setup_binary() -> Option<PathBuf> {
         }
     }
     Some(PathBuf::from("llm-usage-setup"))
+}
+
+/// Shared "Import cookies from browser" UI block. Both the Codex
+/// (chatgpt.com) and Ollama Cloud (ollama.com) cards lean on the
+/// same rookie-driven cookie capture; rendering them through one
+/// helper keeps the visual treatment identical (same green button,
+/// same "✓ captured" pill, same status line) and prevents one card
+/// from drifting ahead of the other when we tweak the wording.
+///
+/// The two callbacks are taken as `&mut dyn FnMut(())` so the
+/// caller can flip a boolean inside its own borrow scope — egui's
+/// builder closures don't let us hold `&mut self` across the
+/// button add.
+#[allow(clippy::too_many_arguments)]
+fn render_cookie_import_block(
+    ui: &mut egui::Ui,
+    section_label: &str,
+    domain_label: &str,
+    captured: bool,
+    in_flight: bool,
+    allow_popup: bool,
+    on_import: &mut dyn FnMut(()),
+    on_popup: &mut dyn FnMut(()),
+    status: Option<&str>,
+) {
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(section_label)
+            .strong()
+            .size(12.5)
+            .color(Color32::from_gray(200)),
+    );
+
+    // Primary path: zero-click cookie capture via rookie. Rendered
+    // first and emphasised (green button) so the user reaches for
+    // it before the backup webview path.
+    ui.horizontal(|ui| {
+        let label = if captured {
+            "Re-import from browser"
+        } else {
+            "Import from browser — recommended"
+        };
+        let button = egui::Button::new(
+            RichText::new(label)
+                .strong()
+                .color(Color32::WHITE)
+                .size(13.0),
+        )
+        .fill(Color32::from_rgb(0x4C, 0xAF, 0x50))
+        .min_size(egui::vec2(240.0, 28.0));
+        let hover = format!(
+            "Reads the {domain} cookie from any already-logged-in desktop browser \
+             (Chrome / Firefox / Edge / Brave / Safari / Vivaldi). Zero clicks \
+             beyond this button.",
+            domain = domain_label
+        );
+        if ui
+            .add_enabled(!in_flight, button)
+            .on_hover_text(hover)
+            .clicked()
+        {
+            on_import(());
+        }
+        if captured && !in_flight {
+            ui.colored_label(Color32::from_rgb(0x4C, 0xAF, 0x50), "✓ captured");
+        }
+    });
+
+    // Secondary: embedded-webview sign-in. Only Ollama Cloud has
+    // this today (the `llm-usage-setup` binary opens ollama.com/signin
+    // in a wry webview and polls cookies until the user reaches
+    // /settings). Codex doesn't get the option — chatgpt.com's
+    // Cloudflare + bot-detection make the webview path fragile and
+    // the rookie path covers every realistic scenario.
+    if allow_popup {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let popup_label = if in_flight {
+                "Setup window open…"
+            } else if captured {
+                "Re-run popup sign-in (backup)"
+            } else {
+                "Sign in via popup window (backup)"
+            };
+            if ui
+                .add_enabled(!in_flight, egui::Button::new(popup_label))
+                .on_hover_text(format!(
+                    "Backup: opens an embedded browser at {domain}/signin and \
+                     captures the cookie automatically once sign-in completes.",
+                    domain = domain_label
+                ))
+                .clicked()
+            {
+                on_popup(());
+            }
+        });
+    }
+
+    if let Some(msg) = status {
+        ui.add_space(2.0);
+        ui.weak(msg);
+    }
 }
 
 fn empty_to_none(s: &str) -> Option<String> {
@@ -821,7 +881,10 @@ mod tests {
         assert_eq!(round.anthropic.warn_at, vec![0.5, 0.9]);
         assert_eq!(round.codex_cli.warn_at, vec![0.75, 0.9]);
         assert!(round.ollama_cloud.enabled);
-        assert_eq!(round.ollama_cloud.session_cookie.as_deref(), Some("session=abc"));
+        assert_eq!(
+            round.ollama_cloud.session_cookie.as_deref(),
+            Some("session=abc")
+        );
         assert_eq!(round.ollama_cloud.warn_at, vec![0.9]);
     }
 
@@ -829,7 +892,7 @@ mod tests {
     fn config_draft_to_config_clamps_minimums() {
         let mut cfg = Config::default();
         cfg.poll_interval_secs = 30; // below 60 floor
-        cfg.icon_rotation_secs = 1;  // below 5 floor
+        cfg.icon_rotation_secs = 1; // below 5 floor
         let draft = ConfigDraft::from_config(&cfg);
         let round = draft.to_config();
         assert_eq!(round.poll_interval_secs, 60);

@@ -60,6 +60,33 @@ paste the `Cookie:` header yourself.
 
 ## Build
 
+## Install and Run
+
+For a source install, build all four binaries first:
+
+```bash
+cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
+```
+
+Then start the resident tray process:
+
+```bash
+./target/release/llm-usage-tray
+```
+
+Keep `llm-usage-tray` running if you want the menu-bar icon, background
+polling, shared dashboard snapshots, and desktop alerts to stay alive.
+The dashboard and CLI are companion views; they do not replace the tray.
+
+The easiest durable setup is:
+
+1. Launch `llm-usage-tray`.
+2. Open **Settings** from the tray menu.
+3. Turn on **Start tray at login**.
+
+That setting writes the platform login item for the tray binary so the
+icon comes back automatically after sign-in.
+
 ### Linux (Pop!_OS / Ubuntu / Debian)
 
 ```bash
@@ -150,19 +177,28 @@ The app reads the file on each startup; restart after editing.
 
 ## Autostart
 
+The dashboard's **Start tray at login** setting is the recommended path.
+It creates or removes the same platform files shown below and points them
+at the built `llm-usage-tray` binary.
+
 ### Linux
 
 ```bash
 mkdir -p ~/.config/autostart
-cp packaging/linux/llm-usage.desktop ~/.config/autostart/
+sed "s#Exec=llm-usage-tray#Exec=$(pwd)/target/release/llm-usage-tray#" \
+    packaging/linux/llm-usage.desktop > ~/.config/autostart/llm-usage.desktop
 ```
 
 ### macOS
 
 ```bash
 cp packaging/macos/dev.buffbit.llm-usage.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/dev.buffbit.llm-usage.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.buffbit.llm-usage.plist
 ```
+
+For macOS source builds outside `/Applications/llm-usage.app`, prefer the
+Settings toggle because it writes the actual path to your local
+`llm-usage-tray` binary.
 
 ## Architecture
 

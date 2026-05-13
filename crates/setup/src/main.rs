@@ -27,7 +27,33 @@ const SIGNIN_URL: &str = "https://ollama.com/signin";
 const SUCCESS_PATH: &str = "/settings";
 const POLL_INTERVAL: Duration = Duration::from_millis(750);
 
+fn print_help() {
+    println!("llm-usage-setup - one-shot sign-in window for Ollama Cloud");
+    println!();
+    println!("USAGE:");
+    println!("  llm-usage-setup              Open the sign-in webview window");
+    println!("  llm-usage-setup --help|-h    Print this help");
+    println!();
+    println!("This binary opens an embedded browser at ollama.com/signin.");
+    println!("After you sign in and land on the /settings page, the session");
+    println!("cookie is captured automatically and saved to config.toml.");
+    println!("The window closes once capture succeeds.");
+    println!();
+    println!("The binary is normally spawned by the dashboard's Settings tab");
+    println!("(Ollama Cloud → \"Sign in via popup window\"), not run directly.");
+    println!();
+    println!("The primary, recommended way to configure Ollama Cloud is the");
+    println!("\"Import from browser\" button in the Settings tab, which reads");
+    println!("cookies directly from your already-logged-in browser.");
+}
+
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -46,9 +72,7 @@ fn main() -> Result<()> {
         .with_inner_size(LogicalSize::new(960.0, 720.0))
         .build(&event_loop)?;
 
-    let webview = WebViewBuilder::new()
-        .with_url(SIGNIN_URL)
-        .build(&window)?;
+    let webview = WebViewBuilder::new().with_url(SIGNIN_URL).build(&window)?;
 
     let mut last_check = Instant::now() - POLL_INTERVAL;
     let mut captured = false;

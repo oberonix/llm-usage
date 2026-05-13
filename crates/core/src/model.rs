@@ -124,6 +124,25 @@ impl WindowUsage {
             _ => None,
         };
     }
+
+    /// How long after `ends_at` has passed before quota data is
+    /// considered stale. Five minutes absorbs clock skew and the
+    /// latency between the API reset moment and the next poll.
+    pub const STALE_GRACE_SECS: i64 = 5 * 60;
+
+    /// Mark the window stale if its reset time is in the past beyond
+    /// the grace period. Call this after setting `ends_at` on a fresh
+    /// quota window. The flag is additive — once stale it stays stale,
+    /// so a 429-cooldown `mark_oauth_windows_stale` call afterwards
+    /// just reaffirms it.
+    pub fn mark_stale_if_expired(&mut self, now: DateTime<Utc>) {
+        if self
+            .ends_at
+            .is_some_and(|t| (now - t).num_seconds() > Self::STALE_GRACE_SECS)
+        {
+            self.stale = true;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,9 +175,7 @@ impl UsageSnapshot {
     }
 
     pub fn window_mut(&mut self, kind: WindowKind) -> &mut WindowUsage {
-        self.windows
-            .entry(kind.label().to_string())
-            .or_default()
+        self.windows.entry(kind.label().to_string()).or_default()
     }
 
     pub fn window(&self, kind: WindowKind) -> Option<&WindowUsage> {
@@ -570,8 +587,54 @@ mod tests {
         let mut snap = UsageSnapshot::unavailable(ProviderId::Anthropic, "_");
         let w = snap.window_mut(WindowKind::Today);
         w.tokens_in = 42;
-        // window() should now return the same data.
         let r = snap.window(WindowKind::Today).unwrap();
         assert_eq!(r.tokens_in, 42);
+    }
+
+    #[test]
+    fn mark_stale_if_expired_flags_past_ends_at_beyond_grace() {
+        let now = Utc::now();
+        let mut w = WindowUsage {
+            fraction_used: Some(0.97),
+            ends_at: Some(now - chrono::Duration::minutes(10)),
+            ..Default::default()
+        };
+        w.mark_stale_if_expired(now);
+        assert!(w.stale);
+    }
+
+    #[test]
+    fn mark_stale_if_expired_within_grace_leaves_false() {
+        let now = Utc::now();
+        let mut w = WindowUsage {
+            fraction_used: Some(0.80),
+            ends_at: Some(now - chrono::Duration::seconds(30)),
+            ..Default::default()
+        };
+        w.mark_stale_if_expired(now);
+        assert!(!w.stale);
+    }
+
+    #[test]
+    fn mark_stale_if_expired_future_ends_at_not_stale() {
+        let now = Utc::now();
+        let mut w = WindowUsage {
+            fraction_used: Some(0.50),
+            ends_at: Some(now + chrono::Duration::hours(3)),
+            ..Default::default()
+        };
+        w.mark_stale_if_expired(now);
+        assert!(!w.stale);
+    }
+
+    #[test]
+    fn mark_stale_if_expired_no_ends_at_not_stale() {
+        let now = Utc::now();
+        let mut w = WindowUsage {
+            fraction_used: Some(0.50),
+            ..Default::default()
+        };
+        w.mark_stale_if_expired(now);
+        assert!(!w.stale);
     }
 }

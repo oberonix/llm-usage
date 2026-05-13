@@ -117,9 +117,11 @@ pub struct QuotaBucket {
 
 impl QuotaBucket {
     pub fn resets_at_utc(&self) -> Option<DateTime<Utc>> {
-        self.resets_at
-            .as_deref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc)))
+        self.resets_at.as_deref().and_then(|s| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        })
     }
 }
 
@@ -235,11 +237,7 @@ impl OAuthBackoff {
     ///
     /// Returns `false` when no `last_good` has ever been recorded so
     /// the first poll after startup is always allowed through.
-    pub fn should_skip_http(
-        &self,
-        now: DateTime<Utc>,
-        min_interval: std::time::Duration,
-    ) -> bool {
+    pub fn should_skip_http(&self, now: DateTime<Utc>, min_interval: std::time::Duration) -> bool {
         if self.in_cooldown(now) {
             return true;
         }
@@ -380,7 +378,10 @@ mod tests {
         b.record_429(now);
         let first = b.current_cooldown_secs;
         b.record_429(now);
-        assert_eq!(b.current_cooldown_secs, (first * 2).min(OAuthBackoff::MAX_COOLDOWN_SECS));
+        assert_eq!(
+            b.current_cooldown_secs,
+            (first * 2).min(OAuthBackoff::MAX_COOLDOWN_SECS)
+        );
         // Force enough repeats to hit the cap.
         for _ in 0..10 {
             b.record_429(now);
@@ -570,9 +571,8 @@ mod tests {
         // No mock registered: if we made the request the test would
         // produce an "unexpected request" warning.
         let mut creds = fresh_creds();
-        creds.claude_ai_oauth.expires_at_ms = Some(
-            (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis(),
-        );
+        creds.claude_ai_oauth.expires_at_ms =
+            Some((chrono::Utc::now() - chrono::Duration::hours(1)).timestamp_millis());
         let err = fetch_usage_with(&reqwest::Client::new(), &server.uri(), &creds)
             .await
             .unwrap_err();
@@ -583,9 +583,7 @@ mod tests {
     async fn fetch_usage_malformed_body_returns_transport_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string("definitely not json"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string("definitely not json"))
             .mount(&server)
             .await;
         let err = fetch_usage_with(&reqwest::Client::new(), &server.uri(), &fresh_creds())

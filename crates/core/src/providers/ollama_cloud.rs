@@ -152,27 +152,23 @@ impl Provider for OllamaCloudProvider {
         if self.cfg.session_cookie.is_none() {
             return Ok(UsageSnapshot::unavailable(
                 ProviderId::OllamaCloud,
-                "not signed in — use the dashboard's Ollama Cloud setup",
+                "Not signed in — use the dashboard's Ollama Cloud setup",
             ));
         }
 
         // Cache-hit short-circuit: if we successfully fetched within
         // the throttle window, skip the HTTP and reuse the prior body.
         let now_pre = Utc::now();
-        let cached_html: Option<String> = self
-            .last_good
-            .lock()
-            .ok()
-            .and_then(|guard| {
-                guard.as_ref().and_then(|c| {
-                    let elapsed = (now_pre - c.at).to_std().ok()?;
-                    if elapsed < MIN_HTTP_INTERVAL {
-                        Some(c.html.clone())
-                    } else {
-                        None
-                    }
-                })
-            });
+        let cached_html: Option<String> = self.last_good.lock().ok().and_then(|guard| {
+            guard.as_ref().and_then(|c| {
+                let elapsed = (now_pre - c.at).to_std().ok()?;
+                if elapsed < MIN_HTTP_INTERVAL {
+                    Some(c.html.clone())
+                } else {
+                    None
+                }
+            })
+        });
 
         let html = if let Some(cached) = cached_html {
             cached
@@ -190,7 +186,7 @@ impl Provider for OllamaCloudProvider {
                 Err(e) => {
                     return Ok(UsageSnapshot::unavailable(
                         ProviderId::OllamaCloud,
-                        format!("fetch failed: {}", e),
+                        format!("Fetch failed: {}", e),
                     ));
                 }
             }
@@ -200,7 +196,7 @@ impl Provider for OllamaCloudProvider {
         if parsed.rows.is_empty() && parsed.plan.is_none() {
             return Ok(UsageSnapshot::unavailable(
                 ProviderId::OllamaCloud,
-                "parse failed — page shape changed; run `cargo run -p llm-usage-core \
+                "Parse failed — page shape changed; run `cargo run -p llm-usage-core \
                  --example dump_ollama_cloud` and tighten selectors",
             ));
         }
@@ -213,10 +209,7 @@ impl Provider for OllamaCloudProvider {
             error: None,
             windows: Default::default(),
             headline: None,
-            plan_label: parsed
-                .plan
-                .as_deref()
-                .map(crate::model::title_case_first),
+            plan_label: parsed.plan.as_deref().map(crate::model::title_case_first),
         };
 
         for row in &parsed.rows {
@@ -232,6 +225,7 @@ impl Provider for OllamaCloudProvider {
             w.fraction_used = Some(row.percent / 100.0);
             w.ends_at = row.reset_at;
             w.started_at = Some(now);
+            w.mark_stale_if_expired(now);
         }
 
         // Supplementary source: opencode token activity scoped to
@@ -646,7 +640,9 @@ mod tests {
         let five_h = snap.windows.get("5h").expect("5h window present");
         assert!((five_h.fraction_used.unwrap() - 0.278).abs() < 1e-6);
         // Weekly usage rolls into the canonical week label.
-        let week = snap.windows.get(WindowKind::ThisWeek.label())
+        let week = snap
+            .windows
+            .get(WindowKind::ThisWeek.label())
             .expect("week window present");
         assert!((week.fraction_used.unwrap() - 0.835).abs() < 1e-6);
     }
@@ -664,7 +660,12 @@ mod tests {
         let p = provider_against(&server, "session=abc");
         let snap = p.poll().await.unwrap();
         assert_eq!(snap.status, ProviderStatus::Unavailable);
-        assert!(snap.error.as_deref().unwrap_or("").contains("parse failed"));
+        assert!(snap
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("parse failed"));
     }
 
     #[tokio::test]
@@ -684,6 +685,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or("")
+            .to_lowercase()
             .contains("fetch failed"));
     }
 
@@ -696,7 +698,12 @@ mod tests {
         let p = OllamaCloudProvider::with_opencode_db(cfg, None).with_base_url(server.uri());
         let snap = p.poll().await.unwrap();
         assert_eq!(snap.status, ProviderStatus::Unavailable);
-        assert!(snap.error.as_deref().unwrap_or("").contains("not signed in"));
+        assert!(snap
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("not signed in"));
     }
 
     #[tokio::test]

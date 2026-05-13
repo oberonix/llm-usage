@@ -47,8 +47,7 @@ fn window_order(label: &str) -> u32 {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
@@ -65,7 +64,10 @@ async fn main() -> Result<()> {
     let once = args.iter().any(|a| a == "--once");
     // Surface typos rather than silently dropping into watch mode.
     if let Some(unknown) = args.iter().find(|a| {
-        !matches!(a.as_str(), "--refresh" | "--once" | "--help" | "-h" | "--version" | "-V")
+        !matches!(
+            a.as_str(),
+            "--refresh" | "--once" | "--help" | "-h" | "--version" | "-V"
+        )
     }) {
         eprintln!("unknown flag: {unknown}\n");
         print_usage();
@@ -146,7 +148,10 @@ async fn run_live(use_color: bool) -> Result<()> {
     // user isn't staring at "no data" while the tray's first poll runs.
     let (mut latest, mut updated_at) = match cached_snapshots() {
         Some((s, t)) => (s, Some(t)),
-        None => (poll_fresh().await.unwrap_or_default(), Some(chrono::Utc::now())),
+        None => (
+            poll_fresh().await.unwrap_or_default(),
+            Some(chrono::Utc::now()),
+        ),
     };
     render_screen(&latest, updated_at, use_color);
 
@@ -333,7 +338,10 @@ fn format_footer(
     let refreshed = now.format("%H:%M:%S").to_string();
     let body = match updated_at {
         Some(t) => {
-            let updated = t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string();
+            let updated = t
+                .with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string();
             format!("updated {} · refreshed {}", updated, refreshed)
         }
         // First paint with no snapshot file on disk: the previous
@@ -352,7 +360,10 @@ fn format_footer(
 /// renderer can show "data is from X, display refreshed at Y". A
 /// cache older than `STALE_AFTER` is treated as missing — the caller
 /// should fall back to `poll_fresh()`.
-fn cached_snapshots() -> Option<(BTreeMap<ProviderId, UsageSnapshot>, chrono::DateTime<chrono::Utc>)> {
+fn cached_snapshots() -> Option<(
+    BTreeMap<ProviderId, UsageSnapshot>,
+    chrono::DateTime<chrono::Utc>,
+)> {
     let file = llm_usage_core::read_snapshots().ok().flatten()?;
     let age = (chrono::Utc::now() - file.updated_at)
         .to_std()
@@ -653,7 +664,13 @@ mod tests {
         // anyone piping to grep / a file isn't surprised by escape
         // codes — and a purple pace marker would just look like an
         // extra unit of usage.
-        let plain = colored_bar(0.4, 10, Some(7), /*stale*/ false, /*use_color*/ false);
+        let plain = colored_bar(
+            0.4,
+            10,
+            Some(7),
+            /*stale*/ false,
+            /*use_color*/ false,
+        );
         assert_eq!(plain, unicode_bar(0.4, 10));
     }
 
@@ -679,7 +696,12 @@ mod tests {
         // `Color32::from_gray(120)` fill.
         for frac in [0.20, 0.50, 0.70, 0.95] {
             let s = colored_bar(frac, 10, None, /*stale*/ true, true);
-            assert!(s.contains("\x1b[90m"), "frac={}: expected grey: {:?}", frac, s);
+            assert!(
+                s.contains("\x1b[90m"),
+                "frac={}: expected grey: {:?}",
+                frac,
+                s
+            );
             // None of the live-tier colours may appear.
             for live in ["\x1b[31m", "\x1b[32m", "\x1b[33m"] {
                 assert!(
@@ -699,7 +721,11 @@ mod tests {
         // empty, but here's where time says you should be" rather
         // than "extra unit of usage in a different colour."
         let s = colored_bar(0.4, 10, Some(7), false, true);
-        assert!(s.contains("\x1b[35m"), "expected magenta pace marker: {:?}", s);
+        assert!(
+            s.contains("\x1b[35m"),
+            "expected magenta pace marker: {:?}",
+            s
+        );
         assert_eq!(s.matches('▰').count(), 4, "got {:?}", s);
         assert_eq!(s.matches('▱').count(), 6, "got {:?}", s);
     }
@@ -788,7 +814,11 @@ mod tests {
         let s = format_quota_row("5h", &w, /*use_color*/ false);
         assert!(s.contains("100%"), "got: {}", s);
         assert!(s.contains("2h"), "got: {}", s);
-        assert!(!s.contains("⚠"), "row should not carry per-row marker: {}", s);
+        assert!(
+            !s.contains("⚠"),
+            "row should not carry per-row marker: {}",
+            s
+        );
     }
 
     #[test]
@@ -864,7 +894,11 @@ mod tests {
         // "last refreshed HH:MM:SS" phrasing.
         assert!(s.contains("last refreshed"), "expected footer in: {}", s);
         // No trailing newline (cursor parks on the footer line).
-        assert!(!s.ends_with('\n'), "got trailing newline in: {:?}", s.chars().last());
+        assert!(
+            !s.ends_with('\n'),
+            "got trailing newline in: {:?}",
+            s.chars().last()
+        );
     }
 
     #[test]
@@ -972,7 +1006,10 @@ mod tests {
         let now = chrono::Local::now();
         let out = format_footer(Some(chrono::Utc::now()), now, /*use_color*/ true);
         // Dim grey is `\x1b[90m` per the existing palette.
-        assert!(out.contains("\x1b[90m") && out.ends_with("\x1b[0m"), "got: {}", out);
+        assert!(
+            out.contains("\x1b[90m") && out.ends_with("\x1b[0m"),
+            "got: {}",
+            out
+        );
     }
-
 }

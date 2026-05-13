@@ -20,9 +20,9 @@ use crate::pricing::{anthropic_default, AnthropicTokenUsage, ModelRate};
 use crate::provider::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Utc};
 #[cfg(test)]
 use chrono::TimeZone;
+use chrono::{DateTime, Datelike, Utc};
 use serde::Deserialize;
 
 /// Minimum time between successive `/api/oauth/usage` HTTP calls.
@@ -31,14 +31,16 @@ use serde::Deserialize;
 /// refresh storms (Claude Code can write to `~/.claude/projects/`
 /// once per assistant turn).
 ///
-/// Empirically 60 s is *not* safe: under heavy Claude Code use we
-/// were getting 429'd within 30 minutes. 300 s matches the
-/// `OAuthBackoff::INITIAL_COOLDOWN_SECS` floor — the same interval
-/// Anthropic implicitly tells us is acceptable. Local-file token
-/// counts still update instantly via the data-source watcher, so
-/// only the quota *percentage* fraction lags by up to 5 min, which
-/// is still 3× fresher than the pre-watcher 15 min default.
-const MIN_HTTP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+/// Bumped progressively:
+///   60 s   — got 429'd within 30 minutes under heavy use.
+///   300 s  — got 429'd again after a few hours of use.
+///   900 s  — 4 calls/hour ceiling, comfortably inside whatever
+///            Anthropic's actual budget is. Local-file token
+///            counts still update instantly via the data-source
+///            watcher; only the quota *percentage* lags by at
+///            most 15 min, same cadence as the pre-watcher idle
+///            poll default.
+const MIN_HTTP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -164,8 +166,7 @@ impl AnthropicProvider {
                 .into_iter()
                 .filter_map(|e| e.ok())
                 .filter(|e| {
-                    e.file_type().is_file()
-                        && e.path().extension().is_some_and(|x| x == "jsonl")
+                    e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl")
                 })
             {
                 let path = entry.path().to_path_buf();
@@ -308,7 +309,11 @@ impl AnthropicProvider {
         // to count tokens once. Fall back to "path:offset" when ids
         // aren't present, which is unique enough for an incremental
         // append-only stream.
-        let dedupe_key = format!("{}:{}", path.display(), cache.files.get(path).map(|s| s.offset).unwrap_or(0));
+        let dedupe_key = format!(
+            "{}:{}",
+            path.display(),
+            cache.files.get(path).map(|s| s.offset).unwrap_or(0)
+        );
         let id_key = message
             .id
             .as_deref()
@@ -419,7 +424,12 @@ impl Provider for AnthropicProvider {
             .oauth_backoff
             .lock()
             .ok()
-            .map(|b| (b.should_skip_http(now, MIN_HTTP_INTERVAL), b.in_cooldown(now)))
+            .map(|b| {
+                (
+                    b.should_skip_http(now, MIN_HTTP_INTERVAL),
+                    b.in_cooldown(now),
+                )
+            })
             .unwrap_or((false, false));
 
         if skip_http {
@@ -447,11 +457,15 @@ impl Provider for AnthropicProvider {
                     .map(|b| b.cooldown_remaining(now))
                     .unwrap_or(0);
                 quota_error = Some(format!(
-                    "rate-limited; quota refresh paused for {}m",
-                    remaining.div_euclid(60)
+                    "Rate-limited by Anthropic — refresh paused for {} min",
+                    remaining.div_euclid(60).max(1)
                 ));
             }
         } else {
+            tracing::info!(
+                throttle_secs = MIN_HTTP_INTERVAL.as_secs(),
+                "anthropic /api/oauth/usage — calling upstream"
+            );
             match anthropic_oauth::fetch_usage(&self.http).await {
                 Ok(usage) => {
                     apply_oauth_usage(&mut snap, &usage, now, &mut quota_headline);
@@ -473,11 +487,19 @@ impl Provider for AnthropicProvider {
                         "anthropic oauth /usage rate-limited; backing off {}s",
                         OAuthBackoff::INITIAL_COOLDOWN_SECS
                     );
-                    quota_error = Some("rate-limited; backing off".into());
+                    quota_error = Some("Rate-limited by Anthropic — backing off".into());
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "anthropic oauth usage fetch failed");
-                    quota_error = Some(e.to_string());
+                    // Capitalise + drop the trailing "." some
+                    // OAuthError variants embed so the chip reads
+                    // like a UI message, not a log line.
+                    let mut s = e.to_string();
+                    if let Some(first) = s.get_mut(0..1) {
+                        first.make_ascii_uppercase();
+                    }
+                    s = s.trim_end_matches('.').to_string();
+                    quota_error = Some(s);
                 }
             }
         }
@@ -507,7 +529,7 @@ impl Provider for AnthropicProvider {
         if let Some(err) = quota_error {
             if matches!(snap.status, ProviderStatus::Ok) {
                 snap.status = ProviderStatus::Degraded;
-                snap.error = Some(format!("quota: {}", err));
+                snap.error = Some(err);
             }
         }
 
@@ -559,6 +581,9 @@ fn fill_quota_window(window: &mut WindowUsage, q: &QuotaBucket, now: DateTime<Ut
     window.fraction_used = Some(q.utilization / 100.0);
     window.ends_at = q.resets_at_utc();
     window.started_at = Some(now);
+    // A successful OAuth response is fresh even if Anthropic reports a
+    // reset timestamp that has just passed or is absent. Grey/stale is
+    // reserved for cache fallback after a failed/throttled quota poll.
 }
 
 /// After `apply_oauth_usage` has populated the canonical quota windows
@@ -985,7 +1010,7 @@ mod tests {
         let line = r#"{"type":"assistant","timestamp":"2026-05-08T10:00:00.000Z","requestId":"req_1","message":{"model":"claude-opus-4-7","id":"msg_1","usage":{"input_tokens":100,"output_tokens":200,"cache_read_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":500}}}}"#;
         writeln!(out, "{}", line).unwrap();
         writeln!(out, "{}", line).unwrap(); // duplicate
-        // Second turn, different request, same id — also distinct.
+                                            // Second turn, different request, same id — also distinct.
         let line2 = r#"{"type":"assistant","timestamp":"2026-05-08T10:01:00.000Z","requestId":"req_2","message":{"model":"claude-opus-4-7","id":"msg_2","usage":{"input_tokens":50,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}"#;
         writeln!(out, "{}", line2).unwrap();
         drop(out);
@@ -1001,7 +1026,11 @@ mod tests {
         // first turn cost: (100/1M)*15 + (200/1M)*75 + (1000/1M)*15*0.1 + (500/1M)*15*2 = 0.0015+0.015+0.0015+0.015 = 0.033
         // second turn: (50/1M)*15 + (50/1M)*75 = 0.00075 + 0.00375 = 0.0045
         // total ≈ 0.0375
-        assert!((agg.today.cost - 0.0375).abs() < 1e-6, "got {}", agg.today.cost);
+        assert!(
+            (agg.today.cost - 0.0375).abs() < 1e-6,
+            "got {}",
+            agg.today.cost
+        );
     }
 
     // ---- incremental scan tests ----
@@ -1025,7 +1054,12 @@ mod tests {
         std::fs::create_dir_all(&proj).unwrap();
         let f = proj.join("s.jsonl");
         let mut out = std::fs::File::create(&f).unwrap();
-        writeln!(out, "{}", one_assistant_line("r1", "m1", "2026-05-08T10:00:00Z")).unwrap();
+        writeln!(
+            out,
+            "{}",
+            one_assistant_line("r1", "m1", "2026-05-08T10:00:00Z")
+        )
+        .unwrap();
         drop(out);
 
         let mut cfg = AnthropicConfig::default();
@@ -1056,7 +1090,12 @@ mod tests {
         let f = proj.join("s.jsonl");
 
         let mut out = std::fs::File::create(&f).unwrap();
-        writeln!(out, "{}", one_assistant_line("r1", "m1", "2026-05-08T10:00:00Z")).unwrap();
+        writeln!(
+            out,
+            "{}",
+            one_assistant_line("r1", "m1", "2026-05-08T10:00:00Z")
+        )
+        .unwrap();
         drop(out);
 
         let mut cfg = AnthropicConfig::default();
@@ -1076,11 +1115,13 @@ mod tests {
             .unwrap();
 
         // Append a second turn to the same file.
-        let mut out = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&f)
-            .unwrap();
-        writeln!(out, "{}", one_assistant_line("r2", "m2", "2026-05-08T10:05:00Z")).unwrap();
+        let mut out = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
+        writeln!(
+            out,
+            "{}",
+            one_assistant_line("r2", "m2", "2026-05-08T10:05:00Z")
+        )
+        .unwrap();
         drop(out);
 
         let agg = p.aggregate(now).unwrap();
@@ -1129,13 +1170,13 @@ mod tests {
         let p = AnthropicProvider::with_opencode_db(cfg, None);
         let now = chrono::Utc.with_ymd_and_hms(2026, 5, 8, 10, 30, 0).unwrap();
         let agg = p.aggregate(now).unwrap();
-        assert_eq!(agg.last_hour.requests, 1, "only the complete line should count");
+        assert_eq!(
+            agg.last_hour.requests, 1,
+            "only the complete line should count"
+        );
 
         // Now finish the partial line. Next scan should pick it up.
-        let mut out = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&f)
-            .unwrap();
+        let mut out = std::fs::OpenOptions::new().append(true).open(&f).unwrap();
         out.write_all(
             b",\"output_tokens\":50,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":0}}}}\n",
         )
@@ -1178,7 +1219,12 @@ mod tests {
         // Replace the file with a single (different) line.
         {
             let mut out = std::fs::File::create(&f).unwrap();
-            writeln!(out, "{}", one_assistant_line("r_new", "m_new", "2026-05-08T10:10:00Z")).unwrap();
+            writeln!(
+                out,
+                "{}",
+                one_assistant_line("r_new", "m_new", "2026-05-08T10:10:00Z")
+            )
+            .unwrap();
         }
 
         let agg2 = p.aggregate(now).unwrap();

@@ -68,10 +68,7 @@ fn migrate_legacy_labels(file: &mut SnapshotsFile) {
         if !matches!(snap.provider, ProviderId::Anthropic) {
             continue;
         }
-        for (legacy, current) in [
-            ("week (Sonnet)", "Sonnet"),
-            ("week (Opus)", "Opus"),
-        ] {
+        for (legacy, current) in [("week (Sonnet)", "Sonnet"), ("week (Opus)", "Opus")] {
             if let Some(w) = snap.windows.remove(legacy) {
                 // `or_insert` rather than overwrite — a successful
                 // post-rename poll may have already populated the
@@ -187,9 +184,7 @@ mod tests {
         let original = SnapshotsFile::new(sample_snapshots());
         let parsed = round_trip_through_disk(&path, &original);
         assert_eq!(parsed.snapshots.len(), 1);
-        assert!(parsed
-            .snapshots
-            .contains_key(&ProviderId::Anthropic));
+        assert!(parsed.snapshots.contains_key(&ProviderId::Anthropic));
     }
 
     #[test]
@@ -416,10 +411,8 @@ mod tests {
             headline: None,
             plan_label: None,
         };
-        snap.windows.insert(
-            "week (Sonnet)".into(),
-            WindowUsage::default(),
-        );
+        snap.windows
+            .insert("week (Sonnet)".into(), WindowUsage::default());
         let mut snaps = BTreeMap::new();
         snaps.insert(ProviderId::CodexCli, snap);
         let mut file = SnapshotsFile::new(snaps);
@@ -447,13 +440,15 @@ mod tests {
             .unwrap()
             .stale = true;
         let parsed = round_trip_through_disk(&path, &SnapshotsFile::new(snaps));
-        assert!(parsed
-            .snapshots
-            .get(&ProviderId::Anthropic)
-            .unwrap()
-            .windows
-            .get("5h")
-            .unwrap()
-            .stale);
+        assert!(
+            parsed
+                .snapshots
+                .get(&ProviderId::Anthropic)
+                .unwrap()
+                .windows
+                .get("5h")
+                .unwrap()
+                .stale
+        );
     }
 }

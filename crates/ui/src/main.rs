@@ -49,8 +49,7 @@ fn main() -> Result<()> {
     //   RUST_LOG=info,llm_usage=debug,llm_usage_core=debug
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -177,8 +176,7 @@ fn main() -> Result<()> {
                     latest_update = Some(info);
                     // Rebuild the menu so the new banner appears
                     // immediately, not just on the next Snapshots tick.
-                    let new_menu =
-                        build_menu(&current_snapshots, latest_update.as_ref());
+                    let new_menu = build_menu(&current_snapshots, latest_update.as_ref());
                     tray.set_menu(Some(Box::new(new_menu)));
                     // One-time native notification when the version
                     // first changes, so users notice without having to
@@ -269,8 +267,7 @@ fn build_menu(
                 // menus instead of two-row ones into the tray and may
                 // have been what made the menu unscrollable on smaller
                 // panels.)
-                w.fraction_used.is_some()
-                    && !matches!(label.as_str(), "Sonnet" | "Opus")
+                w.fraction_used.is_some() && !matches!(label.as_str(), "Sonnet" | "Opus")
             })
             .collect();
         let has_activity = snap
@@ -336,18 +333,8 @@ fn build_menu(
         true,
         None,
     ));
-    let _ = menu.append(&MenuItem::with_id(
-        MenuId::new(HELP_ID),
-        "Help",
-        true,
-        None,
-    ));
-    let _ = menu.append(&MenuItem::with_id(
-        MenuId::new(QUIT_ID),
-        "Quit",
-        true,
-        None,
-    ));
+    let _ = menu.append(&MenuItem::with_id(MenuId::new(HELP_ID), "Help", true, None));
+    let _ = menu.append(&MenuItem::with_id(MenuId::new(QUIT_ID), "Quit", true, None));
     menu
 }
 
@@ -553,9 +540,8 @@ mod tests {
         cfg.anthropic.claude_projects_dir = Some(std::path::PathBuf::from("/tmp/custom-claude"));
         cfg.codex_cli.codex_dir = Some(std::path::PathBuf::from("/tmp/custom-codex"));
         let paths = data_source_paths(&cfg);
-        assert!(paths
-            .iter()
-            .any(|(p, _, l)| *l == "claude_projects" && p == &std::path::PathBuf::from("/tmp/custom-claude")));
+        assert!(paths.iter().any(|(p, _, l)| *l == "claude_projects"
+            && p == &std::path::PathBuf::from("/tmp/custom-claude")));
         // Codex appends `/sessions` to the configured codex_dir.
         assert!(paths.iter().any(|(p, _, l)| *l == "codex_sessions"
             && p == &std::path::PathBuf::from("/tmp/custom-codex/sessions")));
@@ -657,40 +643,43 @@ fn spawn_config_watcher(reload: Arc<Notify>) -> Option<RecommendedWatcher> {
     // Coalesce the burst of events a single save typically produces into one
     // reload signal. notify v7 fires create/modify/close events on a write,
     // so without a debounce we'd reload three times in quick succession.
-    let last_fire = Arc::new(std::sync::Mutex::new(Instant::now() - Duration::from_secs(60)));
+    let last_fire = Arc::new(std::sync::Mutex::new(
+        Instant::now() - Duration::from_secs(60),
+    ));
     let target = config_path.clone();
-    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let event = match res {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(error = %err, "config watcher error");
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let event = match res {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::warn!(error = %err, "config watcher error");
+                    return;
+                }
+            };
+            let interesting = matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+            );
+            if !interesting {
                 return;
             }
+            if !event.paths.iter().any(|p| p == &target) {
+                return;
+            }
+            let now = Instant::now();
+            let mut guard = last_fire.lock().expect("poisoned");
+            if now.duration_since(*guard) < Duration::from_millis(250) {
+                return;
+            }
+            *guard = now;
+            reload.notify_one();
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start config watcher (live-reload disabled)");
+                return None;
+            }
         };
-        let interesting = matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-        );
-        if !interesting {
-            return;
-        }
-        if !event.paths.iter().any(|p| p == &target) {
-            return;
-        }
-        let now = Instant::now();
-        let mut guard = last_fire.lock().expect("poisoned");
-        if now.duration_since(*guard) < Duration::from_millis(250) {
-            return;
-        }
-        *guard = now;
-        reload.notify_one();
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not start config watcher (live-reload disabled)");
-            return None;
-        }
-    };
 
     if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
         tracing::warn!(error = %e, path = %parent.display(), "config watcher subscribe failed");
@@ -711,40 +700,40 @@ fn spawn_refresh_trigger_watcher(refresh: Arc<Notify>) -> Option<RecommendedWatc
         tracing::warn!(error = %e, "could not ensure data dir for refresh watcher");
     }
 
-    let last_fire = Arc::new(std::sync::Mutex::new(Instant::now() - Duration::from_secs(60)));
+    let last_fire = Arc::new(std::sync::Mutex::new(
+        Instant::now() - Duration::from_secs(60),
+    ));
     let target = trigger_path.clone();
-    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        let event = match res {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(error = %err, "refresh watcher error");
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let event = match res {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::warn!(error = %err, "refresh watcher error");
+                    return;
+                }
+            };
+            let interesting = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+            if !interesting {
                 return;
             }
+            if !event.paths.iter().any(|p| p == &target) {
+                return;
+            }
+            let now = Instant::now();
+            let mut guard = last_fire.lock().expect("poisoned");
+            if now.duration_since(*guard) < Duration::from_millis(250) {
+                return;
+            }
+            *guard = now;
+            refresh.notify_one();
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not start refresh trigger watcher");
+                return None;
+            }
         };
-        let interesting = matches!(
-            event.kind,
-            EventKind::Create(_) | EventKind::Modify(_)
-        );
-        if !interesting {
-            return;
-        }
-        if !event.paths.iter().any(|p| p == &target) {
-            return;
-        }
-        let now = Instant::now();
-        let mut guard = last_fire.lock().expect("poisoned");
-        if now.duration_since(*guard) < Duration::from_millis(250) {
-            return;
-        }
-        *guard = now;
-        refresh.notify_one();
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!(error = %e, "could not start refresh trigger watcher");
-            return None;
-        }
-    };
 
     if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
         tracing::warn!(error = %e, path = %parent.display(), "refresh watcher subscribe failed");
@@ -769,10 +758,7 @@ fn spawn_refresh_trigger_watcher(refresh: Arc<Notify>) -> Option<RecommendedWatc
 /// Code can write a JSONL on every assistant turn) from translating
 /// into per-event upstream calls. See `MIN_HTTP_INTERVAL` in
 /// `crates/core/src/providers/anthropic.rs` and `ollama_cloud.rs`.
-fn spawn_data_source_watchers(
-    config: &Config,
-    refresh: Arc<Notify>,
-) -> Vec<RecommendedWatcher> {
+fn spawn_data_source_watchers(config: &Config, refresh: Arc<Notify>) -> Vec<RecommendedWatcher> {
     let mut out = Vec::new();
     let paths = data_source_paths(config);
     // Shared debounce: any source can fire it. 5 s is the floor we
@@ -785,7 +771,9 @@ fn spawn_data_source_watchers(
     // can be relatively generous without making the UI feel laggy:
     // the first event in a quiet period still fires immediately,
     // we just coalesce bursts.
-    let last_fire = Arc::new(std::sync::Mutex::new(Instant::now() - Duration::from_secs(60)));
+    let last_fire = Arc::new(std::sync::Mutex::new(
+        Instant::now() - Duration::from_secs(60),
+    ));
     for (path, mode, label) in paths {
         if !path.exists() {
             tracing::debug!(path = %path.display(), source = label, "data source dir absent; not watching");
@@ -804,8 +792,7 @@ fn spawn_data_source_watchers(
                         return;
                     }
                 };
-                let interesting =
-                    matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
+                let interesting = matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_));
                 if !interesting {
                     return;
                 }
@@ -873,9 +860,7 @@ fn is_meaningful_data_path(p: &std::path::Path) -> bool {
 /// The three (or fewer, depending on what's installed) local paths
 /// we watch for "something happened, re-poll the providers" signals.
 /// Each entry is (path, recursion mode, log-friendly label).
-fn data_source_paths(
-    config: &Config,
-) -> Vec<(std::path::PathBuf, RecursiveMode, &'static str)> {
+fn data_source_paths(config: &Config) -> Vec<(std::path::PathBuf, RecursiveMode, &'static str)> {
     let mut out = Vec::new();
 
     // Anthropic JSONLs — config override or ~/.claude/projects.
@@ -903,7 +888,11 @@ fn data_source_paths(
     // catch writes to `opencode.db` and its `-wal` / `-shm` siblings.
     if let Some(db) = config.resolve_opencode_db() {
         if let Some(parent) = db.parent() {
-            out.push((parent.to_path_buf(), RecursiveMode::NonRecursive, "opencode"));
+            out.push((
+                parent.to_path_buf(),
+                RecursiveMode::NonRecursive,
+                "opencode",
+            ));
         }
     }
 

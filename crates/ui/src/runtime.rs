@@ -8,8 +8,8 @@
 
 use llm_usage_core::config::Config;
 use llm_usage_core::model::{ProviderId, UsageSnapshot};
-use llm_usage_core::providers::{AnthropicProvider, CodexCliProvider, OllamaCloudProvider};
 use llm_usage_core::provider::Provider;
+use llm_usage_core::providers::{AnthropicProvider, CodexCliProvider, OllamaCloudProvider};
 use llm_usage_core::quota::QuotaEngine;
 use llm_usage_core::storage::Store;
 use llm_usage_core::updates::{self, UpdateInfo};
@@ -172,24 +172,34 @@ pub async fn run(
     // Set the next-check anchor in the past so the first iteration
     // through the loop fires the check immediately (subject to the
     // user's `check_for_updates` flag).
-    let mut next_update_check =
-        std::time::Instant::now() - Duration::from_secs(1);
+    let mut next_update_check = std::time::Instant::now() - Duration::from_secs(1);
+    // First poll after launch: still RECORD which thresholds were
+    // already over (so the SQLite dedupe table is in sync) but don't
+    // fire desktop notifications for them. The user is opening the
+    // app — they don't want to be greeted by alerts for state they
+    // already know about; alerts should fire when state TRANSITIONS
+    // past a threshold while the tray's running.
+    let mut first_poll = true;
 
     loop {
-        let alerts = poll_once(
-            &state.providers,
-            &mut snapshots,
-            &mut state.engine,
-            &store,
-        )
-        .await;
+        let alerts = poll_once(&state.providers, &mut snapshots, &mut state.engine, &store).await;
         if let Err(e) = llm_usage_core::write_snapshots(&snapshots) {
             tracing::warn!(error = %e, "failed to write shared snapshots file");
         }
         let _ = tx.send(RuntimeMessage::Snapshots(snapshots.clone()));
-        for msg in alerts {
-            if !state.alerts_disabled {
-                let _ = tx.send(RuntimeMessage::Alert(msg));
+        if first_poll {
+            if !alerts.is_empty() {
+                tracing::info!(
+                    suppressed = alerts.len(),
+                    "first-poll alerts suppressed (already-over thresholds at startup)",
+                );
+            }
+            first_poll = false;
+        } else {
+            for msg in alerts {
+                if !state.alerts_disabled {
+                    let _ = tx.send(RuntimeMessage::Alert(msg));
+                }
             }
         }
 
@@ -279,7 +289,10 @@ mod tests {
             })
         }
 
-        fn sequence(id: ProviderId, responses: Vec<anyhow::Result<UsageSnapshot>>) -> Box<dyn Provider> {
+        fn sequence(
+            id: ProviderId,
+            responses: Vec<anyhow::Result<UsageSnapshot>>,
+        ) -> Box<dyn Provider> {
             Box::new(Self {
                 id,
                 enabled: true,

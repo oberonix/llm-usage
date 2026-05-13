@@ -49,8 +49,7 @@ const PROBE_ENDPOINTS: &[&str] = &[
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -180,20 +179,24 @@ async fn probe_with_bearer(
     if let Some(t) = bearer {
         req = req.bearer_auth(t);
     }
-    let resp = req
-        .send()
-        .await
-        .with_context(|| format!("GET {}", url))?;
+    let resp = req.send().await.with_context(|| format!("GET {}", url))?;
     let status = resp.status();
     eprintln!("status: {status}");
     for (k, v) in resp.headers().iter() {
         let key = k.as_str();
-        if matches!(key, "content-type" | "cf-mitigated" | "x-ratelimit-remaining") {
+        if matches!(
+            key,
+            "content-type" | "cf-mitigated" | "x-ratelimit-remaining"
+        ) {
             eprintln!("  {key}: {}", v.to_str().unwrap_or("<binary>"));
         }
     }
     let body = resp.text().await.context("read body")?;
-    eprintln!("body ({} bytes): {}", body.len(), &body[..body.len().min(1500)]);
+    eprintln!(
+        "body ({} bytes): {}",
+        body.len(),
+        &body[..body.len().min(1500)]
+    );
     Ok(())
 }
 
@@ -215,7 +218,10 @@ async fn probe(
         .header(reqwest::header::ACCEPT, accept)
         // chatgpt.com's backend rejects requests without these on
         // some paths; harmless to send always.
-        .header("Sec-Fetch-Mode", if accept_html { "navigate" } else { "cors" })
+        .header(
+            "Sec-Fetch-Mode",
+            if accept_html { "navigate" } else { "cors" },
+        )
         .header("Sec-Fetch-Site", "same-origin")
         .send()
         .await
@@ -231,7 +237,12 @@ async fn probe(
         let key = k.as_str();
         if matches!(
             key,
-            "content-type" | "location" | "cf-mitigated" | "server" | "set-cookie" | "x-ratelimit-remaining"
+            "content-type"
+                | "location"
+                | "cf-mitigated"
+                | "server"
+                | "set-cookie"
+                | "x-ratelimit-remaining"
         ) {
             eprintln!("  {key}: {}", v.to_str().unwrap_or("<binary>"));
         }
@@ -243,10 +254,7 @@ async fn probe(
     // raw "% used" strings; if it's a shell we won't.
     let head: String = body.chars().take(400).collect();
     eprintln!("---- head (first 400 chars) ----\n{head}\n--------");
-    eprintln!(
-        "  contains `% used`: {}",
-        body.contains("% used")
-    );
+    eprintln!("  contains `% used`: {}", body.contains("% used"));
     eprintln!(
         "  contains `next/static`: {}  (Next.js shell marker)",
         body.contains("next/static")

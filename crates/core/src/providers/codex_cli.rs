@@ -245,7 +245,10 @@ impl CodexCliProvider {
                 for entry in WalkDir::new(&root)
                     .into_iter()
                     .filter_map(|e| e.ok())
-                    .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
+                    .filter(|e| {
+                        e.file_type().is_file()
+                            && e.path().extension().is_some_and(|x| x == "jsonl")
+                    })
                 {
                     let path = entry.path().to_path_buf();
                     if let Err(e) = scan_codex_file_incremental(&path, &mut cache) {
@@ -270,15 +273,17 @@ impl CodexCliProvider {
         // exist.
         if let Some(db) = &self.opencode_db {
             match crate::opencode::read_events(db, "openai") {
-                Ok(events) => out
-                    .events
-                    .extend(events.into_iter().map(|e| TokenEvent {
-                        timestamp: e.timestamp,
-                        model: if e.model.is_empty() { "openai".into() } else { e.model },
-                        input_tokens: e.input_tokens,
-                        output_tokens: e.output_tokens,
-                        cached_tokens: e.cached_tokens,
-                    })),
+                Ok(events) => out.events.extend(events.into_iter().map(|e| TokenEvent {
+                    timestamp: e.timestamp,
+                    model: if e.model.is_empty() {
+                        "openai".into()
+                    } else {
+                        e.model
+                    },
+                    input_tokens: e.input_tokens,
+                    output_tokens: e.output_tokens,
+                    cached_tokens: e.cached_tokens,
+                })),
                 Err(e) => {
                     tracing::warn!(error = %e, path = %db.display(), "opencode db read failed");
                 }
@@ -396,11 +401,7 @@ impl Provider for CodexCliProvider {
         if let Some(rl) = &collected.latest_rate_limits {
             plan_label = rl.plan_type.clone();
             if let Some(primary) = rl.primary {
-                apply_rate_limits(
-                    snap.window_mut(WindowKind::FiveHourRolling),
-                    primary,
-                    now,
-                );
+                apply_rate_limits(snap.window_mut(WindowKind::FiveHourRolling), primary, now);
             }
             if let Some(secondary) = rl.secondary {
                 apply_rate_limits(snap.window_mut(WindowKind::ThisWeek), secondary, now);
@@ -416,8 +417,7 @@ impl Provider for CodexCliProvider {
         if self.http.is_some() && self.cfg.chatgpt_session_cookie.is_some() {
             match self.fetch_live_quota(now).await {
                 Ok(Some(usage)) => {
-                    let (mut five_h, mut week) =
-                        (WindowUsage::default(), WindowUsage::default());
+                    let (mut five_h, mut week) = (WindowUsage::default(), WindowUsage::default());
                     usage.apply_to(&mut five_h, &mut week, now);
                     // `apply_to` only sets the quota-derived fields;
                     // re-fold them into the existing windows so we
@@ -428,6 +428,7 @@ impl Provider for CodexCliProvider {
                         w.ends_at = five_h.ends_at;
                         w.started_at = five_h.started_at;
                         w.stale = false;
+                        w.mark_stale_if_expired(now);
                     }
                     if week.fraction_used.is_some() {
                         let w = snap.window_mut(WindowKind::ThisWeek);
@@ -435,6 +436,7 @@ impl Provider for CodexCliProvider {
                         w.ends_at = week.ends_at;
                         w.started_at = week.started_at;
                         w.stale = false;
+                        w.mark_stale_if_expired(now);
                     }
                     if let Some(p) = usage.plan_type.clone() {
                         plan_label = Some(p);
@@ -476,9 +478,7 @@ impl Provider for CodexCliProvider {
             }
         }
 
-        snap.plan_label = plan_label
-            .as_deref()
-            .map(crate::model::title_case_first);
+        snap.plan_label = plan_label.as_deref().map(crate::model::title_case_first);
         snap.headline = Some(build_headline(
             plan_label.as_deref(),
             snap.window(WindowKind::FiveHourRolling),
@@ -493,14 +493,6 @@ impl Provider for CodexCliProvider {
         Ok(snap)
     }
 }
-
-/// How long after a Codex rate-limits record's declared `resets_at`
-/// we keep treating the recorded fraction as "current" before
-/// flipping the `stale` flag. Five minutes is the rough latency
-/// between the API window rolling over and the user's next codex CLI
-/// invocation that would refresh the snapshot — short enough not to
-/// hide real staleness, long enough to absorb a clock-skew tick.
-const STALE_GRACE_SECS: i64 = 5 * 60;
 
 /// Turn a raw rate-limit-reached kind (varies by upstream: wham uses
 /// `"default"` / `"weekly"`; rollouts use `"primary"` / `"secondary"`
@@ -521,23 +513,12 @@ fn apply_rate_limits(
     bucket: RateLimitsBucket,
     now: DateTime<Utc>,
 ) {
-    // Always surface the last known fraction (clamped to 0..1). When
-    // resets_at is in the past the data is stale, but the most useful
-    // thing is still "this is what we last saw": a user who hit 100 %
-    // and is still locked out wants to see "100 %", not a blank row.
-    //
-    // The `stale` flag tells downstream renderers to swap the reset
-    // countdown for a ⚠ marker. `STALE_GRACE_SECS` covers the gap
-    // between the declared reset moment and the next time the user
-    // actually runs codex CLI (which is what refreshes the data).
     let raw_frac = (bucket.used_percent / 100.0).clamp(0.0, 1.0);
     w.fraction_used = Some(raw_frac);
     w.ends_at = bucket.resets_at;
     w.started_at = Some(now);
-    w.stale = bucket
-        .resets_at
-        .is_some_and(|t| (now - t).num_seconds() > STALE_GRACE_SECS);
-    let _ = bucket.window_minutes; // kept for future labelling
+    w.mark_stale_if_expired(now);
+    let _ = bucket.window_minutes;
 }
 
 fn build_headline(
@@ -581,7 +562,9 @@ fn build_headline(
 }
 
 fn reset_suffix(ends_at: Option<DateTime<Utc>>) -> String {
-    let Some(t) = ends_at else { return String::new() };
+    let Some(t) = ends_at else {
+        return String::new();
+    };
     let now = Utc::now();
     let secs = (t - now).num_seconds();
     if secs <= 0 {
@@ -600,7 +583,6 @@ fn default_codex_dir() -> PathBuf {
         .map(|h| h.join(".codex"))
         .unwrap_or_else(|| PathBuf::from(".codex"))
 }
-
 
 #[derive(Debug, Default)]
 struct Bucket {
@@ -641,10 +623,7 @@ struct OuterEntry {
     payload: Option<Value>,
 }
 
-fn scan_codex_file_incremental(
-    path: &std::path::Path,
-    cache: &mut ScanCache,
-) -> Result<()> {
+fn scan_codex_file_incremental(path: &std::path::Path, cache: &mut ScanCache) -> Result<()> {
     let meta = std::fs::metadata(path)?;
     let size = meta.len();
     let prev = cache.files.get(path).cloned().unwrap_or_default();
@@ -662,7 +641,11 @@ fn scan_codex_file_incremental(
     // we're resuming we carry the previous `current_model` and
     // `prev_snapshot` so deduplication stays correct across calls.
     let mut state = if start == 0 {
-        FileState { size, offset: 0, ..Default::default() }
+        FileState {
+            size,
+            offset: 0,
+            ..Default::default()
+        }
     } else {
         let mut s = prev.clone();
         s.size = size;
@@ -709,10 +692,11 @@ fn process_codex_line(line: &str, state: &mut FileState, cache: &mut ScanCache) 
         return;
     };
     let Some(payload) = entry.payload else { return };
-    let record_ts = entry
-        .timestamp
-        .as_deref()
-        .and_then(|s| DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc)));
+    let record_ts = entry.timestamp.as_deref().and_then(|s| {
+        DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.with_timezone(&Utc))
+    });
 
     match entry.entry_type.as_deref() {
         Some("turn_context") => {
@@ -728,21 +712,23 @@ fn process_codex_line(line: &str, state: &mut FileState, cache: &mut ScanCache) 
             // Rate-limit snapshot, if present. Lives on the
             // event_msg payload itself, not under `info`.
             if let Some(rl) = payload.get("rate_limits") {
-                if let (Some(ts), Some(record)) =
-                    (record_ts, parse_rate_limits(rl, record_ts))
-                {
+                if let (Some(ts), Some(record)) = (record_ts, parse_rate_limits(rl, record_ts)) {
                     maybe_update_latest_rate_limits(&mut cache.latest_rate_limits, ts, record);
                 }
             }
 
             let info = payload.get("info");
-            let usage = info
-                .filter(|v| !v.is_null())
-                .and_then(|i| i.get("last_token_usage").or_else(|| i.get("total_token_usage")));
+            let usage = info.filter(|v| !v.is_null()).and_then(|i| {
+                i.get("last_token_usage")
+                    .or_else(|| i.get("total_token_usage"))
+            });
             let Some(u) = usage else { return };
             let input = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
             let output = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            let cached = u.get("cached_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cached = u
+                .get("cached_input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             if input == 0 && output == 0 && cached == 0 {
                 return;
             }
@@ -870,10 +856,7 @@ fn codex_cost_usd(model: &str, input: u64, output: u64, cached: u64) -> f64 {
         (1.0, 4.0, 0.5)
     };
     let billed_input = input.saturating_sub(cached);
-    (billed_input as f64 * i_rate
-        + output as f64 * o_rate
-        + cached as f64 * c_rate)
-        / 1_000_000.0
+    (billed_input as f64 * i_rate + output as f64 * o_rate + cached as f64 * c_rate) / 1_000_000.0
 }
 
 #[cfg(test)]
@@ -933,7 +916,9 @@ mod tests {
         // input_tokens INCLUDES cached_input_tokens per OpenAI convention;
         // we should bill (input - cached) at the regular rate and `cached`
         // at the cached rate.
-        let c = codex_cost_usd("gpt-5", /* input */ 1_000_000, /* output */ 0, /* cached */ 500_000);
+        let c = codex_cost_usd(
+            "gpt-5", /* input */ 1_000_000, /* output */ 0, /* cached */ 500_000,
+        );
         // billed_input = 500_000 → 500_000 * 1.25/1e6 = 0.625
         // cached = 500_000 → 500_000 * 0.125/1e6 = 0.0625
         // total = 0.6875
@@ -945,7 +930,12 @@ mod tests {
         // sanity: output rate > input rate for gpt-5.
         let in_cost = codex_cost_usd("gpt-5", 1_000_000, 0, 0);
         let out_cost = codex_cost_usd("gpt-5", 0, 1_000_000, 0);
-        assert!(out_cost > in_cost, "out {} should be > in {}", out_cost, in_cost);
+        assert!(
+            out_cost > in_cost,
+            "out {} should be > in {}",
+            out_cost,
+            in_cost
+        );
     }
 
     #[test]
@@ -1026,10 +1016,7 @@ mod tests {
         let primary = rl.primary.expect("primary present");
         assert!((primary.used_percent - 1.0).abs() < 1e-6);
         assert_eq!(primary.window_minutes, 300);
-        assert_eq!(
-            primary.resets_at,
-            Utc.timestamp_opt(1778387659, 0).single()
-        );
+        assert_eq!(primary.resets_at, Utc.timestamp_opt(1778387659, 0).single());
         let secondary = rl.secondary.expect("secondary present");
         assert!((secondary.used_percent - 17.0).abs() < 1e-6);
         assert_eq!(secondary.window_minutes, 10080);
@@ -1154,7 +1141,10 @@ mod tests {
         let older_at = now - chrono::Duration::seconds(60);
         maybe_update_latest_rate_limits(&mut slot, older_at, rec_with_buckets(older_at, 50.0));
         let p = slot.as_ref().unwrap().primary.unwrap();
-        assert!((p.used_percent - 80.0).abs() < 1e-9, "older record must not win");
+        assert!(
+            (p.used_percent - 80.0).abs() < 1e-9,
+            "older record must not win"
+        );
     }
 
     #[test]
@@ -1302,7 +1292,13 @@ mod tests {
         .to_string();
         conn.execute(
             "INSERT INTO message VALUES (?,?,?,?,?)",
-            rusqlite::params!["u1", "ses1", completed_ms - 1000, completed_ms - 1000, user_data],
+            rusqlite::params![
+                "u1",
+                "ses1",
+                completed_ms - 1000,
+                completed_ms - 1000,
+                user_data
+            ],
         )
         .unwrap();
         conn.execute(

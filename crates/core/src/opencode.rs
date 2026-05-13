@@ -89,9 +89,8 @@ pub fn read_events(db_path: &Path, provider_id: &str) -> Result<Vec<OpencodeEven
     let _ = conn.pragma_update(None, "query_only", true);
 
     let cutoff_ms = (Utc::now() - Duration::days(14)).timestamp_millis();
-    let mut stmt = conn.prepare(
-        "SELECT time_created, data FROM message WHERE time_created >= ?",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT time_created, data FROM message WHERE time_created >= ?")?;
     let mut rows = stmt.query([cutoff_ms])?;
 
     let mut events = Vec::new();
@@ -216,7 +215,13 @@ mod tests {
         }
         conn.execute(
             "INSERT INTO message VALUES (?,?,?,?,?)",
-            rusqlite::params!["a1", "ses1", completed_ms - 500, completed_ms, data.to_string()],
+            rusqlite::params![
+                "a1",
+                "ses1",
+                completed_ms - 500,
+                completed_ms,
+                data.to_string()
+            ],
         )
         .unwrap();
     }
@@ -253,7 +258,14 @@ mod tests {
     fn skips_zero_token_rows() {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("oc.db");
-        write_fixture(&p, "openai", chrono::Utc::now().timestamp_millis(), 0, 0, None);
+        write_fixture(
+            &p,
+            "openai",
+            chrono::Utc::now().timestamp_millis(),
+            0,
+            0,
+            None,
+        );
         assert!(read_events(&p, "openai").unwrap().is_empty());
     }
 
@@ -330,7 +342,12 @@ mod tests {
             }
         }
         let events = read_events(&p, "openai").unwrap();
-        assert_eq!(events.len(), 1, "old row must be filtered out: {:#?}", events);
+        assert_eq!(
+            events.len(),
+            1,
+            "old row must be filtered out: {:#?}",
+            events
+        );
     }
 
     #[test]
@@ -437,7 +454,8 @@ mod tests {
         // Valid SQLite file, but no `message` table — open succeeds,
         // prepare fails. Confirm the error surfaces rather than
         // silently returning an empty event list.
-        conn.execute_batch("CREATE TABLE not_message (x INTEGER);").unwrap();
+        conn.execute_batch("CREATE TABLE not_message (x INTEGER);")
+            .unwrap();
         drop(conn);
         assert!(read_events(&p, "openai").is_err());
     }
@@ -455,7 +473,12 @@ mod tests {
                     now_ms - i as i64 * 60_000,
                     tokens.1,
                 );
-                insert_row(&conn, &format!("r{}", tokens.0), now_ms - i as i64 * 60_000, &blob);
+                insert_row(
+                    &conn,
+                    &format!("r{}", tokens.0),
+                    now_ms - i as i64 * 60_000,
+                    &blob,
+                );
             }
         }
         let events = read_events(&p, "openai").unwrap();
