@@ -51,7 +51,7 @@
 //! cross-reading [soulduse/ai-token-monitor]'s `codex.rs` parser.
 
 use crate::config::CodexCliConfig;
-use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind};
+use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind, WindowUsage};
 use crate::provider::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -83,11 +83,30 @@ struct FileState {
 /// trim cheap without losing in-window data.
 const EVENT_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 86_400);
 
+/// Minimum gap between live `/backend-api/wham/usage` HTTP calls.
+/// Same rationale as Anthropic's `MIN_HTTP_INTERVAL`: the
+/// file-watcher fires once per assistant turn under heavy Codex
+/// use and we don't want one HTTP call per turn against
+/// chatgpt.com (which is more Cloudflare-trigger-happy than most).
+const WHAM_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[derive(Default)]
 struct ScanCache {
     events: Vec<TokenEvent>,
     files: HashMap<PathBuf, FileState>,
     latest_rate_limits: Option<RateLimitsRecord>,
+}
+
+/// Cached state for the chatgpt.com live-quota path. The bearer is
+/// minted from the session cookie via NextAuth and held alongside its
+/// expiry so we re-mint just before it lapses; the `last_usage` is
+/// the most recent successful `/wham/usage` response, served when
+/// `last_usage_at` falls inside `WHAM_MIN_INTERVAL`.
+#[derive(Default)]
+struct WhamCache {
+    bearer: Option<crate::chatgpt_oauth::MintedBearer>,
+    last_usage: Option<crate::chatgpt_oauth::WhamUsage>,
+    last_usage_at: Option<chrono::DateTime<Utc>>,
 }
 
 pub struct CodexCliProvider {
@@ -102,6 +121,11 @@ pub struct CodexCliProvider {
     /// loop. Cache stores TokenEvents + latest rate_limits + per-file
     /// offsets so subsequent polls only read appended bytes.
     cache: Mutex<ScanCache>,
+    /// HTTP client + cached bearer for the chatgpt.com live-quota
+    /// source. Lazily initialised; `None` when no `chatgpt_session_cookie`
+    /// is configured.
+    http: Option<reqwest::Client>,
+    wham: Mutex<WhamCache>,
 }
 
 impl CodexCliProvider {
@@ -111,12 +135,7 @@ impl CodexCliProvider {
     pub fn new(cfg: CodexCliConfig) -> Self {
         let codex_dir = cfg.codex_dir.clone().unwrap_or_else(default_codex_dir);
         let opencode_db = Some(crate::opencode::default_db_path());
-        Self {
-            cfg,
-            codex_dir,
-            opencode_db,
-            cache: Mutex::new(ScanCache::default()),
-        }
+        Self::build(cfg, codex_dir, opencode_db)
     }
 
     /// Construct with an explicit opencode override:
@@ -125,11 +144,90 @@ impl CodexCliProvider {
     pub fn with_opencode_db(cfg: CodexCliConfig, opencode_db: Option<PathBuf>) -> Self {
         let codex_dir = cfg.codex_dir.clone().unwrap_or_else(default_codex_dir);
         let opencode_db = opencode_db.filter(|p| !p.as_os_str().is_empty());
+        Self::build(cfg, codex_dir, opencode_db)
+    }
+
+    /// Pull live quota data from chatgpt.com. Returns `Ok(None)`
+    /// when the configured session cookie is empty. Caches the
+    /// bearer + the response in `self.wham`. Carefully scoped lock
+    /// acquisition: never hold a `MutexGuard` across an `.await`,
+    /// otherwise the future stops being `Send` and tokio can't
+    /// schedule it on the multi-thread runtime.
+    async fn fetch_live_quota(
+        &self,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<Option<crate::chatgpt_oauth::WhamUsage>> {
+        let Some(cookie_header) = self.cfg.chatgpt_session_cookie.as_deref() else {
+            return Ok(None);
+        };
+        let Some(http) = &self.http else {
+            return Ok(None);
+        };
+
+        // Cache-hit short-circuit. We hold the response for
+        // `WHAM_MIN_INTERVAL` and return it verbatim — the data
+        // truly hasn't changed in that window (chatgpt's backend
+        // updates a single account record on each Codex API call).
+        let cached: Option<crate::chatgpt_oauth::WhamUsage> = {
+            let cache = self.wham.lock().expect("poisoned");
+            match (&cache.last_usage, cache.last_usage_at) {
+                (Some(last), Some(at)) => match (now - at).to_std() {
+                    Ok(elapsed) if elapsed < WHAM_MIN_INTERVAL => Some(last.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        if let Some(u) = cached {
+            return Ok(Some(u));
+        }
+
+        // Decide whether to re-mint the bearer. Cache lock scoped
+        // to this block so we don't carry the guard into the
+        // `.await` below.
+        let need_mint = {
+            let cache = self.wham.lock().expect("poisoned");
+            match &cache.bearer {
+                None => true,
+                Some(b) => now + chrono::Duration::minutes(5) > b.expires_at_utc,
+            }
+        };
+        let bearer = if need_mint {
+            let minted = crate::chatgpt_oauth::mint_bearer(http, cookie_header).await?;
+            {
+                let mut cache = self.wham.lock().expect("poisoned");
+                cache.bearer = Some(minted.clone());
+            }
+            minted
+        } else {
+            let cache = self.wham.lock().expect("poisoned");
+            cache.bearer.clone().expect("checked above")
+        };
+
+        // Actual usage fetch.
+        let usage =
+            crate::chatgpt_oauth::fetch_wham_usage(http, cookie_header, &bearer.token).await?;
+        {
+            let mut cache = self.wham.lock().expect("poisoned");
+            cache.last_usage = Some(usage.clone());
+            cache.last_usage_at = Some(now);
+        }
+        Ok(Some(usage))
+    }
+
+    fn build(cfg: CodexCliConfig, codex_dir: PathBuf, opencode_db: Option<PathBuf>) -> Self {
+        let http = if cfg.chatgpt_session_cookie.is_some() {
+            crate::chatgpt_oauth::build_http_client().ok()
+        } else {
+            None
+        };
         Self {
             cfg,
             codex_dir,
             opencode_db,
             cache: Mutex::new(ScanCache::default()),
+            http,
+            wham: Mutex::new(WhamCache::default()),
         }
     }
 
@@ -279,13 +377,21 @@ impl Provider for CodexCliProvider {
         ww.request_count = bucket_7d.turns;
         ww.spend_usd = Some(bucket_7d.cost_usd);
 
-        // Apply the most recent rate-limit snapshot we observed. Codex
-        // emits these on every API turn; even when the snapshot's
-        // declared `resets_at` has already passed, we keep the last
-        // known fraction in place — the user can't run Codex if
-        // they're locked out, so the API never produces a fresher
-        // record. Renderers detect the stale state from `ends_at`
-        // and surface a warning marker after a short grace period.
+        // Apply the most recent rate-limit snapshot we observed.
+        // Two sources, in order of precedence:
+        //
+        //   1. The chatgpt.com `/backend-api/wham/usage` endpoint —
+        //      same data the cloud Codex settings page renders. Live,
+        //      never stale, no v0.129+ null-bucket dance. Requires the
+        //      user to have a `chatgpt_session_cookie` configured.
+        //   2. The rollouts' `rate_limits` records. Used as fallback
+        //      when (1) isn't configured / fails, and always for the
+        //      `plan_type` and `rate_limit_reached_type` fields when
+        //      the rollouts are fresher than the wham response (rare
+        //      but possible right after a turn).
+        //
+        // We apply the rollouts first (cheap), then let wham override
+        // when available.
         let mut plan_label: Option<String> = None;
         if let Some(rl) = &collected.latest_rate_limits {
             plan_label = rl.plan_type.clone();
@@ -305,6 +411,65 @@ impl Provider for CodexCliProvider {
                     "rate limit hit: {}",
                     rl.rate_limit_reached_type.as_deref().unwrap_or("?")
                 ));
+            }
+        }
+
+        // Live quota override from chatgpt.com. Errors are logged at
+        // WARN and ignored — we keep whatever the rollouts gave us.
+        if self.http.is_some() && self.cfg.chatgpt_session_cookie.is_some() {
+            match self.fetch_live_quota(now).await {
+                Ok(Some(usage)) => {
+                    let (mut five_h, mut week) =
+                        (WindowUsage::default(), WindowUsage::default());
+                    usage.apply_to(&mut five_h, &mut week, now);
+                    // `apply_to` only sets the quota-derived fields;
+                    // re-fold them into the existing windows so we
+                    // don't clobber the token activity above.
+                    if five_h.fraction_used.is_some() {
+                        let w = snap.window_mut(WindowKind::FiveHourRolling);
+                        w.fraction_used = five_h.fraction_used;
+                        w.ends_at = five_h.ends_at;
+                        w.started_at = five_h.started_at;
+                        w.stale = false;
+                    }
+                    if week.fraction_used.is_some() {
+                        let w = snap.window_mut(WindowKind::ThisWeek);
+                        w.fraction_used = week.fraction_used;
+                        w.ends_at = week.ends_at;
+                        w.started_at = week.started_at;
+                        w.stale = false;
+                    }
+                    if let Some(p) = usage.plan_type.clone() {
+                        plan_label = Some(p);
+                    }
+                    if let Some(rl) = &usage.rate_limit_reached_type {
+                        if usage.rate_limit.limit_reached {
+                            snap.status = ProviderStatus::Degraded;
+                            snap.error = Some(format!(
+                                "rate limit hit: {}",
+                                rl.details.as_deref().unwrap_or(rl.kind.as_str())
+                            ));
+                        } else {
+                            // Reachedness has cleared since the last
+                            // rollouts-derived error — wipe the
+                            // status flag the rollouts may have set.
+                            snap.status = ProviderStatus::Ok;
+                            snap.error = None;
+                        }
+                    } else {
+                        // No reachedness info at all → wipe any
+                        // stale "rate limit hit" the rollouts set.
+                        snap.status = ProviderStatus::Ok;
+                        snap.error = None;
+                    }
+                }
+                Ok(None) => {} // no fresh data this poll; fall back
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "chatgpt.com /wham/usage live-quota fetch failed; using rollouts"
+                    );
+                }
             }
         }
 

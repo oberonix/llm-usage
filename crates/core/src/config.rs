@@ -102,6 +102,14 @@ pub struct CodexCliConfig {
     /// When false (default) the UI shows turn counts and tokens but hides
     /// the reverse-engineered dollar estimate.
     pub show_spend: bool,
+    /// Optional `Cookie:` header for chatgpt.com / openai.com. When
+    /// set, the provider hits `/backend-api/wham/usage` for live
+    /// quota fractions (the same source the
+    /// chatgpt.com/codex/cloud/settings/analytics page uses) and
+    /// falls back to the rollouts' `rate_limits` records only when
+    /// the live fetch fails. The dashboard's "Import from browser…"
+    /// button populates this for you via `rookie`.
+    pub chatgpt_session_cookie: Option<String>,
 }
 
 impl Default for CodexCliConfig {
@@ -111,6 +119,7 @@ impl Default for CodexCliConfig {
             codex_dir: None,
             warn_at: vec![0.75, 0.9],
             show_spend: false,
+            chatgpt_session_cookie: None,
         }
     }
 }

@@ -59,6 +59,12 @@ pub struct ConfigDraft {
     pub codex_enabled: bool,
     pub codex_show_spend: bool,
     pub codex_warn_at: Vec<f64>,
+    /// `Cookie:` header for chatgpt.com — when present the Codex
+    /// provider hits `/backend-api/wham/usage` for live quota
+    /// fractions. Captured via the "Import from browser…" button
+    /// (rookie reads from Chrome / Brave / Firefox / etc).
+    pub codex_chatgpt_session_cookie: String,
+    pub codex_chatgpt_setup_status: Option<String>,
 
     pub ollama_cloud_enabled: bool,
     pub ollama_cloud_session_cookie: String,
@@ -92,6 +98,12 @@ impl ConfigDraft {
             codex_enabled: c.codex_cli.enabled,
             codex_show_spend: c.codex_cli.show_spend,
             codex_warn_at: c.codex_cli.warn_at.clone(),
+            codex_chatgpt_session_cookie: c
+                .codex_cli
+                .chatgpt_session_cookie
+                .clone()
+                .unwrap_or_default(),
+            codex_chatgpt_setup_status: None,
 
             ollama_cloud_enabled: c.ollama_cloud.enabled,
             ollama_cloud_session_cookie: c
@@ -132,6 +144,7 @@ impl ConfigDraft {
             enabled: self.codex_enabled,
             show_spend: self.codex_show_spend,
             warn_at: self.codex_warn_at.clone(),
+            chatgpt_session_cookie: empty_to_none(&self.codex_chatgpt_session_cookie),
             ..c.codex_cli
         };
 
@@ -365,9 +378,85 @@ impl ConfigDraft {
             help(
                 ui,
                 "Quota (5h, 7d) comes from OpenAI's rate-limit headers, which the \
-                 Codex CLI writes into your local rollouts on every turn.",
+                 Codex CLI writes into your local rollouts on every turn. \
+                 Optionally also hit chatgpt.com directly for live quota \u{2014} \
+                 same data the Codex Cloud Settings page shows.",
             );
+            ui.add_space(6.0);
+            field_row(ui, "ChatGPT cookies", |ui| {
+                if ui.button("Import from browser \u{2014} recommended").clicked() {
+                    self.import_chatgpt_cookies_from_browser();
+                }
+                if !self.codex_chatgpt_session_cookie.is_empty() {
+                    ui.weak(format!(
+                        "\u{2713} {} chars saved",
+                        self.codex_chatgpt_session_cookie.len()
+                    ));
+                }
+            });
+            if let Some(msg) = &self.codex_chatgpt_setup_status {
+                help(ui, msg);
+            }
         });
+    }
+
+    /// Pull chatgpt.com / openai.com cookies via `rookie` and persist
+    /// them to `codex_cli.chatgpt_session_cookie`. Mirrors
+    /// `import_from_browser` for Ollama Cloud — same dependency, same
+    /// failure modes (no logged-in browser; libsecret keyring on
+    /// Linux). The Codex provider treats the saved cookie as a live
+    /// quota source override that supersedes the rollouts' lagging
+    /// `rate_limits` records.
+    fn import_chatgpt_cookies_from_browser(&mut self) {
+        let cookies = match rookie::load(Some(vec![
+            "chatgpt.com".to_string(),
+            ".chatgpt.com".to_string(),
+            "openai.com".to_string(),
+            ".openai.com".to_string(),
+        ])) {
+            Ok(c) => c,
+            Err(e) => {
+                self.codex_chatgpt_setup_status =
+                    Some(format!("Browser import failed: {}", e));
+                return;
+            }
+        };
+        let header: String = cookies
+            .iter()
+            .filter(|c| {
+                let d = c.domain.trim_start_matches('.');
+                d.ends_with("chatgpt.com") || d.ends_with("openai.com")
+            })
+            .map(|c| format!("{}={}", c.name, c.value))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if header.is_empty() {
+            self.codex_chatgpt_setup_status = Some(
+                "No chatgpt.com / openai.com cookies found in any installed browser. \
+                 Sign in to chatgpt.com in your browser first, then click again."
+                    .into(),
+            );
+            return;
+        }
+        let path = match config::config_path() {
+            Ok(p) => p,
+            Err(e) => {
+                self.codex_chatgpt_setup_status =
+                    Some(format!("Could not resolve config path: {}", e));
+                return;
+            }
+        };
+        let mut cfg = config::Config::load_or_default().unwrap_or_default();
+        cfg.codex_cli.chatgpt_session_cookie = Some(header.clone());
+        if let Err(e) = cfg.save(&path) {
+            self.codex_chatgpt_setup_status = Some(format!("Save failed: {}", e));
+            return;
+        }
+        self.codex_chatgpt_session_cookie = header;
+        self.codex_chatgpt_setup_status = Some(format!(
+            "Imported from browser. Saved to {}.",
+            path.display()
+        ));
     }
 
     fn render_ollama_cloud(&mut self, ui: &mut egui::Ui) {

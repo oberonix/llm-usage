@@ -36,8 +36,12 @@ const ANALYTICS_URL: &str = "https://chatgpt.com/codex/cloud/settings/analytics"
 // on chatgpt.com's typical `/backend-api/<feature>/...` shape. If a
 // 404 comes back the user should grab the real path from devtools.
 const PROBE_ENDPOINTS: &[&str] = &[
-    "https://chatgpt.com/backend-api/codex/cloud/settings/analytics/usage",
-    "https://chatgpt.com/backend-api/codex/usage",
+    // The real one — confirmed by the user from their browser's
+    // network tab.
+    "https://chatgpt.com/backend-api/wham/usage",
+    // Kept around so a future regression on the wham path can be
+    // distinguished from an auth issue (a 200 here means we're
+    // logged in; a 401/404 means cookies got stale).
     "https://chatgpt.com/backend-api/me",
 ];
 
@@ -113,9 +117,83 @@ async fn main() -> Result<()> {
         .build()?;
 
     probe(&http, &cookie_header, ANALYTICS_URL, true).await?;
+
+    // ChatGPT's NextAuth handler mints a short-lived bearer token
+    // from the session cookie. The /backend-api routes that gate
+    // on bearer (e.g. /wham/usage) take it as
+    // `Authorization: Bearer <token>`. /me happens to accept the
+    // session cookie alone, which is why our cookies appear "valid"
+    // for some routes and not others.
+    let bearer = mint_session_bearer(&http, &cookie_header).await?;
+    eprintln!(
+        "\n[auth] session-bearer minted: {} ({} chars)",
+        if bearer.is_some() { "yes" } else { "no" },
+        bearer.as_deref().map(|s| s.len()).unwrap_or(0),
+    );
+
     for url in PROBE_ENDPOINTS {
-        probe(&http, &cookie_header, url, false).await?;
+        probe_with_bearer(&http, &cookie_header, bearer.as_deref(), url).await?;
     }
+    Ok(())
+}
+
+async fn mint_session_bearer(
+    http: &reqwest::Client,
+    cookie_header: &str,
+) -> Result<Option<String>> {
+    let url = "https://chatgpt.com/api/auth/session";
+    let resp = http
+        .get(url)
+        .header(reqwest::header::COOKIE, cookie_header)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .with_context(|| format!("GET {}", url))?;
+    if !resp.status().is_success() {
+        eprintln!(
+            "[auth] /api/auth/session returned {} — bearer not obtainable",
+            resp.status()
+        );
+        return Ok(None);
+    }
+    let body: serde_json::Value = resp.json().await.context("parse session JSON")?;
+    let token = body
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Ok(token)
+}
+
+async fn probe_with_bearer(
+    http: &reqwest::Client,
+    cookie_header: &str,
+    bearer: Option<&str>,
+    url: &str,
+) -> Result<()> {
+    eprintln!("\n--- GET {url} (with bearer = {}) ---", bearer.is_some());
+    let mut req = http
+        .get(url)
+        .header(reqwest::header::COOKIE, cookie_header)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-origin");
+    if let Some(t) = bearer {
+        req = req.bearer_auth(t);
+    }
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("GET {}", url))?;
+    let status = resp.status();
+    eprintln!("status: {status}");
+    for (k, v) in resp.headers().iter() {
+        let key = k.as_str();
+        if matches!(key, "content-type" | "cf-mitigated" | "x-ratelimit-remaining") {
+            eprintln!("  {key}: {}", v.to_str().unwrap_or("<binary>"));
+        }
+    }
+    let body = resp.text().await.context("read body")?;
+    eprintln!("body ({} bytes): {}", body.len(), &body[..body.len().min(1500)]);
     Ok(())
 }
 

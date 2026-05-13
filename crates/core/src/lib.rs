@@ -1,4 +1,5 @@
 pub mod anthropic_oauth;
+pub mod chatgpt_oauth;
 pub mod config;
 pub mod model;
 pub mod pricing;
