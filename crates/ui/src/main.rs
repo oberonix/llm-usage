@@ -39,7 +39,7 @@ fn rotation_interval_from(cfg: &Config) -> Duration {
 
 const DASHBOARD_ID: &str = "dashboard";
 const SETTINGS_ID: &str = "settings";
-const REFRESH_ID: &str = "refresh";
+const HELP_ID: &str = "help";
 const UPDATE_ID: &str = "update";
 const QUIT_ID: &str = "quit";
 
@@ -197,9 +197,9 @@ fn main() -> Result<()> {
         if let Ok(menu_event) = menu_channel.try_recv() {
             match menu_event.id.0.as_str() {
                 QUIT_ID => *control_flow = ControlFlow::Exit,
-                REFRESH_ID => refresh.notify_one(),
                 DASHBOARD_ID => spawn_dashboard(&[]),
                 SETTINGS_ID => spawn_dashboard(&["--tab=settings"]),
+                HELP_ID => spawn_dashboard(&["--tab=help"]),
                 UPDATE_ID => {
                     if let Some(info) = &latest_update {
                         open_url(&info.url);
@@ -337,8 +337,8 @@ fn build_menu(
         None,
     ));
     let _ = menu.append(&MenuItem::with_id(
-        MenuId::new(REFRESH_ID),
-        "Refresh now",
+        MenuId::new(HELP_ID),
+        "Help",
         true,
         None,
     ));

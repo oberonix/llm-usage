@@ -22,6 +22,7 @@ use crate::settings::ConfigDraft;
 enum Tab {
     Status,
     Settings,
+    Help,
 }
 
 fn main() -> Result<()> {
@@ -183,14 +184,15 @@ impl Drop for PidGuard {
     }
 }
 
-/// Look for `--tab=status` / `--tab=settings` so the tray can launch
-/// us directly on the Settings tab from its "Settings…" menu item.
+/// Look for `--tab=status` / `--tab=settings` / `--tab=help` so the
+/// tray can launch us directly on a specific tab from its menu items.
 fn parse_initial_tab() -> Tab {
     for arg in std::env::args().skip(1) {
         if let Some(value) = arg.strip_prefix("--tab=") {
             match value {
                 "settings" => return Tab::Settings,
                 "status" => return Tab::Status,
+                "help" => return Tab::Help,
                 _ => {}
             }
         }
@@ -348,6 +350,8 @@ impl eframe::App for DashboardApp {
                     self.tab_button(ui, Tab::Status, "Status");
                     ui.add_space(8.0);
                     self.tab_button(ui, Tab::Settings, "Settings");
+                    ui.add_space(8.0);
+                    self.tab_button(ui, Tab::Help, "Help");
                 });
                 // No separator line — the underline under the active
                 // tab button is the divider.
@@ -388,6 +392,7 @@ impl eframe::App for DashboardApp {
             .show(ctx, |ui| match self.tab {
                 Tab::Status => self.render_status(ui),
                 Tab::Settings => self.render_settings(ui),
+                Tab::Help => self.render_help(ui),
             });
     }
 }
@@ -592,6 +597,23 @@ impl DashboardApp {
         self.auto_save_if_changed();
     }
 
+    fn render_help(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                egui::Frame::none()
+                    .inner_margin(egui::Margin {
+                        left: 20.0,
+                        right: 20.0,
+                        top: 12.0,
+                        bottom: 16.0,
+                    })
+                    .show(ui, |ui| {
+                        render_help_body(ui);
+                    });
+            });
+    }
+
     /// Called every frame from the Settings tab. Cheap when nothing has
     /// changed (one serialisation + string compare); writes to disk
     /// only on actual edits.
@@ -753,6 +775,285 @@ fn render_window_usage(ui: &mut egui::Ui, w: &llm_usage_core::model::WindowUsage
                 }
             }
         }
+    }
+}
+
+/// The repo URL is the single source of truth for "go file an issue
+/// / send a PR" — used by the Help tab and shown in the menu's
+/// version banner. Kept here rather than in `core` because only the
+/// dashboard renders it; the core lib has no UI.
+const REPO_URL: &str = "https://github.com/oberonix/llm-usage";
+
+/// Render the Help tab body. Long-form documentation of what each
+/// provider tracks, where the data comes from, how the various
+/// throttles interact, and the visual conventions (colours, ⚠
+/// markers, gray = stale).
+fn render_help_body(ui: &mut egui::Ui) {
+    ui.label(
+        RichText::new("How llm-usage works")
+            .strong()
+            .size(20.0),
+    );
+    ui.add_space(2.0);
+    ui.weak(
+        "Reference for what's being tracked, where each number comes from, \
+         and how to wire everything up for your setup.",
+    );
+
+    help_section(ui, "At a glance");
+    help_para(
+        ui,
+        "The tray icon shows two stacked bars — short window on top \
+         (5h for Anthropic / Codex; \"Session\" on Ollama Cloud) and \
+         weekly on the bottom — for whichever provider is currently in \
+         the rotation slot. The icon cycles to the next quota-bearing \
+         provider every few seconds. Click the tray icon to drop a \
+         menu with the same data as text + buttons for the dashboard, \
+         Settings, and Help; click \"Open dashboard\" for the full \
+         multi-card view you're looking at now.",
+    );
+    help_para(
+        ui,
+        "Bar colour means utilisation tier: green below 60 %, amber \
+         60–85 %, red above 85 %. A grey bar means the data is from a \
+         previous poll (the live source failed for this round); the \
+         provider's name in the card header carries a red ⚠ so you \
+         can tell at a glance which providers are disconnected. The \
+         CLI uses the same colour conventions.",
+    );
+
+    help_section(ui, "Providers and data sources");
+
+    help_subhead(ui, "Anthropic");
+    help_bullets(
+        ui,
+        &[
+            "5h / weekly / per-model (Sonnet, Opus) quota fractions \
+             come from Anthropic's OAuth /api/oauth/usage endpoint — \
+             same numbers Claude Code's /usage view shows. The OAuth \
+             token is read from ~/.claude/.credentials.json on every \
+             poll, so a re-login in Claude Code is picked up \
+             automatically.",
+            "Hourly / today / weekly / monthly token counts and dollar \
+             spend come from walking ~/.claude/projects/**.jsonl, the \
+             session logs Claude Code writes per assistant turn. \
+             Pricing is per-model and configurable in your \
+             config.toml under [anthropic.model_rates].",
+            "If you route Anthropic via opencode instead of Claude \
+             Code, those turns are read from opencode's SQLite store \
+             (filtered to providerID = \"anthropic\") and folded into \
+             the same token / spend windows.",
+        ],
+    );
+
+    help_subhead(ui, "Codex");
+    help_bullets(
+        ui,
+        &[
+            "Token counts and rate-limit snapshots come from \
+             ~/.codex/sessions/**/rollout-*.jsonl, written by the \
+             codex CLI on every turn. Quota fractions for the 5h and \
+             weekly windows are extracted from the rate_limits block \
+             inside each rollout.",
+            "Optionally, if you've imported chatgpt.com cookies via \
+             the Settings → Codex card, we also hit \
+             /backend-api/wham/usage directly (the endpoint the Codex \
+             Cloud Settings analytics page uses). That live data \
+             overrides the rollouts' fractions and is the strongly \
+             preferred source — it stays accurate through the \
+             \"limit hit\" state where the rollouts often go stale.",
+            "opencode-routed OpenAI turns (providerID = \"openai\") \
+             are picked up the same way as the Anthropic flow.",
+        ],
+    );
+
+    help_subhead(ui, "Ollama Cloud");
+    help_bullets(
+        ui,
+        &[
+            "Quota percentages for Session and Weekly come from \
+             scraping the logged-in ollama.com /settings page using a \
+             browser session cookie. Capture it via Settings → \
+             Ollama Cloud → \"Import from browser…\".",
+            "Token counts and request counts come from opencode's \
+             SQLite store (providerID = \"ollama-cloud\") — Ollama's \
+             page doesn't surface token data.",
+        ],
+    );
+
+    help_section(ui, "How fresh is each number?");
+    help_para(
+        ui,
+        "Three layered refresh triggers. From most to least frequent:",
+    );
+    help_bullets(
+        ui,
+        &[
+            "File watchers on ~/.claude/projects/, ~/.codex/sessions/, \
+             and the opencode SQLite parent dir. Any write fires a \
+             refresh within ~5 seconds. This is what makes a fresh \
+             Claude Code turn show up in the tray near-instantly. \
+             Sidecars (.db-wal, .db-shm) are filtered out so \
+             opencode's per-commit WAL writes don't pin the CPU.",
+            "Idle poll on the configured interval (Settings → \
+             \"Max refresh every\", default 15 min). Acts as a \
+             ceiling for stretches when no files change.",
+            "HTTP throttles inside each provider so high-frequency \
+             file events don't translate into upstream calls: \
+             Anthropic OAuth at most once per 5 min, Ollama scrape \
+             at most once per 60 s, chatgpt.com /wham/usage at most \
+             once per 5 min. Codex rollouts and opencode SQLite are \
+             local-file reads with no equivalent throttle — they're \
+             cached incrementally in memory so a 76 MB JSONL history \
+             still polls in milliseconds.",
+        ],
+    );
+
+    help_section(ui, "Windows you'll see");
+    help_bullets(
+        ui,
+        &[
+            "5h — rolling 5-hour quota window. Anthropic and Codex \
+             both have one; Ollama Cloud calls its equivalent \
+             \"Session usage\" and we normalise the label to \"5h\".",
+            "week — rolling 7-day quota window.",
+            "Sonnet / Opus — Anthropic's per-model weekly sub-quotas. \
+             Tray menu hides these (they crowd the panel); they show \
+             on the dashboard so you can see which model is heaviest.",
+            "1h / today / month — informational token-activity \
+             buckets. No quota fraction; just spend and counts.",
+        ],
+    );
+
+    help_section(ui, "Visual conventions");
+    help_bullets(
+        ui,
+        &[
+            "Bar fill colour — green / amber / red by utilisation \
+             tier. Grey + a red ⚠ next to the provider name means \
+             the values are from a previous poll (live source \
+             unreachable this round).",
+            "Pace marker — small magenta cell inside the bar showing \
+             where the time window currently sits. A 5h bar at \
+             50 % fill with the pace marker at cell 3 (~30 %) means \
+             you're ahead of pace. The marker takes the outline (▱) \
+             shape when it sits past the fill so it doesn't read as \
+             extra usage.",
+            "Countdown — \"resets 23m (15:14)\" next to the bar. \
+             Relative time first for at-a-glance, absolute wall-clock \
+             time in parens for planning.",
+        ],
+    );
+
+    help_section(ui, "Configuration");
+    help_bullets(
+        ui,
+        &[
+            "Settings → \"Max refresh every\" — idle-poll ceiling. \
+             File-watcher-driven refreshes happen within ~5 s \
+             regardless of this value.",
+            "Settings → \"Tray rotates every\" — how often the tray \
+             icon cycles to the next provider.",
+            "Per-provider alert thresholds — fire a desktop \
+             notification when any window crosses the configured \
+             fractions. De-duped per (provider, window, threshold) \
+             so you don't get spammed when you sit at 76 % for hours.",
+            "config.toml lives at ~/.config/llm-usage/ (Linux) or \
+             ~/Library/Application Support/dev.buffbit.llm-usage/ \
+             (macOS). The dashboard auto-saves every form change; the \
+             tray's file watcher picks the new config up within a \
+             few seconds.",
+        ],
+    );
+
+    help_section(ui, "CLI companion");
+    help_para(
+        ui,
+        "`llm-usage` in a terminal renders the same data as the tray, \
+         in colour, with a pace marker. Plays well with tmux. Flags:",
+    );
+    help_bullets(
+        ui,
+        &[
+            "(no flags) — live mode, watches the shared snapshot \
+             file written by the tray and redraws on each change. \
+             Footer shows \"updated HH:MM:SS · refreshed HH:MM:SS\" \
+             so you can tell live data freshness from display redraw.",
+            "--once — render the current snapshot and exit. \
+             Scriptable; exits 1 with a friendly stderr if no \
+             provider data is available.",
+            "--refresh — touches the tray's refresh-trigger file so \
+             the next poll fires immediately.",
+            "--help / --version — standard.",
+        ],
+    );
+
+    help_section(ui, "Privacy & networking");
+    help_para(
+        ui,
+        "The tray only ever talks to: api.anthropic.com (your OAuth \
+         /usage endpoint), ollama.com (the /settings scrape), \
+         chatgpt.com (only if you've imported its cookies), and \
+         api.github.com (only when \"Check for updates\" is on, at \
+         most once every 24 h). No telemetry, no auto-update install, \
+         no listening sockets. Snapshot files written to disk \
+         contain only counts and percentages — never tokens or \
+         cookies.",
+    );
+
+    help_section(ui, "Got a problem or an idea?");
+    help_para(
+        ui,
+        "Issues and pull requests are welcome on the project repo:",
+    );
+    ui.horizontal(|ui| {
+        ui.weak("→");
+        ui.hyperlink(REPO_URL);
+    });
+    ui.add_space(8.0);
+    ui.weak(
+        "When filing a bug, include your OS, the binary version (in \
+         the tray's update banner if visible, or via \
+         `llm-usage --version`), and which provider behaves \
+         unexpectedly. Running with RUST_LOG=debug on the tray \
+         produces useful diagnostics for any source's failure mode.",
+    );
+    ui.add_space(8.0);
+}
+
+fn help_section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(20.0);
+    ui.label(RichText::new(title).strong().size(15.0));
+    ui.add_space(2.0);
+    ui.separator();
+    ui.add_space(4.0);
+}
+
+fn help_subhead(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(title)
+            .strong()
+            .size(13.5)
+            .color(Color32::from_gray(220)),
+    );
+    ui.add_space(2.0);
+}
+
+fn help_para(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(2.0);
+    ui.label(RichText::new(text).size(12.5).color(Color32::from_gray(210)));
+}
+
+fn help_bullets(ui: &mut egui::Ui, items: &[&str]) {
+    ui.add_space(2.0);
+    for item in items {
+        ui.horizontal_top(|ui| {
+            ui.add_space(4.0);
+            ui.weak("•");
+            ui.label(RichText::new(*item).size(12.5).color(Color32::from_gray(210)));
+        });
+        ui.add_space(3.0);
     }
 }
 
