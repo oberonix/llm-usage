@@ -64,17 +64,15 @@ impl OAuthCredentials {
     pub fn load() -> Result<Self, OAuthError> {
         if let Ok(path) = credentials_path() {
             if path.exists() {
-                match Self::load_from_file(&path) {
-                    Ok(creds) => return Ok(creds),
-                    Err(_) => {}
+                if let Ok(creds) = Self::load_from_file(&path) {
+                    return Ok(creds);
                 }
             }
         }
         #[cfg(target_os = "macos")]
         {
-            match Self::load_from_keychain() {
-                Ok(creds) => return Ok(creds),
-                Err(_) => {}
+            if let Ok(creds) = Self::load_from_keychain() {
+                return Ok(creds);
             }
         }
         Err(OAuthError::Credentials(
