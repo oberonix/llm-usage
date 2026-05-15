@@ -28,7 +28,7 @@ OpenAI API | (none — spend only) | `/v1/dashboard/billing/usage` | Unofficial 
 Ollama (local) | n/a | `http://localhost:11434/api/ps` | No spend (local). Live model-loaded indicator.
 Codex CLI | `~/.codex/sessions/**` turn counts (5h, 7d) | reverse-engineered per-token | Best-effort; schema pinned to current Codex CLI.
 Gemini CLI | `~/.gemini/tmp/<proj>/chats/*.jsonl` turn counts | reverse-engineered per-token | Best-effort; schema pinned to gemini-cli 0.41.x.
-Ollama Cloud | TBD | TBD | Stub. Awaits documented usage API.
+Ollama Cloud | `/settings` page scraped with a saved session cookie | (none — no usage API) | Best-effort; cookie expires every few weeks, dashboard flags when to re-capture. See [Linking your Ollama Cloud account](#linking-your-ollama-cloud-account).
 
 ### Spend display is opt-in
 
@@ -57,8 +57,6 @@ Settings → Ollama Cloud section, neither of which requires copy-paste:
 
 A "Manual cookie (advanced)" collapsible is still there if you'd rather
 paste the `Cookie:` header yourself.
-
-## Build
 
 ## Install and Run
 
