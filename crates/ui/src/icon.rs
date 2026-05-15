@@ -115,10 +115,10 @@ fn draw_bar(buf: &mut [u8], x: usize, y: usize, w: usize, h: usize, frac: Option
 }
 
 /// Vertical 1 px line across a bar at the given pace (0..1).
-/// Red over green/amber bars; white over red-tier bars (≥ 85 %
-/// fill) for contrast against the dominant fill colour. Drawn on
-/// top of the fill so it's always visible regardless of where it
-/// sits in the bar.
+/// Magenta on every tier so it stays distinct from the
+/// green/amber/red fill colours (and matches the dashboard and CLI
+/// pace markers). Drawn on top of the fill so it's always visible
+/// regardless of where it sits in the bar.
 fn draw_pace_marker(
     buf: &mut [u8],
     x: usize,
@@ -126,20 +126,18 @@ fn draw_pace_marker(
     w: usize,
     h: usize,
     pace: f64,
-    fraction: Option<f64>,
+    // Kept for call-site symmetry with the fill colour; the marker is
+    // now tier-independent so it's no longer read.
+    _fraction: Option<f64>,
 ) {
     if w == 0 {
         return;
     }
     let pace = pace.clamp(0.0, 1.0);
     let pos = ((pace * (w - 1) as f64).round() as usize).min(w - 1);
-    // If the bar is in the red tier the marker is on a saturated
-    // red background — switch to white so it stays legible.
-    let color = if fraction.is_some_and(|f| f >= 0.85) {
-        (0xFF, 0xFF, 0xFF)
-    } else {
-        (0xFF, 0x20, 0x20)
-    };
+    // Magenta on every tier — distinct from the green/amber/red fill
+    // and from a grey stale bar, so the marker never blends in.
+    let color = (0xE0, 0x40, 0xE0);
     for yy in y..(y + h).min(SIZE_U) {
         let xx = x + pos;
         if xx >= SIZE_U {

@@ -704,37 +704,42 @@ fn render_window_usage(ui: &mut egui::Ui, label: &str, w: &llm_usage_core::model
             } else {
                 fraction_color(frac)
             };
+            // The bar is drawn without its own text so the pace
+            // marker can be painted on top of the fill, then the
+            // percentage re-painted on top of the marker — that
+            // z-order keeps the digits readable even when the marker
+            // line passes through them.
             let bar = egui::ProgressBar::new(frac.min(1.0) as f32)
                 .desired_width(220.0)
-                .fill(fill)
-                .text(
-                    RichText::new(format!("{:.0}%", frac * 100.0))
-                        .size(11.0)
-                        .strong(),
-                );
+                .fill(fill);
             let bar_resp = ui.add(bar);
+            let rect = bar_resp.rect;
             // Pace marker overlay: a 2px vertical line at the
             // elapsed-fraction-of-window position. Matches the tray
             // icon and CLI pace markers so the three surfaces tell
-            // the same time-vs-usage story. White over a red bar
-            // for contrast; red otherwise.
+            // the same time-vs-usage story. Magenta on every tier so
+            // it never blends into the green/amber/red/grey fill.
             if let Some(pace) = pace_fraction(label, w, chrono::Utc::now()) {
-                let rect = bar_resp.rect;
                 let x = rect.left() + (rect.width() * pace.clamp(0.0, 1.0) as f32);
-                let pace_color = if !w.stale && frac >= 0.85 {
-                    Color32::WHITE
-                } else {
-                    Color32::from_rgb(0xFF, 0x20, 0x20)
-                };
                 ui.painter().rect_filled(
                     egui::Rect::from_min_max(
                         egui::pos2(x, rect.top()),
                         egui::pos2(x + 2.0, rect.bottom()),
                     ),
                     0.0,
-                    pace_color,
+                    PACE_MARKER_COLOR,
                 );
             }
+            // Percentage label, painted last so it sits above both the
+            // fill and the pace marker. White for legibility on every
+            // tier colour.
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{:.0}%", frac * 100.0),
+                egui::FontId::proportional(11.0),
+                Color32::WHITE,
+            );
             // Reset countdown still shows when we know it, even for
             // stale rows — the user wants to know when fresh data
             // should be arriving. `secs.max(0)` clamps a lapsed
@@ -1313,6 +1318,11 @@ fn fmt_tokens(n: u64) -> String {
         n.to_string()
     }
 }
+
+/// Pace-marker colour, shared by every quota bar. Magenta so it stays
+/// distinct from the green/amber/red fill tiers and the grey stale
+/// tier — and matches the tray icon and CLI markers.
+const PACE_MARKER_COLOR: Color32 = Color32::from_rgb(0xE0, 0x40, 0xE0);
 
 fn fraction_color(frac: f64) -> Color32 {
     if frac < 0.60 {
