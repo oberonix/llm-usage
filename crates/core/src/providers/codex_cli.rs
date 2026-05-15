@@ -55,7 +55,7 @@ use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind, Window
 use crate::provider::Provider;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -79,9 +79,11 @@ struct FileState {
 }
 
 /// Stop tracking events older than this. The longest Codex bucket is
-/// "this week" (7 d) so a comfortable retention buffer keeps the
-/// trim cheap without losing in-window data.
-const EVENT_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 86_400);
+/// the calendar `month` window, which on the last day of a 31-day
+/// month reaches back ~31 days. 40 days keeps a comfortable buffer
+/// past that (plus timezone slop, since the month boundary is local
+/// while this trim is UTC) so the monthly totals never undercount.
+const EVENT_RETENTION: std::time::Duration = std::time::Duration::from_secs(40 * 86_400);
 
 /// Minimum gap between live `/backend-api/wham/usage` HTTP calls.
 /// Same rationale as Anthropic's `MIN_HTTP_INTERVAL`: the
@@ -348,15 +350,33 @@ impl Provider for CodexCliProvider {
 
         let five_hour_cutoff = now - Duration::hours(5);
         let week_cutoff = now - Duration::days(7);
+        let hour_cutoff = now - Duration::hours(1);
+        // `today` / `month` use calendar boundaries (local day, calendar
+        // month) to match the Anthropic card's `today` / `month` rows so
+        // the same label means the same span across providers.
+        let now_local = now.with_timezone(&chrono::Local);
 
         let mut bucket_5h = Bucket::default();
         let mut bucket_7d = Bucket::default();
+        let mut bucket_1h = Bucket::default();
+        let mut bucket_today = Bucket::default();
+        let mut bucket_month = Bucket::default();
         for e in &collected.events {
             if e.timestamp > five_hour_cutoff {
                 bucket_5h.add(e);
             }
             if e.timestamp > week_cutoff {
                 bucket_7d.add(e);
+            }
+            if e.timestamp > hour_cutoff {
+                bucket_1h.add(e);
+            }
+            let ts_local = e.timestamp.with_timezone(&chrono::Local);
+            if ts_local.date_naive() == now_local.date_naive() {
+                bucket_today.add(e);
+            }
+            if ts_local.year() == now_local.year() && ts_local.month() == now_local.month() {
+                bucket_month.add(e);
             }
         }
 
@@ -381,6 +401,27 @@ impl Provider for CodexCliProvider {
         ww.tokens_out = bucket_7d.output_tokens;
         ww.request_count = bucket_7d.turns;
         ww.spend_usd = Some(bucket_7d.cost_usd);
+
+        // Activity-only windows (1h / today / month). No quota fraction
+        // or reset — they render below the quota bars and give the
+        // Codex card the same density as Anthropic's. Skipped when the
+        // bucket is empty so an idle card doesn't grow three
+        // "no activity" rows. `spend_usd` is dropped later by
+        // `strip_spend()` when the user hasn't opted into spend.
+        for (kind, b) in [
+            (WindowKind::LastHour, &bucket_1h),
+            (WindowKind::Today, &bucket_today),
+            (WindowKind::ThisMonth, &bucket_month),
+        ] {
+            if b.turns == 0 {
+                continue;
+            }
+            let w = snap.window_mut(kind);
+            w.tokens_in = b.input_tokens;
+            w.tokens_out = b.output_tokens;
+            w.request_count = b.turns;
+            w.spend_usd = Some(b.cost_usd);
+        }
 
         // Apply the most recent rate-limit snapshot we observed.
         // Two sources, in order of precedence:
