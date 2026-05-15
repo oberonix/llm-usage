@@ -64,7 +64,6 @@ pub fn render(provider: ProviderId, session: BarSlot, weekly: BarSlot) -> Icon {
             SIZE_U,
             SESSION_HEIGHT,
             p,
-            session.fraction,
         );
     }
     draw_bar(
@@ -83,7 +82,6 @@ pub fn render(provider: ProviderId, session: BarSlot, weekly: BarSlot) -> Icon {
             SIZE_U,
             WEEKLY_HEIGHT,
             p,
-            weekly.fraction,
         );
     }
 
@@ -126,9 +124,6 @@ fn draw_pace_marker(
     w: usize,
     h: usize,
     pace: f64,
-    // Kept for call-site symmetry with the fill colour; the marker is
-    // now tier-independent so it's no longer read.
-    _fraction: Option<f64>,
 ) {
     if w == 0 {
         return;
