@@ -1,164 +1,155 @@
 # llm-usage
 
-Lightweight menu-bar widget showing your LLM account usage across
-**Anthropic / Codex / Ollama Cloud**, with quota alerts and a terminal
-companion view.
+**A menu-bar gauge for your AI coding quotas.** At a glance, see how
+close you are to your Anthropic, Codex, and Ollama Cloud limits — and
+get a desktop alert *before* you hit the wall mid-task, not after.
 
-- **Tray-only**: no Dock icon on macOS, no taskbar entry on Linux.
-- **Self-contained**: no network listeners, no telemetry, no auto-update,
-  no background phone-home — the only outbound call that isn't to one
-  of your data providers is an optional once-a-day check against
-  GitHub Releases (toggle in Settings, off keeps it silent).
-- **Configurable**: thresholds, budgets, polling cadence — all in one
-  TOML file, edited via a dashboard.
+If you live in Claude Code or the Codex CLI, you've felt the surprise
+of a five-hour or weekly cap landing in the middle of something. This
+is a tiny resident tray icon that turns that surprise into a glance:
+coloured quota bars, a pacing marker that shows whether you're burning
+faster than the clock, and threshold alerts you configure once.
 
-> ⚠️ **Best-effort by design.** Anthropic's `/api/oauth/usage`,
-> Codex CLI's local rate-limit snapshots, and Ollama Cloud's `/settings`
-> page are all unofficial sources we reverse-engineer. They can change
-> shape without notice. When they do, expect the corresponding provider
-> to show "parse failed" until we update the parser — open an issue with
-> the new payload shape and we'll iterate.
+It reads the **same local credentials and usage signals your tools
+already use** — nothing leaves your machine except the calls to your
+own providers (and one optional, off-by-default update check).
 
-## Status
+---
 
-Provider | Quota source | Spend source | Notes
----------|--------------|--------------|------
-Anthropic (Pro/Max) | `GET /api/oauth/usage` w/ token from `~/.claude/.credentials.json` | `~/.claude/projects/**/*.jsonl` × per-model pricing | Same endpoint Claude Code's own `/usage` view uses. Token refresh not implemented — re-auth via Claude Code if it expires.
-OpenAI API | (none — spend only) | `/v1/dashboard/billing/usage` | Unofficial endpoint; the widget surfaces "billing endpoint unavailable" if it 4xxs.
-Ollama (local) | n/a | `http://localhost:11434/api/ps` | No spend (local). Live model-loaded indicator.
-Codex CLI | `~/.codex/sessions/**` turn counts (5h, 7d) | reverse-engineered per-token | Best-effort; schema pinned to current Codex CLI.
-Gemini CLI | `~/.gemini/tmp/<proj>/chats/*.jsonl` turn counts | reverse-engineered per-token | Best-effort; schema pinned to gemini-cli 0.41.x.
-Ollama Cloud | `/settings` page scraped with a saved session cookie | (none — no usage API) | Best-effort; cookie expires every few weeks, dashboard flags when to re-capture. See [Linking your Ollama Cloud account](#linking-your-ollama-cloud-account).
+## Highlights
 
-### Spend display is opt-in
+- **At-a-glance tray icon.** Rotating per-provider quota bars right in
+  the menu bar / system tray. Green → amber → red as you approach a
+  cap, with a magenta pacing marker showing elapsed-time vs. usage so
+  you can tell "comfortably ahead" from "about to run out".
+- **Multi-provider.** Anthropic (Pro/Max), Codex CLI (ChatGPT plan),
+  and Ollama Cloud — each with the windows that matter (5-hour,
+  weekly, and activity rollups).
+- **Alerts before the wall.** Pick the fractions you care about
+  (`0.5, 0.75, 0.9`, …); get one desktop notification per threshold
+  per window. Debounced in SQLite so a restart never re-spams you.
+- **Privacy by construction.** No telemetry, no analytics, no
+  auto-update, no listening sockets, no background phone-home. The
+  only non-provider call is an optional once-a-day GitHub release
+  check that ships **off**.
+- **Spend is opt-in.** By default you see quotas only. Dollar amounts
+  and budget bars stay hidden until you explicitly turn them on,
+  per provider.
+- **Terminal companion.** A `llm-usage` CLI mirrors the tray in any
+  terminal — great for a tmux pane or `watch`.
+- **One config file**, editable from a built-in dashboard: thresholds,
+  budgets, poll cadence, per-model pricing overrides.
+- **Tray-only.** No Dock icon on macOS, no taskbar entry on Linux.
 
-By default each provider shows **quota only** — token counts, turn counts,
-and any plan-quota fractions. Dollar amounts (and dollar-budget progress
-bars) stay hidden until you flip `show_spend = true` under that provider's
-section in `config.toml`, or tick the matching checkbox in the dashboard's
-Settings tab. OpenAI is a special case: with no non-spend quota it shows
-"spend tracking hidden" until enabled.
+## Supported providers
 
-### Linking your Ollama Cloud account
+| Provider | Quota signal | Spend (opt-in) | Source of truth |
+|---|---|---|---|
+| **Anthropic** (Pro/Max) | 5h / weekly / weekly-Sonnet / weekly-Opus | local JSONL × per-model pricing | `GET /api/oauth/usage` using the OAuth token in `~/.claude/.credentials.json` — the same endpoint Claude Code's own `/usage` view uses |
+| **Codex CLI** (ChatGPT plan) | 5h / weekly + 1h/today/month activity | reverse-engineered per-token estimate | `~/.codex/sessions/**` rollouts; optional live quota via a saved chatgpt.com cookie |
+| **Ollama Cloud** | plan usage from the account page | — (no usage API) | `ollama.com/settings` scraped with a saved browser session cookie |
 
-Ollama publishes no usage API, so we authenticate to `/settings` with a
-browser session cookie. Two ways to grab it from the dashboard's
-Settings → Ollama Cloud section, neither of which requires copy-paste:
+> **Best-effort by design.** None of these sources is an official,
+> documented usage API — they're the same local files and endpoints
+> your tools use, parsed by us. Upstream can change shape without
+> notice; when it does the affected provider shows "parse failed"
+> until the parser is updated. Open an issue with the new payload
+> shape and we'll iterate.
 
-- **Sign in via popup window…** opens an embedded browser at
-  `ollama.com/signin`. After you log in and land on `/settings` the cookie
-  store is read automatically and saved. Requires the `llm-usage-setup`
-  binary (which needs `libwebkit2gtk-4.1-dev` on Linux).
-- **Import from browser…** reads the `ollama.com` cookie out of your
-  already-logged-in browser (Chrome / Firefox / Edge / Brave / Safari /
-  Vivaldi) via the [`rookie`](https://crates.io/crates/rookie) crate.
-  Zero clicks beyond the button. On Linux you may see a one-time keyring
-  prompt because Chrome's cookie DB is libsecret-encrypted.
+Earlier OpenAI-API, Gemini-CLI, and local-Ollama integrations were
+removed from the build because none exposed a real quota fraction
+(only spend or activity), which made for a noisy tray. They're kept,
+documented, and resurrectable under [`archived/`](archived/).
 
-A "Manual cookie (advanced)" collapsible is still there if you'd rather
-paste the `Cookie:` header yourself.
+## Install
 
-## Install and Run
+### From a release (recommended)
 
-For a source install, build all four binaries first:
+Grab the latest build from the
+[**Releases**](https://github.com/oberonix/llm-usage/releases) page.
+
+**Linux (x86_64):**
 
 ```bash
-cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
+tar xf llm-usage-*-linux-x86_64.tar.xz
+cd llm-usage-*-linux-x86_64
+sudo cp llm-usage{,-tray,-dashboard,-setup} /usr/local/bin/   # or ~/.local/bin/
+./llm-usage-tray &                                            # start the tray
 ```
 
-Then start the resident tray process:
+**macOS (Intel = `x86_64`, Apple Silicon = `aarch64`):**
 
 ```bash
-./target/release/llm-usage-tray
+unzip llm-usage-*-macos-*.zip
+mv llm-usage-*-macos-*/llm-usage.app /Applications/
+xattr -d com.apple.quarantine /Applications/llm-usage.app   # see note below
+open /Applications/llm-usage.app
 ```
 
-Keep `llm-usage-tray` running if you want the menu-bar icon, background
-polling, shared dashboard snapshots, and desktop alerts to stay alive.
-The dashboard and CLI are companion views; they do not replace the tray.
+> Release binaries are **unsigned**. macOS Gatekeeper refuses unsigned
+> apps on first launch; the `xattr` line tells it you've reviewed the
+> binary. Every release ships a `.sha256` next to each archive so you
+> can verify the download. Prefer not to run unsigned binaries? Build
+> from source instead.
 
-The easiest durable setup is:
+Then open **Settings** from the tray menu and turn on **Start tray at
+login** so the icon comes back after you sign in.
 
-1. Launch `llm-usage-tray`.
-2. Open **Settings** from the tray menu.
-3. Turn on **Start tray at login**.
+### From source
 
-That setting writes the platform login item for the tray binary so the
-icon comes back automatically after sign-in.
+Requires a recent stable Rust toolchain.
 
-### Linux (Pop!_OS / Ubuntu / Debian)
+**Linux (Pop!\_OS / Ubuntu / Debian):**
 
 ```bash
 sudo apt install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
     libwebkit2gtk-4.1-dev pkg-config libssl-dev
-cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
+cargo build --release \
+    -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
+./target/release/llm-usage-tray
 ```
 
-The four binaries land at:
-
-- `target/release/llm-usage-tray` — the tray app (always-running)
-- `target/release/llm-usage-dashboard` — opened on demand from the tray menu
-- `target/release/llm-usage-setup` — one-shot login window for Ollama Cloud,
-  spawned by the dashboard's "Set up login…" button
-- `target/release/llm-usage` — terminal/CLI usage view. By default it
-  watches the tray's shared snapshot file and redraws the quota bars
-  whenever a new poll lands, so a small terminal window on the side of
-  your screen mirrors the tray. Pass `--once` to render a single frame
-  and exit (useful for scripts or `watch -n N`), or `--refresh` to ask
-  the tray to poll right away.
-
-### Putting `llm-usage` on `PATH`
-
-Pick whichever you prefer. The first option doesn't need sudo and is
-the most idiomatic for Rust toolchains:
+**macOS:**
 
 ```bash
-# Recommended: cargo's own bin dir (already on PATH for rustup users)
-cargo install --path crates/cli
-
-# Or symlink the release build into a user-local bin dir
-mkdir -p ~/.local/bin
-ln -sf "$(pwd)/target/release/llm-usage" ~/.local/bin/
-
-# If ~/.local/bin isn't on PATH yet:
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
-source ~/.bashrc
-
-# Or system-wide (needs sudo)
-sudo ln -sf "$(pwd)/target/release/llm-usage" /usr/local/bin/
-```
-
-Then anywhere in a terminal: `llm-usage`.
-
-### macOS
-
-```bash
-cargo build --release -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
-cargo install cargo-bundle
+cargo build --release \
+    -p llm-usage-tray -p llm-usage-dashboard -p llm-usage-setup -p llm-usage
+cargo install cargo-bundle --locked
 cargo bundle --release -p llm-usage-tray
 open target/release/bundle/osx/llm-usage.app
 ```
 
-The bundle's `Info.plist` sets `LSUIElement=true`, so the app runs tray-only with
-no Dock icon.
+The four binaries are:
 
-> Pre-built release archives are unsigned. After unpacking the
-> `macos-*.zip` and moving the `.app` to `/Applications`, run
-> `xattr -d com.apple.quarantine /Applications/llm-usage.app` once
-> so Gatekeeper will let it launch. Build from source if you'd
-> rather avoid that step.
+| Binary | Role |
+|---|---|
+| `llm-usage-tray` | The resident tray app — keep this running. Does the polling, owns the menu-bar icon, fires alerts, writes the shared snapshot. |
+| `llm-usage-dashboard` | On-demand window opened from the tray menu. Quota bars, history, and the Settings form. |
+| `llm-usage-setup` | One-shot login window for capturing the Ollama Cloud cookie; spawned by the dashboard. |
+| `llm-usage` | Terminal view that mirrors the tray. `--once` for a single frame (scripts / `watch`); `--refresh` to force a poll. |
 
-## Test the providers without the tray UI
+The dashboard and CLI are **companion views** — they don't replace the
+tray. Keep `llm-usage-tray` running for the icon, polling, and alerts.
 
-If you don't have the system GUI deps yet, you can still run the data-source
-side end-to-end:
+To put the CLI on `PATH`: `cargo install --path crates/cli`, or symlink
+`target/release/llm-usage` into `~/.local/bin/`.
+
+### Try it without the GUI
+
+No system GUI deps installed? You can still exercise the whole
+data-source side:
 
 ```bash
 cargo run -p llm-usage-core --example print_snapshots
 ```
 
-This polls every enabled provider once, prints what it found, and exits.
+This polls every enabled provider once, prints what it found, exits.
 
-## Config
+## Configuration
+
+Copy the example config into place and edit it (the dashboard's
+Settings tab writes the same file, so most people never touch it by
+hand):
 
 ```bash
 # Linux
@@ -170,33 +161,97 @@ mkdir -p "$HOME/Library/Application Support/dev.buffbit.llm-usage"
 cp config.example.toml "$HOME/Library/Application Support/dev.buffbit.llm-usage/config.toml"
 ```
 
-Edit thresholds, budgets, API keys, and per-model pricing overrides as needed.
-The app reads the file on each startup; restart after editing.
+Thresholds, budgets, poll cadence, and per-model pricing overrides all
+live there. The tray reads it on startup; restart after a hand-edit
+(or just use the dashboard, which applies changes live).
 
-## Autostart
+### Spend display is opt-in
 
-The dashboard's **Start tray at login** setting is the recommended path.
-It creates or removes the same platform files shown below and points them
-at the built `llm-usage-tray` binary.
+Every provider shows **quota only** by default — token/turn counts and
+plan-quota fractions. Dollar amounts and budget bars stay hidden until
+you flip `show_spend = true` for that provider (or tick its checkbox in
+Settings).
 
-### Linux
+### Linking your Ollama Cloud account
+
+Ollama publishes no usage API, so the app reads your logged-in
+`ollama.com/settings` page with a browser session cookie. Two
+one-click ways to capture it from **Settings → Ollama Cloud**, neither
+needing copy-paste:
+
+- **Import from browser…** — reads the `ollama.com` cookie from a
+  browser you're already logged into (Chrome / Firefox / Edge / Brave /
+  Safari / Vivaldi) via the [`rookie`](https://crates.io/crates/rookie)
+  crate. On Linux you may get a one-time keyring prompt because
+  Chrome's cookie DB is libsecret-encrypted.
+- **Sign in via popup window…** — opens an embedded browser at
+  `ollama.com/signin`; once you land on `/settings` the cookie is
+  saved automatically. Needs `llm-usage-setup` (and
+  `libwebkit2gtk-4.1-dev` on Linux).
+
+There's also a "Manual cookie (advanced)" field if you'd rather paste
+the `Cookie:` header yourself. The cookie expires every few weeks; the
+dashboard surfaces a "session likely expired" hint so you know when to
+re-capture.
+
+### Autostart
+
+The dashboard's **Start tray at login** toggle is the recommended
+path — it writes the platform login item pointing at your actual
+`llm-usage-tray` binary. The equivalents by hand:
 
 ```bash
+# Linux
 mkdir -p ~/.config/autostart
 sed "s#Exec=llm-usage-tray#Exec=$(pwd)/target/release/llm-usage-tray#" \
     packaging/linux/llm-usage.desktop > ~/.config/autostart/llm-usage.desktop
-```
 
-### macOS
-
-```bash
+# macOS
 cp packaging/macos/dev.buffbit.llm-usage.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.buffbit.llm-usage.plist
 ```
 
-For macOS source builds outside `/Applications/llm-usage.app`, prefer the
-Settings toggle because it writes the actual path to your local
-`llm-usage-tray` binary.
+## Privacy — what leaves your machine
+
+This is the whole point, so it's worth stating plainly:
+
+- **Outbound traffic** goes only to your own providers:
+  `api.anthropic.com`, `chatgpt.com` (only if you've supplied a Codex
+  cookie), and `ollama.com` (only if you've linked Ollama Cloud).
+- **The one exception** is an optional GitHub Releases check
+  (`api.github.com`, the `releases/latest` endpoint, at most once a
+  day). It ships **off** (`check_for_updates`) and is a single
+  Settings toggle.
+- **No telemetry, no analytics, no auto-update, no listening
+  sockets.** Your credentials are read locally and used only to talk
+  to the provider they belong to.
+- The shared `snapshots.json` the tray writes for the dashboard/CLI
+  contains usage counts and percentages **only** — never tokens,
+  cookies, or keys.
+
+See [`SECURITY.md`](SECURITY.md) for the threat model and how to
+report an issue.
+
+## Caveats
+
+- **Anthropic quota needs a Claude Code login on this machine.** It
+  reuses the OAuth token in `~/.claude/.credentials.json`. No token,
+  no quota line — set `enabled = false` for `[anthropic]` if that's
+  permanent for you. Token refresh isn't implemented; if it expires,
+  re-auth via Claude Code. Dollar spend is computed from Claude Code's
+  local JSONL × per-model pricing (plus opencode's SQLite store,
+  filtered to the `anthropic` providerID, if you use it).
+- **Codex CLI on the ChatGPT plan has no public API.** Quota comes
+  from the local `~/.codex/sessions/` rollouts (schema
+  reverse-engineered, may break across Codex releases) or, if you've
+  supplied a chatgpt.com cookie, the live quota endpoint. opencode's
+  per-message store is folded in for users who drive OpenAI through
+  opencode.
+- **Ollama Cloud** is a session-cookie scrape of `/settings`; the
+  cookie expires every few weeks (the dashboard tells you when).
+- **GNOME** needs the *AppIndicator and KStatusNotifierItem Support*
+  extension. Pop!\_OS COSMIC and most other desktops work out of the
+  box.
 
 ## Architecture
 
@@ -204,40 +259,22 @@ Settings toggle because it writes the actual path to your local
 crates/
   core/        # provider trait, parsers, pricing, quota engine, sqlite store
   ui/          # tray binary (tray-icon + tao + tokio runtime)
-  dashboard/   # on-demand egui window (separate binary, only loaded when opened)
+  dashboard/   # on-demand egui window (separate binary, loaded only when opened)
+  setup/       # one-shot Ollama Cloud cookie-capture window
+  cli/         # terminal companion view
 ```
 
-Polling runs on a tokio worker thread; the main thread is the tao event loop
-(required by macOS's NSStatusItem). State updates flow main-thread-ward via
-`std::sync::mpsc`. Alerts are debounced per `(provider, window, threshold)`
-in SQLite so restarts don't re-fire.
+Polling runs on a tokio worker thread; the main thread is the tao
+event loop (required by macOS's `NSStatusItem`). State flows
+main-thread-ward via `std::sync::mpsc`. Alerts are debounced per
+`(provider, window, threshold)` in SQLite so restarts don't re-fire.
 
-## Caveats
+## Contributing
 
-- **Anthropic quota requires Claude Code login.** We pull `five_hour` /
-  `seven_day` / `seven_day_sonnet` / `seven_day_opus` from the same
-  `/api/oauth/usage` endpoint Claude Code uses, authenticated with the
-  OAuth token in `~/.claude/.credentials.json`. If you've never logged
-  into Claude Code on this machine, the quota line will be blank — set
-  `enabled = false` for `[anthropic]` if that's permanent for you.
-- **Anthropic dollar spend** is computed from Claude Code's local
-  JSONL × per-model pricing. Raw API usage made via other clients is
-  visible only if you point opencode at the API (we read opencode's
-  SQLite store too, filtered to the `anthropic` providerID).
-- **Codex CLI on the ChatGPT plan has no public API.** We read the
-  local `~/.codex/sessions/` rollouts; the schema is reverse-engineered
-  and may break across Codex CLI releases. opencode's per-message
-  store is also folded in for users who drive OpenAI through opencode
-  rather than the codex CLI directly.
-- **Ollama Cloud** has no usage API either; we scrape the logged-in
-  `/settings` page using a session cookie captured by
-  `llm-usage-setup`. Cookie expires every few weeks — the dashboard
-  surfaces a "session cookie likely expired" hint when that happens
-  so you can re-run the setup capture.
-- **GNOME** users will need the `AppIndicator and KStatusNotifierItem
-  Support` extension. Pop!_OS COSMIC and most other desktops work out of
-  the box.
+PRs welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). New provider
+integrations have a non-obvious data shape, so please open an issue to
+agree on the source of truth before a big PR.
 
 ## License
 
-MIT.
+[MIT](LICENSE).

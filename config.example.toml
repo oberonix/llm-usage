@@ -11,8 +11,8 @@ poll_interval_secs = 900
 # Default 15 s; clamps to a minimum of 5 s.
 icon_rotation_secs = 15
 
-# Draw a 1 px red line across each tray-icon bar at the elapsed fraction of
-# the corresponding time window. Off keeps the icon as just the fill bars.
+# Draw a 1 px magenta line across each tray-icon bar at the elapsed fraction
+# of the corresponding time window. Off keeps the icon as just the fill bars.
 show_pace_marker = true
 
 # Once a day, the tray asks GitHub whether a newer release has been

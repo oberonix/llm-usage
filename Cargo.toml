@@ -6,7 +6,9 @@ members = ["crates/core", "crates/ui", "crates/dashboard", "crates/setup", "crat
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Menu-bar gauge for AI coding quotas — Anthropic, Codex, and Ollama Cloud usage with threshold alerts."
 repository = "https://github.com/oberonix/llm-usage"
+homepage = "https://github.com/oberonix/llm-usage"
 rust-version = "1.80"
 
 # Workspace-wide clippy tuning. These opt-outs silence style lints

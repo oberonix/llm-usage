@@ -34,7 +34,21 @@ cargo test --workspace
 cargo run -p llm-usage-core --example print_snapshots   # headless smoke
 ```
 
-CI runs the same on every PR; see `.github/workflows/ci.yml`.
+CI runs the same on every PR; see `.github/workflows/ci.yml`. It also
+enforces `cargo clippy --workspace -- -D warnings`, a `cargo deny`
+licence/advisory audit, and a line-coverage floor.
+
+Coverage locally:
+
+```bash
+cargo llvm-cov --workspace --summary-only          # numbers
+cargo llvm-cov --workspace --html                  # clickable per-file report
+```
+
+The pure-logic modules (`model`, `pricing`, `quota`, `config`) should
+stay at or near 100 %; the GUI / event-loop / live-network paths are
+deliberately not chased to 100 % because mocking the framework costs
+more than the bugs it would catch.
 
 ## Adding a new provider
 

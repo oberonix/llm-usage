@@ -1,4 +1,14 @@
 /target
+/dist
 **/*.rs.bk
 .DS_Store
 *.swp
+
+# Local user config — never commit a real config.toml (may carry a
+# session cookie / budgets). The committed template is config.example.toml.
+/config.toml
+config.toml
+
+# Scratch review diffs produced by the pre-commit review tooling.
+*.diff_second-opinion*.patch
+.diff_second-opinion*.patch
