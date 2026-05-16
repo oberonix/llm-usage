@@ -71,54 +71,40 @@ jobs:
             dist/*.tar.xz
             dist/*.sha256
 
-  build-macos:
-    name: build (${{ matrix.label }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-13
-            target: x86_64-apple-darwin
-            label: macos-x86_64
-          - runner: macos-14
-            target: aarch64-apple-darwin
-            label: macos-aarch64
-    runs-on: ${{ matrix.runner }}
+  # Apple Silicon — a required release platform. GitHub's macos-14
+  # (arm64) runners are reliably available.
+  build-macos-arm:
+    name: build (macos-aarch64)
+    runs-on: macos-14
+    env:
+      TARGET: aarch64-apple-darwin
+      LABEL: macos-aarch64
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-
       - run: cargo install cargo-bundle --locked || true
-
       # Same rationale as the Linux job — re-test the tagged commit
       # so a workflow_dispatch with a stale tag can't ship a broken
-      # macOS .app. macOS runners can build everything without
-      # apt-get prerequisites.
-      - run: cargo test --workspace --release --target ${{ matrix.target }}
-
+      # macOS .app.
+      - run: cargo test --workspace --release --target "$TARGET"
       - name: Build binaries
         run: |
-          cargo build --release --target ${{ matrix.target }} \
-            -p llm-usage-tray \
-            -p llm-usage-dashboard \
-            -p llm-usage-setup \
-            -p llm-usage
-
+          cargo build --release --target "$TARGET" \
+            -p llm-usage-tray -p llm-usage-dashboard \
+            -p llm-usage-setup -p llm-usage
       - name: Bundle the tray app
         run: |
-          cargo bundle --release --target ${{ matrix.target }} -p llm-usage-tray
+          cargo bundle --release --target "$TARGET" -p llm-usage-tray
           # cargo-bundle only knows about the tray binary; copy the
           # sibling binaries into the same MacOS/ dir so the tray's
-          # `spawn_dashboard` / `--popup` / setup paths work when users
-          # run from /Applications.
-          APP="target/${{ matrix.target }}/release/bundle/osx/llm-usage.app"
-          cp target/${{ matrix.target }}/release/llm-usage-dashboard "$APP/Contents/MacOS/"
-          cp target/${{ matrix.target }}/release/llm-usage-setup     "$APP/Contents/MacOS/"
-          cp target/${{ matrix.target }}/release/llm-usage           "$APP/Contents/MacOS/"
-
+          # spawn-dashboard / setup paths work when run from /Applications.
+          APP="target/$TARGET/release/bundle/osx/llm-usage.app"
+          cp "target/$TARGET/release/llm-usage-dashboard" "$APP/Contents/MacOS/"
+          cp "target/$TARGET/release/llm-usage-setup"     "$APP/Contents/MacOS/"
+          cp "target/$TARGET/release/llm-usage"           "$APP/Contents/MacOS/"
       - name: Package
         run: |
           set -e
@@ -127,25 +113,83 @@ jobs:
             VERSION="${{ inputs.tag }}"
             VERSION="${VERSION#v}"
           fi
-          STAGE="llm-usage-${VERSION}-${{ matrix.label }}"
+          STAGE="llm-usage-${VERSION}-${LABEL}"
           mkdir -p "dist/${STAGE}"
-          cp -R "target/${{ matrix.target }}/release/bundle/osx/llm-usage.app" "dist/${STAGE}/"
+          cp -R "target/$TARGET/release/bundle/osx/llm-usage.app" "dist/${STAGE}/"
           cp LICENSE README.md config.example.toml "dist/${STAGE}/"
           cp packaging/macos/dev.buffbit.llm-usage.plist "dist/${STAGE}/"
           (cd dist && zip -r "${STAGE}.zip" "${STAGE}")
           (cd dist && shasum -a 256 "${STAGE}.zip" > "${STAGE}.zip.sha256")
           ls -la dist
-
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.label }}
+          name: macos-aarch64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+
+  # Intel macOS — best-effort. GitHub's macos-13 (x86_64) runners are
+  # frequently backlogged for hours; `continue-on-error` plus the fact
+  # that `publish` does NOT list this job in `needs` means a stuck or
+  # failed Intel build never blocks the release. If it finishes before
+  # `publish` runs its artifact is picked up (merge-multiple); if not,
+  # the release ships without an Intel asset and one can be added later
+  # via a `workflow_dispatch` re-run of this workflow.
+  build-macos-intel:
+    name: build (macos-x86_64, best-effort)
+    runs-on: macos-13
+    continue-on-error: true
+    timeout-minutes: 60
+    env:
+      TARGET: x86_64-apple-darwin
+      LABEL: macos-x86_64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-bundle --locked || true
+      - run: cargo test --workspace --release --target "$TARGET"
+      - name: Build binaries
+        run: |
+          cargo build --release --target "$TARGET" \
+            -p llm-usage-tray -p llm-usage-dashboard \
+            -p llm-usage-setup -p llm-usage
+      - name: Bundle the tray app
+        run: |
+          cargo bundle --release --target "$TARGET" -p llm-usage-tray
+          APP="target/$TARGET/release/bundle/osx/llm-usage.app"
+          cp "target/$TARGET/release/llm-usage-dashboard" "$APP/Contents/MacOS/"
+          cp "target/$TARGET/release/llm-usage-setup"     "$APP/Contents/MacOS/"
+          cp "target/$TARGET/release/llm-usage"           "$APP/Contents/MacOS/"
+      - name: Package
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="${{ inputs.tag }}"
+            VERSION="${VERSION#v}"
+          fi
+          STAGE="llm-usage-${VERSION}-${LABEL}"
+          mkdir -p "dist/${STAGE}"
+          cp -R "target/$TARGET/release/bundle/osx/llm-usage.app" "dist/${STAGE}/"
+          cp LICENSE README.md config.example.toml "dist/${STAGE}/"
+          cp packaging/macos/dev.buffbit.llm-usage.plist "dist/${STAGE}/"
+          (cd dist && zip -r "${STAGE}.zip" "${STAGE}")
+          (cd dist && shasum -a 256 "${STAGE}.zip" > "${STAGE}.zip.sha256")
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-x86_64
           path: |
             dist/*.zip
             dist/*.sha256
 
   publish:
     name: publish release
-    needs: [build-linux, build-macos]
+    # Intentionally NOT waiting on build-macos-intel (best-effort).
+    needs: [build-linux, build-macos-arm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

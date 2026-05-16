@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/core", "crates/ui", "crates/dashboard", "crates/setup", "crates/cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Menu-bar gauge for AI coding quotas — Anthropic, Codex, and Ollama Cloud usage with threshold alerts."
