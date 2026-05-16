@@ -65,6 +65,7 @@ pub struct ConfigDraft {
     /// (rookie reads from Chrome / Brave / Firefox / etc).
     pub codex_chatgpt_session_cookie: String,
     pub codex_chatgpt_setup_status: Option<String>,
+    pub codex_chatgpt_setup_rx: Option<std::sync::mpsc::Receiver<SetupResult>>,
 
     pub ollama_cloud_enabled: bool,
     pub ollama_cloud_session_cookie: String,
@@ -79,6 +80,31 @@ pub enum SetupResult {
     /// Setup tool exited successfully; config.toml was rewritten.
     Captured,
     Failed(String),
+}
+
+/// Which provider's embedded sign-in window to launch. Maps to the
+/// `llm-usage-setup` binary's positional target arg and selects which
+/// draft fields the captured cookie flows back into.
+#[derive(Clone, Copy)]
+pub enum SetupTarget {
+    OllamaCloud,
+    Codex,
+}
+
+impl SetupTarget {
+    /// Positional arg passed to the `llm-usage-setup` binary.
+    fn arg(self) -> &'static str {
+        match self {
+            SetupTarget::OllamaCloud => "ollama",
+            SetupTarget::Codex => "codex",
+        }
+    }
+    fn signin_label(self) -> &'static str {
+        match self {
+            SetupTarget::OllamaCloud => "Ollama Cloud",
+            SetupTarget::Codex => "chatgpt.com",
+        }
+    }
 }
 
 impl ConfigDraft {
@@ -107,6 +133,7 @@ impl ConfigDraft {
                 .clone()
                 .unwrap_or_default(),
             codex_chatgpt_setup_status: None,
+            codex_chatgpt_setup_rx: None,
 
             ollama_cloud_enabled: c.ollama_cloud.enabled,
             ollama_cloud_session_cookie: c.ollama_cloud.session_cookie.clone().unwrap_or_default(),
@@ -161,25 +188,45 @@ impl ConfigDraft {
     /// thread. The thread blocks on the child's exit, then sends a
     /// `SetupResult` back to the UI via mpsc — `poll_setup_result` picks
     /// it up on the next frame and refreshes the captured-cookie field.
-    fn start_setup_tool(&mut self) {
+    fn start_setup_tool(&mut self, target: SetupTarget) {
         let (tx, rx) = std::sync::mpsc::channel();
         let exe = match resolve_setup_binary() {
             Some(p) => p,
             None => {
-                self.ollama_cloud_setup_status =
-                    Some("Could not find llm-usage-setup binary next to the dashboard.".into());
+                let msg =
+                    Some("Could not find llm-usage-setup binary next to the dashboard.".to_string());
+                match target {
+                    SetupTarget::OllamaCloud => self.ollama_cloud_setup_status = msg,
+                    SetupTarget::Codex => self.codex_chatgpt_setup_status = msg,
+                }
                 return;
             }
         };
-        self.ollama_cloud_setup_rx = Some(rx);
-        self.ollama_cloud_setup_status = Some(
-            "Setup window opened — sign in to Ollama Cloud; the form will \
-             refresh automatically when capture completes."
-                .into(),
-        );
+        let status = Some(format!(
+            "Setup window opened — sign in to {}; the form will refresh \
+             automatically when capture completes.",
+            target.signin_label()
+        ));
+        match target {
+            SetupTarget::OllamaCloud => {
+                self.ollama_cloud_setup_rx = Some(rx);
+                self.ollama_cloud_setup_status = status;
+            }
+            SetupTarget::Codex => {
+                self.codex_chatgpt_setup_rx = Some(rx);
+                self.codex_chatgpt_setup_status = status;
+            }
+        }
+        let arg = target.arg();
         std::thread::spawn(move || {
-            let result = match std::process::Command::new(&exe).status() {
+            let result = match std::process::Command::new(&exe).arg(arg).status() {
                 Ok(status) if status.success() => SetupResult::Captured,
+                // Exit code 2 = the setup window was closed before
+                // sign-in completed (see crates/setup). Surface that as
+                // a plain "cancelled", not a scary error.
+                Ok(status) if status.code() == Some(2) => {
+                    SetupResult::Failed("cancelled — window closed before sign-in".into())
+                }
                 Ok(status) => SetupResult::Failed(format!("setup tool exited with {}", status)),
                 Err(e) => SetupResult::Failed(format!("spawn failed: {}", e)),
             };
@@ -240,27 +287,62 @@ impl ConfigDraft {
     /// Drain any pending setup result from the channel and apply it to
     /// the form. Called once per frame from `render`.
     fn poll_setup_result(&mut self) {
-        let Some(rx) = &self.ollama_cloud_setup_rx else {
-            return;
-        };
-        let Ok(result) = rx.try_recv() else {
-            return;
-        };
-        match result {
-            SetupResult::Captured => {
-                if let Ok(cfg) = config::Config::load_or_default() {
-                    self.ollama_cloud_session_cookie =
-                        cfg.ollama_cloud.session_cookie.clone().unwrap_or_default();
-                    self.ollama_cloud_enabled = cfg.ollama_cloud.enabled;
+        use std::sync::mpsc::TryRecvError;
+
+        // Ollama Cloud channel.
+        if let Some(rx) = &self.ollama_cloud_setup_rx {
+            match rx.try_recv() {
+                Ok(SetupResult::Captured) => {
+                    if let Ok(cfg) = config::Config::load_or_default() {
+                        self.ollama_cloud_session_cookie =
+                            cfg.ollama_cloud.session_cookie.clone().unwrap_or_default();
+                        self.ollama_cloud_enabled = cfg.ollama_cloud.enabled;
+                    }
+                    self.ollama_cloud_setup_status =
+                        Some("Captured. Cookie saved to config.toml.".into());
+                    self.ollama_cloud_setup_rx = None;
                 }
-                self.ollama_cloud_setup_status =
-                    Some("Captured. Cookie saved to config.toml.".into());
-            }
-            SetupResult::Failed(e) => {
-                self.ollama_cloud_setup_status = Some(format!("Setup failed: {}", e));
+                Ok(SetupResult::Failed(e)) => {
+                    self.ollama_cloud_setup_status = Some(format!("Setup failed: {}", e));
+                    self.ollama_cloud_setup_rx = None;
+                }
+                // Setup thread vanished without a verdict (panicked /
+                // killed). Don't leave the UI wedged "in progress".
+                Err(TryRecvError::Disconnected) => {
+                    self.ollama_cloud_setup_status =
+                        Some("Setup ended unexpectedly — please try again.".into());
+                    self.ollama_cloud_setup_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
             }
         }
-        self.ollama_cloud_setup_rx = None;
+        // Codex (chatgpt.com) channel.
+        if let Some(rx) = &self.codex_chatgpt_setup_rx {
+            match rx.try_recv() {
+                Ok(SetupResult::Captured) => {
+                    if let Ok(cfg) = config::Config::load_or_default() {
+                        self.codex_chatgpt_session_cookie = cfg
+                            .codex_cli
+                            .chatgpt_session_cookie
+                            .clone()
+                            .unwrap_or_default();
+                    }
+                    self.codex_chatgpt_setup_status =
+                        Some("Captured. Cookie saved to config.toml.".into());
+                    self.codex_chatgpt_setup_rx = None;
+                }
+                Ok(SetupResult::Failed(e)) => {
+                    self.codex_chatgpt_setup_status = Some(format!("Setup failed: {}", e));
+                    self.codex_chatgpt_setup_rx = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.codex_chatgpt_setup_status =
+                        Some("Setup ended unexpectedly — please try again.".into());
+                    self.codex_chatgpt_setup_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
     }
 
     pub fn render(&mut self, ui: &mut egui::Ui) {
@@ -397,18 +479,23 @@ impl ConfigDraft {
             });
 
             let captured = !self.codex_chatgpt_session_cookie.is_empty();
+            let in_flight = self.codex_chatgpt_setup_rx.is_some();
             let mut import_now = false;
+            let mut launch_now = false;
             render_cookie_import_block(
                 ui,
                 "Sign in",
                 "chatgpt.com",
                 captured,
-                /*in_flight*/ false,
-                /*allow_popup*/ false,
+                in_flight,
+                /*allow_popup*/ true,
                 /*on_import*/ &mut |_| import_now = true,
-                /*on_popup*/ &mut |_| {},
+                /*on_popup*/ &mut |_| launch_now = true,
                 self.codex_chatgpt_setup_status.as_deref(),
             );
+            if launch_now {
+                self.start_setup_tool(SetupTarget::Codex);
+            }
             if import_now {
                 self.import_chatgpt_cookies_from_browser();
             }
@@ -510,7 +597,7 @@ impl ConfigDraft {
             );
 
             if launch_now {
-                self.start_setup_tool();
+                self.start_setup_tool(SetupTarget::OllamaCloud);
             }
             if import_now {
                 self.import_from_browser();
