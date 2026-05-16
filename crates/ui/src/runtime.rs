@@ -115,7 +115,18 @@ pub(crate) async fn poll_once(
         // with intermittent endpoints (Anthropic OAuth, Ollama
         // session-cookie scrape, etc.) keep showing their last
         // known quotas with a ⚠ marker rather than vanishing.
-        if let Some(cached) = snapshots.get(&provider.id()) {
+        if let Some(cached) = snapshots.get_mut(&provider.id()) {
+            // Forward-migrate caches written by an older build: a
+            // snapshot.json predating the `subview` field deserialises
+            // those windows as `subview = false`, so `merge_stale_from`
+            // would graft a per-model window back as a false-stale
+            // ghost. Re-stamp the provider's declared sub-view labels
+            // before merging so old caches behave like new ones.
+            for label in provider.subview_labels() {
+                if let Some(w) = cached.windows.get_mut(*label) {
+                    w.subview = true;
+                }
+            }
             let n = snapshot.merge_stale_from(cached);
             if n > 0 {
                 tracing::debug!(
@@ -309,6 +320,14 @@ mod tests {
         fn enabled(&self) -> bool {
             self.enabled
         }
+        fn subview_labels(&self) -> &'static [&'static str] {
+            // Mirror the real AnthropicProvider so the cache-migration
+            // path is exercised under test.
+            match self.id {
+                ProviderId::Anthropic => &["Sonnet", "Opus"],
+                _ => &[],
+            }
+        }
         async fn poll(&self) -> anyhow::Result<UsageSnapshot> {
             let mut q = self.responses.lock().unwrap();
             if q.is_empty() {
@@ -409,6 +428,49 @@ mod tests {
         let grafted = &snaps.get(&ProviderId::Anthropic).unwrap().windows["5h"];
         assert!(grafted.stale, "expected stale flag after graft");
         assert_eq!(grafted.fraction_used, Some(0.55));
+    }
+
+    #[tokio::test]
+    async fn poll_once_legacy_cached_subview_not_grafted_as_stale() {
+        // Regression: a snapshots.json written by an older build has a
+        // per-model "Sonnet" window with NO `subview` field, so it
+        // deserialises as `subview = false`. A fresh poll where
+        // Anthropic omitted the idle Sonnet bucket must NOT graft that
+        // legacy window back as a false-stale ghost — the runtime
+        // re-stamps the provider's subview labels on the cache first.
+        let (mut snaps, mut engine, store) = fresh_state();
+
+        let mut legacy = snap_with_fraction(ProviderId::Anthropic, "5h", 0.40);
+        legacy.windows.insert(
+            "Sonnet".to_string(),
+            WindowUsage {
+                fraction_used: Some(0.01),
+                subview: false, // legacy on-disk shape
+                ..Default::default()
+            },
+        );
+        snaps.insert(ProviderId::Anthropic, legacy);
+
+        // Fresh poll: 5h present and fresh, no Sonnet (idle class).
+        let providers = vec![FakeProvider::ok(
+            ProviderId::Anthropic,
+            snap_with_fraction(ProviderId::Anthropic, "5h", 0.06),
+        )];
+        poll_once(&providers, &mut snaps, &mut engine, &store).await;
+
+        let result = snaps.get(&ProviderId::Anthropic).unwrap();
+        assert!(
+            !result.windows.contains_key("Sonnet"),
+            "legacy Sonnet sub-view must not be grafted back from cache"
+        );
+        let w5 = &result.windows["5h"];
+        assert_eq!(w5.fraction_used, Some(0.06), "fresh 5h wins");
+        assert!(!w5.stale, "5h is fresh — no stale ⚠");
+        assert!(
+            matches!(result.status, ProviderStatus::Ok),
+            "no spurious degrade when quota is actually fresh"
+        );
+        assert!(result.error.is_none(), "no bare ⚠ reason");
     }
 
     #[tokio::test]

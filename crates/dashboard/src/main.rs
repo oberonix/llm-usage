@@ -641,6 +641,7 @@ fn render_provider_card(ui: &mut egui::Ui, snap: &UsageSnapshot) {
             snap.status,
             tint,
             any_stale,
+            snap.error.as_deref(),
         );
         // Headline removed: the window grid below already shows the
         // same percentages and reset times; the headline duplicated
@@ -1248,6 +1249,7 @@ fn header_row(
     _status: ProviderStatus,
     _tint: Color32,
     any_stale: bool,
+    stale_reason: Option<&str>,
 ) {
     // Provider name and plan tag share one bold label so the dash sits
     // mid-line in the same style. The left-edge accent stripe on the
@@ -1262,12 +1264,20 @@ fn header_row(
     ui.horizontal(|ui| {
         ui.label(RichText::new(title).strong().size(15.5));
         if any_stale {
+            // The ⚠ must never be bare: hovering it explains the class
+            // of problem (rate-limited, throttled, fetch failed, …).
+            // `stale_reason` is the snapshot's own error when set; the
+            // generic fallback still beats an unexplained red mark.
+            let reason = stale_reason.unwrap_or(
+                "Showing cached data — the latest poll didn't return fresh numbers for this provider",
+            );
             ui.label(
                 RichText::new(llm_usage_core::model::STALE_MARKER)
                     .color(Color32::from_rgb(220, 60, 60))
                     .strong()
                     .size(15.5),
-            );
+            )
+            .on_hover_text(reason);
         }
     });
 }

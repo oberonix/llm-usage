@@ -360,6 +360,12 @@ impl Provider for AnthropicProvider {
     fn enabled(&self) -> bool {
         self.cfg.enabled
     }
+    fn subview_labels(&self) -> &'static [&'static str] {
+        // Per-model weekly buckets — Anthropic omits them when that
+        // class is idle, so they must mirror the live response and
+        // never be grafted back from cache.
+        &["Sonnet", "Opus"]
+    }
     async fn poll(&self) -> Result<UsageSnapshot> {
         let now = Utc::now();
         let agg = self.aggregate(now)?;
@@ -523,11 +529,21 @@ impl Provider for AnthropicProvider {
             None
         };
 
-        // Soften status to Degraded when we have spend data but couldn't
-        // reach the quota endpoint — the menu still shows useful info but
-        // the user knows quota numbers may be stale.
+        // Soften status to Degraded when we couldn't reach the quota
+        // endpoint — the menu still shows useful info but the user
+        // knows quota numbers may be stale. The throttle / rate-limit
+        // reason is what explains the ⚠, so it always wins the error
+        // chip: previously it was dropped whenever an unrelated earlier
+        // condition (e.g. a missing claude_projects_dir) had already
+        // degraded the status, leaving the user with a ⚠ and no reason.
+        // We still don't upgrade a worse status (Unavailable) back down.
         if let Some(err) = quota_error {
-            if matches!(snap.status, ProviderStatus::Ok) {
+            if matches!(snap.status, ProviderStatus::Unavailable) {
+                // A harder failure already owns the status; only fill
+                // in the reason if nothing explained it yet, so we
+                // never mask a root-cause error with the quota one.
+                snap.error.get_or_insert(err);
+            } else {
                 snap.status = ProviderStatus::Degraded;
                 snap.error = Some(err);
             }
@@ -567,13 +583,38 @@ fn apply_oauth_usage(
     // them out of the compact tray headline (it's already busy). The
     // display labels match the all-models "week" window so users can read
     // them as siblings of it.
-    if let Some(b) = &usage.seven_day_sonnet {
-        let w = snap.windows.entry("Sonnet".to_string()).or_default();
-        fill_quota_window(w, b, now);
-    }
-    if let Some(b) = &usage.seven_day_opus {
-        let w = snap.windows.entry("Opus".to_string()).or_default();
-        fill_quota_window(w, b, now);
+    //
+    // These per-model buckets are *derived sub-views*: Anthropic omits
+    // them entirely when that model class has no recent usage. They must
+    // mirror exactly what this response contained — when a bucket is
+    // absent we drop the window rather than leave a hole for
+    // `merge_stale_from` to graft the last-seen value back in as stale.
+    // Grafting a stale ghost here would raise the provider-level ⚠ even
+    // though the real quota (5h / 7d) is perfectly fresh. (Cache-serving
+    // paths pass a `usage` that itself carries whatever Sonnet/Opus the
+    // last good response had, so this stays consistent there too.)
+    apply_or_remove_per_model(snap, "Sonnet", usage.seven_day_sonnet.as_ref(), now);
+    apply_or_remove_per_model(snap, "Opus", usage.seven_day_opus.as_ref(), now);
+}
+
+fn apply_or_remove_per_model(
+    snap: &mut UsageSnapshot,
+    label: &str,
+    bucket: Option<&QuotaBucket>,
+    now: DateTime<Utc>,
+) {
+    match bucket {
+        Some(b) => {
+            let w = snap.windows.entry(label.to_string()).or_default();
+            fill_quota_window(w, b, now);
+            // Mark it a derived sub-view so the generic
+            // `merge_stale_from` never grafts a stale ghost of it
+            // (Anthropic omits these when the class is idle).
+            w.subview = true;
+        }
+        None => {
+            snap.windows.remove(label);
+        }
     }
 }
 
@@ -916,6 +957,55 @@ mod tests {
         assert!(headline.contains("5h 55%"), "got: {headline}");
         assert!(headline.contains("7d 58%"), "got: {headline}");
         assert!(!headline.contains("Sonnet"), "got: {headline}");
+    }
+
+    #[test]
+    fn apply_oauth_usage_removes_per_model_window_when_response_omits_it() {
+        use crate::anthropic_oauth::{OAuthUsageResponse, QuotaBucket};
+        // Pre-seed a Sonnet window as if a prior response had it.
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        snap.windows.insert(
+            "Sonnet".into(),
+            WindowUsage {
+                fraction_used: Some(0.31),
+                ..Default::default()
+            },
+        );
+        // New response has 5h + 7d but no per-model split (Anthropic
+        // omits it when that class has no recent usage).
+        let usage = OAuthUsageResponse {
+            five_hour: Some(QuotaBucket {
+                utilization: 6.0,
+                resets_at: None,
+            }),
+            seven_day: Some(QuotaBucket {
+                utilization: 4.0,
+                resets_at: None,
+            }),
+            seven_day_sonnet: None,
+            seven_day_opus: None,
+            extra_usage: None,
+        };
+        let mut headline = String::new();
+        apply_oauth_usage(&mut snap, &usage, Utc::now(), &mut headline);
+
+        // The stale Sonnet window is gone — it mirrors the response
+        // rather than lingering for merge_stale_from to graft as a
+        // false ⚠.
+        assert!(
+            !snap.windows.contains_key("Sonnet"),
+            "Sonnet window must be removed when the response omits it"
+        );
+        assert!(snap.window(WindowKind::FiveHourRolling).is_some());
+        assert!(snap.window(WindowKind::ThisWeek).is_some());
     }
 
     #[test]

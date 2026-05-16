@@ -111,6 +111,16 @@ pub struct WindowUsage {
     /// on-disk snapshot files (pre-stale) deserialising cleanly.
     #[serde(default)]
     pub stale: bool,
+    /// True when this window is a *derived sub-view* of another
+    /// window rather than an independent quota signal (e.g.
+    /// Anthropic's per-model weekly split). The provider that owns
+    /// the upstream shape sets this; the generic core only reads it.
+    /// `merge_stale_from` never grafts a sub-view from cache: upstream
+    /// omits these when that class has no recent usage, so a grafted
+    /// ghost would raise the provider ⚠ while the real quota is fresh.
+    /// `#[serde(default)]` keeps pre-existing snapshots deserialising.
+    #[serde(default)]
+    pub subview: bool,
 }
 
 impl WindowUsage {
@@ -229,6 +239,15 @@ impl UsageSnapshot {
     /// the "now" reference, so a slow clock doesn't artificially age
     /// the cache.
     ///
+    /// Windows flagged `subview` (derived per-model splits) are never
+    /// grafted: upstream omits them when idle, so a cached ghost would
+    /// raise the provider ⚠ while the real quota is fresh.
+    ///
+    /// Side effect: if any primary window is grafted stale and the
+    /// fresh snapshot didn't already explain itself, this sets
+    /// `error` (preferring the cached reason) and downgrades an `Ok`
+    /// `status` to `Degraded`, so the ⚠ is never shown without a why.
+    ///
     /// Returns the number of windows that ended up stale, so callers
     /// can log "served 2 stale windows from cache" if useful.
     pub fn merge_stale_from(&mut self, cached: &UsageSnapshot) -> usize {
@@ -243,6 +262,9 @@ impl UsageSnapshot {
         for (label, cw) in &cached.windows {
             if cw.fraction_used.is_none() {
                 continue; // cache has nothing useful to graft
+            }
+            if cw.subview {
+                continue; // sub-views mirror the live response, never the cache
             }
             match self.windows.get_mut(label) {
                 Some(nw) if nw.fraction_used.is_none() => {
@@ -277,6 +299,28 @@ impl UsageSnapshot {
         // Same for plan label.
         if self.plan_label.is_none() {
             self.plan_label = cached.plan_label.clone();
+        }
+        // If we grafted anything stale and the fresh poll didn't already
+        // explain itself, surface *why* the data is old so the ⚠ is
+        // never bare. Prefer the cached snapshot's own reason (e.g. the
+        // Anthropic "rate-limited / refresh paused" message); fall back
+        // to a generic line otherwise. Drop status to Degraded too so
+        // the provider-state store and the dashboard agree the reading
+        // isn't live. With per-model sub-views excluded above,
+        // `stale_count > 0` means a *primary* quota window is stale —
+        // a genuinely degraded state worth a reason.
+        if stale_count > 0 {
+            if self.error.is_none() {
+                self.error = cached.error.clone().or_else(|| {
+                    Some(
+                        "Showing cached quota — provider returned no fresh data this poll"
+                            .to_string(),
+                    )
+                });
+            }
+            if matches!(self.status, ProviderStatus::Ok) {
+                self.status = ProviderStatus::Degraded;
+            }
         }
         stale_count
     }
@@ -390,6 +434,106 @@ mod tests {
         let w = fresh.windows.get("5h").unwrap();
         assert_eq!(w.fraction_used, Some(0.10));
         assert!(!w.stale);
+    }
+
+    #[test]
+    fn merge_stale_from_does_not_graft_stale_per_model_subview() {
+        // The exact false-⚠ bug: a healthy Anthropic poll returns
+        // fresh 5h + week, but Anthropic omitted the per-model Sonnet
+        // split (no recent Sonnet usage). The cache still holds a
+        // Sonnet window. merge_stale_from must NOT reinstate it as
+        // stale — doing so raised the provider ⚠ while the real quota
+        // was perfectly fresh, with no reason text anywhere.
+        let mut cached = cached_snapshot_with_fraction(ProviderId::Anthropic);
+        cached.windows.insert(
+            "Sonnet".into(),
+            WindowUsage {
+                fraction_used: Some(0.01),
+                subview: true,
+                ..Default::default()
+            },
+        );
+        let mut fresh = UsageSnapshot {
+            provider: ProviderId::Anthropic,
+            timestamp: Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: Some("5h 6% · 7d 4%".into()),
+            plan_label: None,
+        };
+        fresh.windows.insert(
+            "5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.06),
+                ..Default::default()
+            },
+        );
+        fresh.windows.insert(
+            "week".into(),
+            WindowUsage {
+                fraction_used: Some(0.04),
+                ..Default::default()
+            },
+        );
+
+        let n = fresh.merge_stale_from(&cached);
+        assert_eq!(n, 0, "5h/week fresh, Sonnet is a sub-view → graft nothing");
+        assert!(
+            !fresh.windows.contains_key("Sonnet"),
+            "stale Sonnet ghost must not be reinstated"
+        );
+        assert!(
+            !fresh.windows.values().any(|w| w.stale),
+            "no window should be stale"
+        );
+        assert!(matches!(fresh.status, ProviderStatus::Ok), "status stays Ok");
+        assert!(fresh.error.is_none(), "no spurious reason");
+    }
+
+    #[test]
+    fn merge_stale_from_surfaces_reason_on_primary_graft() {
+        // Real degradation: the OAuth /usage call failed/throttled so
+        // the fresh poll has no quota fractions. The cached snapshot
+        // carried the rate-limit message. After grafting the stale
+        // primary windows the ⚠ must be explained — the cached reason
+        // wins and status drops to Degraded.
+        let mut cached = cached_snapshot_with_fraction(ProviderId::Anthropic);
+        cached.error = Some("Rate-limited by Anthropic — refresh paused for 12 min".into());
+        let mut fresh = UsageSnapshot::unavailable(ProviderId::Anthropic, "boom");
+        // `unavailable()` sets its own error/status; reset so we're
+        // testing the cached-reason fallback specifically.
+        fresh.error = None;
+        fresh.status = ProviderStatus::Ok;
+
+        let n = fresh.merge_stale_from(&cached);
+        assert_eq!(n, 2);
+        assert_eq!(
+            fresh.error.as_deref(),
+            Some("Rate-limited by Anthropic — refresh paused for 12 min"),
+            "cached rate-limit reason should explain the ⚠"
+        );
+        assert!(matches!(fresh.status, ProviderStatus::Degraded));
+    }
+
+    #[test]
+    fn merge_stale_from_uses_generic_reason_when_cache_has_none() {
+        // Cache had no error of its own, but we still grafted stale
+        // primary windows → the ⚠ gets a generic-but-present reason
+        // rather than being bare.
+        let cached = cached_snapshot_with_fraction(ProviderId::Anthropic);
+        let mut fresh = UsageSnapshot::unavailable(ProviderId::Anthropic, "boom");
+        fresh.error = None;
+        fresh.status = ProviderStatus::Ok;
+
+        let n = fresh.merge_stale_from(&cached);
+        assert_eq!(n, 2);
+        let reason = fresh.error.as_deref().expect("a reason must be set");
+        assert!(
+            reason.contains("cached"),
+            "generic fallback should mention cached data, got: {reason}"
+        );
+        assert!(matches!(fresh.status, ProviderStatus::Degraded));
     }
 
     #[test]
