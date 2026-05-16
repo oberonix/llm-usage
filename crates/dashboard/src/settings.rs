@@ -395,14 +395,6 @@ impl ConfigDraft {
             field_row(ui, "Alert at", |ui| {
                 alert_preset_combo(ui, "codex_alert", &mut self.codex_warn_at);
             });
-            help(
-                ui,
-                "Quota (5h, 7d) comes from OpenAI's rate-limit headers, which the \
-                 Codex CLI writes into your local rollouts on every turn. \
-                 Importing chatgpt.com cookies below switches to the live \
-                 /backend-api/wham/usage source — same data the Codex Cloud \
-                 Settings analytics page shows, no rollout lag.",
-            );
 
             let captured = !self.codex_chatgpt_session_cookie.is_empty();
             let mut import_now = false;
@@ -420,6 +412,18 @@ impl ConfigDraft {
             if import_now {
                 self.import_chatgpt_cookies_from_browser();
             }
+
+            // Help sits after the import block and is kept terse so this
+            // card mirrors the Ollama Cloud one (same order: header →
+            // toggles → alert → import block → one-line help).
+            ui.add_space(2.0);
+            help(
+                ui,
+                "Quota comes from your local Codex rollouts. Importing \
+                 chatgpt.com cookies switches to the live usage source — \
+                 same data the Codex Cloud Settings page shows, no rollout \
+                 lag. Re-import after logging out or rotating.",
+            );
         });
     }
 
