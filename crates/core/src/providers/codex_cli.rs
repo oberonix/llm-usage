@@ -454,7 +454,10 @@ impl Provider for CodexCliProvider {
         }
 
         // Live quota override from chatgpt.com. Errors are logged at
-        // WARN and ignored — we keep whatever the rollouts gave us.
+        // WARN and ignored while rollouts can still provide quota
+        // percentages; if they cannot, we surface the live-source error
+        // so the UI explains why only activity counts are visible.
+        let mut live_quota_error: Option<String> = None;
         if self.http.is_some() && self.cfg.chatgpt_session_cookie.is_some() {
             match self.fetch_live_quota(now).await {
                 Ok(Some(usage)) => {
@@ -511,12 +514,17 @@ impl Provider for CodexCliProvider {
                 }
                 Ok(None) => {} // no fresh data this poll; fall back
                 Err(e) => {
+                    live_quota_error = Some(e.to_string());
                     tracing::warn!(
                         error = %e,
                         "chatgpt.com /wham/usage live-quota fetch failed; using rollouts"
                     );
                 }
             }
+        }
+
+        if let Some(error) = live_quota_error {
+            mark_degraded_if_quota_missing(&mut snap, error);
         }
 
         snap.plan_label = plan_label.as_deref().map(crate::model::title_case_first);
@@ -546,6 +554,24 @@ fn format_rate_limit_error(kind: &str) -> String {
         "default" | "primary" | "session" | "5h" => "Session rate limit hit".to_string(),
         "weekly" | "secondary" | "7d" | "week" => "Weekly rate limit hit".to_string(),
         other => format!("Rate limit hit ({})", other),
+    }
+}
+
+fn mark_degraded_if_quota_missing(snap: &mut UsageSnapshot, live_error: String) {
+    let has_quota_fraction = snap
+        .window(WindowKind::FiveHourRolling)
+        .and_then(|w| w.fraction_used)
+        .is_some()
+        || snap
+            .window(WindowKind::ThisWeek)
+            .and_then(|w| w.fraction_used)
+            .is_some();
+
+    if !has_quota_fraction && snap.status == ProviderStatus::Ok {
+        snap.status = ProviderStatus::Degraded;
+        snap.error = Some(format!(
+            "Codex quota unavailable: {live_error}. Re-import ChatGPT cookies from Settings."
+        ));
     }
 }
 
@@ -1428,6 +1454,48 @@ mod tests {
             format_rate_limit_error("organizational_limit"),
             "Rate limit hit (organizational_limit)"
         );
+    }
+
+    fn empty_codex_snapshot() -> UsageSnapshot {
+        UsageSnapshot {
+            provider: ProviderId::CodexCli,
+            timestamp: Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: Default::default(),
+            headline: None,
+            plan_label: None,
+        }
+    }
+
+    #[test]
+    fn live_quota_error_degrades_when_no_quota_fraction_exists() {
+        let mut snap = empty_codex_snapshot();
+        mark_degraded_if_quota_missing(&mut snap, "chatgpt.com session expired".into());
+        assert_eq!(snap.status, ProviderStatus::Degraded);
+        assert!(snap
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Re-import ChatGPT cookies"));
+    }
+
+    #[test]
+    fn live_quota_error_keeps_rollout_quota_ok() {
+        let mut snap = empty_codex_snapshot();
+        snap.window_mut(WindowKind::FiveHourRolling).fraction_used = Some(0.42);
+        mark_degraded_if_quota_missing(&mut snap, "chatgpt.com session expired".into());
+        assert_eq!(snap.status, ProviderStatus::Ok);
+        assert!(snap.error.is_none());
+    }
+
+    #[test]
+    fn live_quota_error_does_not_overwrite_rate_limit_error() {
+        let mut snap = empty_codex_snapshot();
+        snap.status = ProviderStatus::Degraded;
+        snap.error = Some("Session rate limit hit".into());
+        mark_degraded_if_quota_missing(&mut snap, "chatgpt.com session expired".into());
+        assert_eq!(snap.error.as_deref(), Some("Session rate limit hit"));
     }
 
     #[test]

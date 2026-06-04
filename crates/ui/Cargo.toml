@@ -21,7 +21,13 @@ chrono.workspace = true
 notify.workspace = true
 notify-rust.workspace = true
 dirs.workspace = true
-tray-icon = "0.21"
+tray-icon = { version = "0.24", default-features = false, features = ["gtk"] }
+# ^ default-features disabled because the "libxdo" feature pulls in
+#   the xdotool C library. That makes installation hard on minimal
+#   distros (Arch/Omarchy, Nix, Fedora, etc.) where X11 + libxdo isn't
+#   pre-installed. We only need the tray icon and menu, not the
+#   accelerator / keyboard-simulation functionality that muda provides
+#   via libxdo. The "gtk" feature keeps libappindicator3 support.
 tao = "0.34"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
