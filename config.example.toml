@@ -53,6 +53,17 @@ show_spend = false
 # codex_dir = "/path/to/.codex"
 warn_at = [0.75, 0.9]
 
+[antigravity]
+enabled = false
+# Uses the Antigravity keyring token by default:
+#   Linux secret-service: service=gemini username=antigravity
+#   macOS keychain: account=antigravity
+# Defaults to https://cloudcode-pa.googleapis.com; Antigravity logs may show
+# daily-cloudcode-pa.googleapis.com, but prod exposes the same quota RPC.
+# base_url = "https://cloudcode-pa.googleapis.com"
+# access_token_command = "some-command-that-prints-a-google-oauth-access-token"
+warn_at = [0.75, 0.9]
+
 [ollama_cloud]
 enabled = false
 # The dashboard's "Import from browser…" or "Sign in via popup window…"

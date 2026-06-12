@@ -24,8 +24,9 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 use crate::runtime::{RuntimeHandle, RuntimeMessage};
 
 /// Order providers iterate in when the icon rotates. Matches the menu order.
-const PROVIDER_ORDER: [ProviderId; 3] = [
+const PROVIDER_ORDER: [ProviderId; 4] = [
     ProviderId::Anthropic,
+    ProviderId::Antigravity,
     ProviderId::CodexCli,
     ProviderId::OllamaCloud,
 ];
@@ -342,6 +343,10 @@ fn menu_window_order(label: &str) -> u32 {
     match label {
         "5h" => 10,
         "week" => 20,
+        "Claude 5h" => 30,
+        "Claude week" => 31,
+        "Gemini 5h" => 32,
+        "Gemini week" => 33,
         "Sonnet" => 21,
         "Opus" => 22,
         _ => 50,
@@ -422,10 +427,18 @@ mod tests {
 
     #[test]
     fn menu_window_order_lifts_quota_above_activity() {
-        let mut labels = vec!["Sonnet", "5h", "month", "week"];
+        let mut labels = vec!["Gemini week", "Sonnet", "5h", "month", "Claude 5h", "week"];
         labels.sort_by_key(|l| menu_window_order(l));
         // Unknown labels (50) come AFTER quota but BEFORE activity (100+).
-        assert_eq!(labels, vec!["5h", "week", "Sonnet", "month"]);
+        assert_eq!(
+            labels,
+            vec!["5h", "week", "Sonnet", "Claude 5h", "Gemini week", "month"]
+        );
+    }
+
+    #[test]
+    fn provider_order_includes_antigravity_for_menu_and_icon_rotation() {
+        assert!(PROVIDER_ORDER.contains(&ProviderId::Antigravity));
     }
 
     #[test]

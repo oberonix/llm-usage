@@ -57,14 +57,7 @@ pub fn render(provider: ProviderId, session: BarSlot, weekly: BarSlot) -> Icon {
         session.fraction,
     );
     if let Some(p) = session.pace {
-        draw_pace_marker(
-            &mut buf,
-            0,
-            SESSION_Y,
-            SIZE_U,
-            SESSION_HEIGHT,
-            p,
-        );
+        draw_pace_marker(&mut buf, 0, SESSION_Y, SIZE_U, SESSION_HEIGHT, p);
     }
     draw_bar(
         &mut buf,
@@ -75,14 +68,7 @@ pub fn render(provider: ProviderId, session: BarSlot, weekly: BarSlot) -> Icon {
         weekly.fraction,
     );
     if let Some(p) = weekly.pace {
-        draw_pace_marker(
-            &mut buf,
-            0,
-            WEEKLY_Y,
-            SIZE_U,
-            WEEKLY_HEIGHT,
-            p,
-        );
+        draw_pace_marker(&mut buf, 0, WEEKLY_Y, SIZE_U, WEEKLY_HEIGHT, p);
     }
 
     Icon::from_rgba(buf, SIZE, SIZE).expect("icon construction")
@@ -117,14 +103,7 @@ fn draw_bar(buf: &mut [u8], x: usize, y: usize, w: usize, h: usize, frac: Option
 /// green/amber/red fill colours (and matches the dashboard and CLI
 /// pace markers). Drawn on top of the fill so it's always visible
 /// regardless of where it sits in the bar.
-fn draw_pace_marker(
-    buf: &mut [u8],
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    pace: f64,
-) {
+fn draw_pace_marker(buf: &mut [u8], x: usize, y: usize, w: usize, h: usize, pace: f64) {
     if w == 0 {
         return;
     }
@@ -177,8 +156,22 @@ fn provider_tint(id: ProviderId) -> (u8, u8, u8) {
 /// time window (so the icon can draw the red pace marker).
 pub fn pick_bars(snap: &UsageSnapshot) -> (BarSlot, BarSlot) {
     let now = chrono::Utc::now();
-    let session = bar_slot_for(snap.windows.get("5h"), "5h", now);
-    let weekly = bar_slot_for(snap.windows.get("week"), "week", now);
+    let session = bar_slot_for(
+        snap.windows
+            .get("5h")
+            .or_else(|| snap.windows.get("Claude 5h"))
+            .or_else(|| snap.windows.get("Gemini 5h")),
+        "5h",
+        now,
+    );
+    let weekly = bar_slot_for(
+        snap.windows
+            .get("week")
+            .or_else(|| snap.windows.get("Claude week"))
+            .or_else(|| snap.windows.get("Gemini week")),
+        "week",
+        now,
+    );
     (session, weekly)
 }
 
@@ -230,6 +223,7 @@ const GLYPH_SPACING: usize = 1;
 fn provider_label(id: ProviderId) -> &'static str {
     match id {
         ProviderId::Anthropic => "ANT",
+        ProviderId::Antigravity => "AGY",
         ProviderId::CodexCli => "COD",
         ProviderId::OllamaCloud => "OLC",
     }
@@ -435,6 +429,7 @@ mod tests {
     #[test]
     fn provider_label_three_chars_per_provider() {
         assert_eq!(provider_label(ProviderId::Anthropic), "ANT");
+        assert_eq!(provider_label(ProviderId::Antigravity), "AGY");
         assert_eq!(provider_label(ProviderId::CodexCli), "COD");
         assert_eq!(provider_label(ProviderId::OllamaCloud), "OLC");
     }
@@ -505,6 +500,42 @@ mod tests {
         assert!(s.pace.is_none());
         assert!(w.fraction.is_none());
         assert!(w.pace.is_none());
+    }
+
+    #[test]
+    fn pick_bars_uses_antigravity_claude_bucket_names() {
+        let now = chrono::Utc::now();
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Antigravity,
+            timestamp: now,
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        snap.windows.insert(
+            "Claude 5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.72),
+                ends_at: Some(now + chrono::Duration::hours(2)),
+                ..Default::default()
+            },
+        );
+        snap.windows.insert(
+            "Claude week".into(),
+            WindowUsage {
+                fraction_used: Some(0.24),
+                ends_at: Some(now + chrono::Duration::days(6)),
+                ..Default::default()
+            },
+        );
+
+        let (short, week) = pick_bars(&snap);
+        assert_eq!(short.fraction, Some(0.72));
+        assert_eq!(week.fraction, Some(0.24));
+        assert!(short.pace.is_some());
+        assert!(week.pace.is_some());
     }
 
     #[test]

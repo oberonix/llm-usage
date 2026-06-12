@@ -24,6 +24,7 @@ pub fn title_case_first(s: &str) -> String {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
     Anthropic,
+    Antigravity,
     CodexCli,
     OllamaCloud,
 }
@@ -32,6 +33,7 @@ impl fmt::Display for ProviderId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             ProviderId::Anthropic => "anthropic",
+            ProviderId::Antigravity => "antigravity",
             ProviderId::CodexCli => "codex_cli",
             ProviderId::OllamaCloud => "ollama_cloud",
         };
@@ -43,6 +45,7 @@ impl ProviderId {
     pub fn human(&self) -> &'static str {
         match self {
             ProviderId::Anthropic => "Anthropic",
+            ProviderId::Antigravity => "Antigravity",
             ProviderId::CodexCli => "Codex",
             ProviderId::OllamaCloud => "Ollama Cloud",
         }
@@ -55,6 +58,7 @@ impl ProviderId {
     pub fn tint_rgb(&self) -> (u8, u8, u8) {
         match self {
             ProviderId::Anthropic => (0xCC, 0x78, 0x5C),
+            ProviderId::Antigravity => (0x42, 0xA5, 0xF5),
             ProviderId::CodexCli => (0x9C, 0x6B, 0xFF),
             ProviderId::OllamaCloud => (0x3B, 0x82, 0xF6),
         }
@@ -487,7 +491,10 @@ mod tests {
             !fresh.windows.values().any(|w| w.stale),
             "no window should be stale"
         );
-        assert!(matches!(fresh.status, ProviderStatus::Ok), "status stays Ok");
+        assert!(
+            matches!(fresh.status, ProviderStatus::Ok),
+            "status stays Ok"
+        );
         assert!(fresh.error.is_none(), "no spurious reason");
     }
 

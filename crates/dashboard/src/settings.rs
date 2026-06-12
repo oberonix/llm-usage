@@ -3,7 +3,9 @@
 //! similar power-user knobs stay edit-via-TOML.
 
 use eframe::egui::{self, Color32, RichText};
-use llm_usage_core::config::{self, AnthropicConfig, CodexCliConfig, Config, OllamaCloudConfig};
+use llm_usage_core::config::{
+    self, AnthropicConfig, AntigravityConfig, CodexCliConfig, Config, OllamaCloudConfig,
+};
 use llm_usage_core::model::ProviderId;
 use std::path::PathBuf;
 
@@ -66,6 +68,9 @@ pub struct ConfigDraft {
     pub codex_chatgpt_session_cookie: String,
     pub codex_chatgpt_setup_status: Option<String>,
     pub codex_chatgpt_setup_rx: Option<std::sync::mpsc::Receiver<SetupResult>>,
+
+    pub antigravity_enabled: bool,
+    pub antigravity_warn_at: Vec<f64>,
 
     pub ollama_cloud_enabled: bool,
     pub ollama_cloud_session_cookie: String,
@@ -135,6 +140,9 @@ impl ConfigDraft {
             codex_chatgpt_setup_status: None,
             codex_chatgpt_setup_rx: None,
 
+            antigravity_enabled: c.antigravity.enabled,
+            antigravity_warn_at: c.antigravity.warn_at.clone(),
+
             ollama_cloud_enabled: c.ollama_cloud.enabled,
             ollama_cloud_session_cookie: c.ollama_cloud.session_cookie.clone().unwrap_or_default(),
             ollama_cloud_warn_at: c.ollama_cloud.warn_at.clone(),
@@ -175,6 +183,12 @@ impl ConfigDraft {
             ..c.codex_cli
         };
 
+        c.antigravity = AntigravityConfig {
+            enabled: self.antigravity_enabled,
+            warn_at: self.antigravity_warn_at.clone(),
+            ..c.antigravity
+        };
+
         c.ollama_cloud = OllamaCloudConfig {
             enabled: self.ollama_cloud_enabled,
             session_cookie: empty_to_none(&self.ollama_cloud_session_cookie),
@@ -193,8 +207,9 @@ impl ConfigDraft {
         let exe = match resolve_setup_binary() {
             Some(p) => p,
             None => {
-                let msg =
-                    Some("Could not find llm-usage-setup binary next to the dashboard.".to_string());
+                let msg = Some(
+                    "Could not find llm-usage-setup binary next to the dashboard.".to_string(),
+                );
                 match target {
                     SetupTarget::OllamaCloud => self.ollama_cloud_setup_status = msg,
                     SetupTarget::Codex => self.codex_chatgpt_setup_status = msg,
@@ -430,6 +445,7 @@ impl ConfigDraft {
 
         self.render_anthropic(ui);
         self.render_codex(ui);
+        self.render_antigravity(ui);
         self.render_ollama_cloud(ui);
     }
 
@@ -510,6 +526,20 @@ impl ConfigDraft {
                  chatgpt.com cookies switches to the live usage source — \
                  same data the Codex Cloud Settings page shows, no rollout \
                  lag. Re-import after logging out or rotating.",
+            );
+        });
+    }
+
+    fn render_antigravity(&mut self, ui: &mut egui::Ui) {
+        provider_card(ui, tint(ProviderId::Antigravity), |ui| {
+            section_header_row(ui, "Antigravity", Some(ProviderId::Antigravity));
+            enabled_row(ui, &mut self.antigravity_enabled, None, "");
+            field_row(ui, "Alert at", |ui| {
+                alert_preset_combo(ui, "antigravity_alert", &mut self.antigravity_warn_at);
+            });
+            help(
+                ui,
+                "Reads Gemini and Claude quota from Google Cloud Code using the Antigravity keyring token.",
             );
         });
     }

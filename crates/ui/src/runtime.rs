@@ -9,7 +9,9 @@
 use llm_usage_core::config::Config;
 use llm_usage_core::model::{ProviderId, UsageSnapshot};
 use llm_usage_core::provider::Provider;
-use llm_usage_core::providers::{AnthropicProvider, CodexCliProvider, OllamaCloudProvider};
+use llm_usage_core::providers::{
+    AnthropicProvider, AntigravityProvider, CodexCliProvider, OllamaCloudProvider,
+};
 use llm_usage_core::quota::QuotaEngine;
 use llm_usage_core::storage::Store;
 use llm_usage_core::updates::{self, UpdateInfo};
@@ -47,6 +49,9 @@ fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
     if !config.codex_cli.warn_at.is_empty() {
         engine.set_thresholds(ProviderId::CodexCli, config.codex_cli.warn_at.clone());
     }
+    if !config.antigravity.warn_at.is_empty() {
+        engine.set_thresholds(ProviderId::Antigravity, config.antigravity.warn_at.clone());
+    }
     if !config.ollama_cloud.warn_at.is_empty() {
         engine.set_thresholds(ProviderId::OllamaCloud, config.ollama_cloud.warn_at.clone());
     }
@@ -61,6 +66,7 @@ fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
             config.codex_cli.clone(),
             opencode.clone(),
         )),
+        Box::new(AntigravityProvider::new(config.antigravity.clone())),
         Box::new(OllamaCloudProvider::with_opencode_db(
             config.ollama_cloud.clone(),
             opencode,

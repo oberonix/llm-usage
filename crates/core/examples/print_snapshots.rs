@@ -10,7 +10,9 @@
 
 use llm_usage_core::config::Config;
 use llm_usage_core::provider::Provider;
-use llm_usage_core::providers::{AnthropicProvider, CodexCliProvider, OllamaCloudProvider};
+use llm_usage_core::providers::{
+    AnthropicProvider, AntigravityProvider, CodexCliProvider, OllamaCloudProvider,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
             config.codex_cli.clone(),
             opencode.clone(),
         )),
+        Box::new(AntigravityProvider::new(config.antigravity.clone())),
         Box::new(OllamaCloudProvider::with_opencode_db(
             config.ollama_cloud.clone(),
             opencode,

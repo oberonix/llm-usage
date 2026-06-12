@@ -511,6 +511,7 @@ impl DashboardApp {
         let snaps = self.snapshots.lock().unwrap().clone();
         let provider_iter = [
             (ProviderId::Anthropic, self.config.anthropic.enabled),
+            (ProviderId::Antigravity, self.config.antigravity.enabled),
             (ProviderId::CodexCli, self.config.codex_cli.enabled),
             (ProviderId::OllamaCloud, self.config.ollama_cloud.enabled),
         ];

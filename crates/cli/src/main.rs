@@ -18,7 +18,9 @@ use anyhow::Result;
 use llm_usage_core::config::Config;
 use llm_usage_core::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowUsage};
 use llm_usage_core::provider::Provider;
-use llm_usage_core::providers::{AnthropicProvider, CodexCliProvider, OllamaCloudProvider};
+use llm_usage_core::providers::{
+    AnthropicProvider, AntigravityProvider, CodexCliProvider, OllamaCloudProvider,
+};
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
@@ -241,6 +243,7 @@ fn build_screen(
 
     let order = [
         ProviderId::Anthropic,
+        ProviderId::Antigravity,
         ProviderId::CodexCli,
         ProviderId::OllamaCloud,
     ];
@@ -390,6 +393,7 @@ async fn poll_fresh() -> Result<BTreeMap<ProviderId, UsageSnapshot>> {
             config.codex_cli.clone(),
             opencode.clone(),
         )),
+        Box::new(AntigravityProvider::new(config.antigravity.clone())),
         Box::new(OllamaCloudProvider::with_opencode_db(
             config.ollama_cloud.clone(),
             opencode,

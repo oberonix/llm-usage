@@ -35,6 +35,7 @@ pub struct Config {
     /// - `Some(path)` → use that file
     pub opencode_db: Option<PathBuf>,
     pub anthropic: AnthropicConfig,
+    pub antigravity: AntigravityConfig,
     pub codex_cli: CodexCliConfig,
     pub ollama_cloud: OllamaCloudConfig,
     pub alerts: AlertsConfig,
@@ -54,6 +55,7 @@ impl Default for Config {
             start_at_login: false,
             opencode_db: None,
             anthropic: AnthropicConfig::default(),
+            antigravity: AntigravityConfig::default(),
             codex_cli: CodexCliConfig::default(),
             ollama_cloud: OllamaCloudConfig::default(),
             alerts: AlertsConfig::default(),
@@ -88,6 +90,29 @@ impl Default for AnthropicConfig {
             warn_at: vec![0.5, 0.75, 0.9],
             model_rates: HashMap::new(),
             show_spend: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AntigravityConfig {
+    pub enabled: bool,
+    /// Cloud Code backend endpoint. `cloudcode-pa.googleapis.com` is the
+    /// production service; Antigravity's own CLI logs may show daily/staging.
+    pub base_url: String,
+    /// Command that prints a Google OAuth access token to stdout.
+    pub access_token_command: Option<String>,
+    pub warn_at: Vec<f64>,
+}
+
+impl Default for AntigravityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "https://cloudcode-pa.googleapis.com".to_string(),
+            access_token_command: None,
+            warn_at: vec![0.75, 0.9],
         }
     }
 }
