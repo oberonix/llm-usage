@@ -937,15 +937,16 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let day = dir.path().join("sessions/2026/05/08");
         std::fs::create_dir_all(&day).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
         let f = day.join("rollout-test.jsonl");
         let mut out = std::fs::File::create(&f).unwrap();
-        writeln!(out, r#"{{"type":"session_meta","timestamp":"2026-05-08T10:00:00Z","payload":{{"id":"sess-1"}}}}"#).unwrap();
-        writeln!(out, r#"{{"type":"turn_context","timestamp":"2026-05-08T10:00:01Z","payload":{{"model":"gpt-5-codex"}}}}"#).unwrap();
-        writeln!(out, r#"{{"type":"event_msg","timestamp":"2026-05-08T10:00:05Z","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":1000,"output_tokens":200,"cached_input_tokens":100,"total_tokens":1200}}}}}}}}"#).unwrap();
+        writeln!(out, r#"{{"type":"session_meta","timestamp":"{}","payload":{{"id":"sess-1"}}}}"#, now).unwrap();
+        writeln!(out, r#"{{"type":"turn_context","timestamp":"{}","payload":{{"model":"gpt-5-codex"}}}}"#, now).unwrap();
+        writeln!(out, r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":1000,"output_tokens":200,"cached_input_tokens":100,"total_tokens":1200}}}}}}}}"#, now).unwrap();
         // Duplicate snapshot — should be skipped.
-        writeln!(out, r#"{{"type":"event_msg","timestamp":"2026-05-08T10:00:06Z","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":1000,"output_tokens":200,"cached_input_tokens":100,"total_tokens":1200}}}}}}}}"#).unwrap();
+        writeln!(out, r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":1000,"output_tokens":200,"cached_input_tokens":100,"total_tokens":1200}}}}}}}}"#, now).unwrap();
         // Different snapshot — counted.
-        writeln!(out, r#"{{"type":"event_msg","timestamp":"2026-05-08T10:00:09Z","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":50,"output_tokens":50,"cached_input_tokens":0,"total_tokens":100}}}}}}}}"#).unwrap();
+        writeln!(out, r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":50,"output_tokens":50,"cached_input_tokens":0,"total_tokens":100}}}}}}}}"#, now).unwrap();
         drop(out);
 
         let mut cfg = CodexCliConfig::default();

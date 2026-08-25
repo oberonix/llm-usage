@@ -66,14 +66,33 @@ async fn main() -> Result<()> {
         println!("llm-usage {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    let mut omarchy_target: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--omarchy" {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                omarchy_target = Some(args[i + 1].clone());
+                i += 2;
+                continue;
+            } else {
+                omarchy_target = Some("all".to_string());
+            }
+        }
+        i += 1;
+    }
+
+    if let Some(target) = omarchy_target {
+        return run_omarchy_export(&target).await;
+    }
+
     let force_refresh = args.iter().any(|a| a == "--refresh");
     let once = args.iter().any(|a| a == "--once");
     // Surface typos rather than silently dropping into watch mode.
     if let Some(unknown) = args.iter().find(|a| {
         !matches!(
             a.as_str(),
-            "--refresh" | "--once" | "--help" | "-h" | "--version" | "-V"
-        )
+            "--refresh" | "--once" | "--help" | "-h" | "--version" | "-V" | "--omarchy"
+        ) && !args.windows(2).any(|w| w[0] == "--omarchy" && w[1] == **a)
     }) {
         eprintln!("unknown flag: {unknown}\n");
         print_usage();
@@ -104,16 +123,63 @@ fn print_usage() {
             llm-usage [FLAGS]\n\
          \n\
          FLAGS:\n\
-            --once         Render the current snapshot once and exit. Defaults\n\
-                           to live mode (re-renders when the tray writes).\n\
-            --refresh      Touch the tray's refresh trigger before rendering,\n\
-                           so the next snapshot is fresh rather than cached.\n\
-            -h, --help     Show this message.\n\
-            -V, --version  Print the binary version.\n\
+            --once                 Render the current snapshot once and exit. Defaults\n\
+                                   to live mode (re-renders when the tray writes).\n\
+            --refresh              Touch the tray's refresh trigger before rendering,\n\
+                                   so the next snapshot is fresh rather than cached.\n\
+            --omarchy [PROVIDER]   Output Omarchy JSON record for PROVIDER or write\n\
+                                   all snapshots to Omarchy usage directory.\n\
+            -h, --help             Show this message.\n\
+            -V, --version          Print the binary version.\n\
          \n\
          Reads `snapshots.json` written by `llm-usage-tray`. If the tray isn't\n\
          running, falls back to polling every enabled provider directly."
     );
+}
+
+async fn run_omarchy_export(target: &str) -> Result<()> {
+    let snapshots = match cached_snapshots() {
+        Some((s, _)) if !s.is_empty() => s,
+        _ => poll_fresh().await?,
+    };
+
+    if target == "all" {
+        llm_usage_core::export_snapshots_to_omarchy(&snapshots)?;
+        println!("Exported snapshots to Omarchy usage directory.");
+        return Ok(());
+    }
+
+    let provider_id = match target.to_lowercase().as_str() {
+        "antigravity" | "agy" => Some(ProviderId::Antigravity),
+        "claude" | "anthropic" => Some(ProviderId::Anthropic),
+        "codex" | "codex_cli" | "openai" => Some(ProviderId::CodexCli),
+        "ollama" | "ollama_cloud" => Some(ProviderId::OllamaCloud),
+        _ => None,
+    };
+
+    let Some(id) = provider_id else {
+        eprintln!("Unknown provider for Omarchy export: {target}");
+        eprintln!("Available: antigravity, claude, codex, ollama, all");
+        std::process::exit(1);
+    };
+
+    let snap = match snapshots.get(&id) {
+        Some(s) => s.clone(),
+        None => {
+            let config = Config::load_or_default()?;
+            let opencode = config.resolve_opencode_db();
+            match id {
+                ProviderId::Antigravity => AntigravityProvider::new(config.antigravity).poll().await?,
+                ProviderId::Anthropic => AnthropicProvider::with_opencode_db(config.anthropic, opencode).poll().await?,
+                ProviderId::CodexCli => CodexCliProvider::with_opencode_db(config.codex_cli, opencode).poll().await?,
+                ProviderId::OllamaCloud => OllamaCloudProvider::with_opencode_db(config.ollama_cloud, opencode).poll().await?,
+            }
+        }
+    };
+
+    let record = llm_usage_core::snapshot_to_omarchy_record(&snap);
+    println!("{}", serde_json::to_string_pretty(&record)?);
+    Ok(())
 }
 
 /// One-shot mode — render the current data and exit. Reads

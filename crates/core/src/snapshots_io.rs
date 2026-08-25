@@ -39,7 +39,13 @@ pub fn write_snapshots(snaps: &BTreeMap<ProviderId, UsageSnapshot>) -> Result<()
     }
     let payload = SnapshotsFile::new(snaps.clone());
     let json = serde_json::to_vec_pretty(&payload).context("serialize snapshots")?;
-    write_atomically(&path, &json)
+    write_atomically(&path, &json)?;
+
+    if let Err(e) = crate::omarchy_export::export_snapshots_to_omarchy(snaps) {
+        tracing::debug!(error = %e, "omarchy usage export skipped/failed");
+    }
+
+    Ok(())
 }
 
 pub fn read_snapshots() -> Result<Option<SnapshotsFile>> {

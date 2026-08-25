@@ -3,6 +3,7 @@ pub mod autostart;
 pub mod chatgpt_oauth;
 pub mod config;
 pub mod model;
+pub mod omarchy_export;
 pub mod opencode;
 pub mod pricing;
 pub mod provider;
@@ -14,5 +15,6 @@ pub mod updates;
 
 pub use config::Config;
 pub use model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind, WindowUsage};
+pub use omarchy_export::{export_snapshots_to_omarchy, snapshot_to_omarchy_record, OmarchyAgentRecord};
 pub use provider::Provider;
 pub use snapshots_io::{read_snapshots, touch_refresh_trigger, write_snapshots, SnapshotsFile};
