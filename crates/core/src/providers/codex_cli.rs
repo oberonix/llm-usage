@@ -53,6 +53,7 @@
 use crate::config::CodexCliConfig;
 use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind, WindowUsage};
 use crate::provider::Provider;
+use crate::storage::{ModelTurnRecord, Store};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
@@ -61,7 +62,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use walkdir::WalkDir;
 
 /// Per-file resumption state for the Codex rollouts incremental
@@ -128,6 +129,7 @@ pub struct CodexCliProvider {
     /// is configured.
     http: Option<reqwest::Client>,
     wham: Mutex<WhamCache>,
+    store: Option<Arc<Store>>,
 }
 
 impl CodexCliProvider {
@@ -137,7 +139,7 @@ impl CodexCliProvider {
     pub fn new(cfg: CodexCliConfig) -> Self {
         let codex_dir = cfg.codex_dir.clone().unwrap_or_else(default_codex_dir);
         let opencode_db = Some(crate::opencode::default_db_path());
-        Self::build(cfg, codex_dir, opencode_db)
+        Self::build(cfg, codex_dir, opencode_db, None)
     }
 
     /// Construct with an explicit opencode override:
@@ -146,7 +148,17 @@ impl CodexCliProvider {
     pub fn with_opencode_db(cfg: CodexCliConfig, opencode_db: Option<PathBuf>) -> Self {
         let codex_dir = cfg.codex_dir.clone().unwrap_or_else(default_codex_dir);
         let opencode_db = opencode_db.filter(|p| !p.as_os_str().is_empty());
-        Self::build(cfg, codex_dir, opencode_db)
+        Self::build(cfg, codex_dir, opencode_db, None)
+    }
+
+    pub fn with_store(
+        cfg: CodexCliConfig,
+        opencode_db: Option<PathBuf>,
+        store: Option<Arc<Store>>,
+    ) -> Self {
+        let codex_dir = cfg.codex_dir.clone().unwrap_or_else(default_codex_dir);
+        let opencode_db = opencode_db.filter(|p| !p.as_os_str().is_empty());
+        Self::build(cfg, codex_dir, opencode_db, store)
     }
 
     /// Pull live quota data from chatgpt.com. Returns `Ok(None)`
@@ -217,7 +229,12 @@ impl CodexCliProvider {
         Ok(Some(usage))
     }
 
-    fn build(cfg: CodexCliConfig, codex_dir: PathBuf, opencode_db: Option<PathBuf>) -> Self {
+    fn build(
+        cfg: CodexCliConfig,
+        codex_dir: PathBuf,
+        opencode_db: Option<PathBuf>,
+        store: Option<Arc<Store>>,
+    ) -> Self {
         let http = if cfg.chatgpt_session_cookie.is_some() {
             crate::chatgpt_oauth::build_http_client().ok()
         } else {
@@ -230,6 +247,7 @@ impl CodexCliProvider {
             cache: Mutex::new(ScanCache::default()),
             http,
             wham: Mutex::new(WhamCache::default()),
+            store,
         }
     }
 
@@ -290,6 +308,29 @@ impl CodexCliProvider {
                     tracing::warn!(error = %e, path = %db.display(), "opencode db read failed");
                 }
             }
+        }
+        if let Some(store) = &self.store {
+            let turns: Vec<ModelTurnRecord> = out
+                .events
+                .iter()
+                .map(|e| ModelTurnRecord {
+                    turn_id: format!(
+                        "codex:{}:{}:{}:{}",
+                        e.timestamp.timestamp_millis(),
+                        e.model,
+                        e.input_tokens,
+                        e.output_tokens
+                    ),
+                    provider: "codex_cli".into(),
+                    model: e.model.clone(),
+                    timestamp: e.timestamp,
+                    tokens_in: e.input_tokens,
+                    tokens_out: e.output_tokens,
+                    tokens_cached: e.cached_tokens,
+                    tokens_cache_creation: 0,
+                })
+                .collect();
+            let _ = store.record_model_turns_batch(&turns);
         }
         Ok(out)
     }

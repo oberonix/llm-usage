@@ -59,45 +59,66 @@ async fn main() -> Result<()> {
         .init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage();
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("llm-usage {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
+    let mut models = false;
+    let mut history = false;
+    let mut json = false;
+    let mut force_refresh = false;
+    let mut once = false;
+    let mut since_arg: Option<String> = None;
+    let mut provider_arg: Option<String> = None;
     let mut omarchy_target: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--omarchy" {
-            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                omarchy_target = Some(args[i + 1].clone());
-                i += 2;
-                continue;
-            } else {
-                omarchy_target = Some("all".to_string());
+
+    let mut iter = args.into_iter().peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("llm-usage {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--omarchy" => {
+                if let Some(next) = iter.peek() {
+                    if !next.starts_with('-') {
+                        omarchy_target = iter.next();
+                    } else {
+                        omarchy_target = Some("all".to_string());
+                    }
+                } else {
+                    omarchy_target = Some("all".to_string());
+                }
+            }
+            "--models" => models = true,
+            "--history" => history = true,
+            "--json" => json = true,
+            "--refresh" => force_refresh = true,
+            "--once" => once = true,
+            "--since" => {
+                since_arg = iter.next();
+                if since_arg.is_none() {
+                    eprintln!("error: --since requires a duration value (e.g. 24h, 7d)\n");
+                    std::process::exit(2);
+                }
+            }
+            "--provider" => {
+                provider_arg = iter.next();
+                if provider_arg.is_none() {
+                    eprintln!("error: --provider requires a name (e.g. anthropic, codex_cli)\n");
+                    std::process::exit(2);
+                }
+            }
+            unknown => {
+                eprintln!("unknown flag: {unknown}\n");
+                print_usage();
+                std::process::exit(2);
             }
         }
-        i += 1;
     }
 
     if let Some(target) = omarchy_target {
         return run_omarchy_export(&target).await;
-    }
-
-    let force_refresh = args.iter().any(|a| a == "--refresh");
-    let once = args.iter().any(|a| a == "--once");
-    // Surface typos rather than silently dropping into watch mode.
-    if let Some(unknown) = args.iter().find(|a| {
-        !matches!(
-            a.as_str(),
-            "--refresh" | "--once" | "--help" | "-h" | "--version" | "-V" | "--omarchy"
-        ) && !args.windows(2).any(|w| w[0] == "--omarchy" && w[1] == **a)
-    }) {
-        eprintln!("unknown flag: {unknown}\n");
-        print_usage();
-        std::process::exit(2);
     }
 
     if force_refresh {
@@ -107,6 +128,24 @@ async fn main() -> Result<()> {
         let _ = llm_usage_core::touch_refresh_trigger();
     }
 
+    let since_duration = match since_arg {
+        Some(ref s) => match parse_duration(s) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("error: {}\n", e);
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+
+    if models {
+        return run_models(since_duration, provider_arg, json).await;
+    }
+    if history {
+        return run_history(since_duration, provider_arg, json).await;
+    }
+
     let use_color = std::io::stdout().is_terminal();
 
     if once {
@@ -114,6 +153,140 @@ async fn main() -> Result<()> {
     } else {
         run_live(use_color).await
     }
+}
+
+fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty duration");
+    }
+    let (num_str, unit) = if let Some(n) = s.strip_suffix('h') {
+        (n, 3600)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86400)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1)
+    } else {
+        (s, 3600) // default hours
+    };
+    let num: u64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid number in duration: {}", s))?;
+    Ok(Duration::from_secs(num.saturating_mul(unit)))
+}
+
+async fn run_models(
+    since: Option<Duration>,
+    provider: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let path = llm_usage_core::config::data_path()?;
+    if !path.exists() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No model activity recorded yet.");
+        }
+        return Ok(());
+    }
+    let store = llm_usage_core::storage::Store::open(&path)?;
+    let since_dt = since.map(|d| chrono::Utc::now() - chrono::Duration::from_std(d).unwrap());
+    let stats = store.query_model_stats(provider.as_deref(), since_dt, None)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+    if stats.is_empty() {
+        println!("No model activity recorded in the specified time window.");
+        return Ok(());
+    }
+    println!(
+        "{:<12} {:<24} {:>8} {:>14} {:>14} {:>14} {:>14}",
+        "PROVIDER", "MODEL", "TURNS", "IN TOKENS", "OUT TOKENS", "CACHED TOK", "TOTAL TOK"
+    );
+    println!(
+        "{:-<12} {:-<24} {:->8} {:->14} {:->14} {:->14} {:->14}",
+        "", "", "", "", "", "", ""
+    );
+    for row in stats {
+        println!(
+            "{:<12} {:<24} {:>8} {:>14} {:>14} {:>14} {:>14}",
+            row.provider,
+            row.model,
+            row.turns_count,
+            format_num(row.tokens_in),
+            format_num(row.tokens_out),
+            format_num(row.tokens_cached + row.tokens_cache_creation),
+            format_num(row.total_tokens),
+        );
+    }
+    Ok(())
+}
+
+async fn run_history(
+    since: Option<Duration>,
+    provider: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let path = llm_usage_core::config::data_path()?;
+    if !path.exists() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No quota history recorded yet.");
+        }
+        return Ok(());
+    }
+    let store = llm_usage_core::storage::Store::open(&path)?;
+    let since_dt = since.map(|d| chrono::Utc::now() - chrono::Duration::from_std(d).unwrap());
+    let rows = store.query_quota_snapshots(provider.as_deref(), since_dt, None)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("No quota history recorded in the specified time window.");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<12} {:<8} {:>8}  {:<12}",
+        "TIMESTAMP (UTC)", "PROVIDER", "WINDOW", "USED %", "RESETS AT"
+    );
+    println!(
+        "{:-<20} {:-<12} {:-<8} {:->8}  {:-<12}",
+        "", "", "", "", ""
+    );
+    for row in rows {
+        let resets = row
+            .resets_at
+            .map(|d| d.format("%H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<20} {:<12} {:<8} {:>7.1}%  {:<12}",
+            row.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+            row.provider,
+            row.window_kind,
+            row.fraction_used * 100.0,
+            resets,
+        );
+    }
+    Ok(())
+}
+
+fn format_num(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    for (i, c) in chars.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*c);
+    }
+    out
 }
 
 fn print_usage() {
@@ -128,6 +301,11 @@ fn print_usage() {
                                    to live mode (re-renders when the tray writes).\n\
             --refresh              Touch the tray's refresh trigger before rendering,\n\
                                    so the next snapshot is fresh rather than cached.\n\
+            --models               Show per-model token activity and request counts.\n\
+            --history              Show recorded quota snapshot history.\n\
+            --since <duration>     Filter --models or --history by duration (e.g. 1h, 24h, 7d).\n\
+            --provider <name>      Filter by provider (e.g. anthropic, codex_cli, ollama_cloud).\n\
+            --json                 Output in JSON format.\n\
             --omarchy [PROVIDER]   Output Omarchy JSON record for PROVIDER or write\n\
                                    all snapshots to Omarchy usage directory.\n\
             -h, --help             Show this message.\n\
@@ -474,20 +652,27 @@ fn cached_snapshots() -> Option<(
 
 async fn poll_fresh() -> Result<BTreeMap<ProviderId, UsageSnapshot>> {
     let config = Config::load_or_default()?;
+    let store = llm_usage_core::config::data_path()
+        .ok()
+        .and_then(|p| llm_usage_core::storage::Store::open(&p).ok())
+        .map(std::sync::Arc::new);
     let opencode = config.resolve_opencode_db();
     let providers: Vec<Box<dyn Provider>> = vec![
-        Box::new(AnthropicProvider::with_opencode_db(
+        Box::new(AnthropicProvider::with_store(
             config.anthropic.clone(),
             opencode.clone(),
+            store.clone(),
         )),
-        Box::new(CodexCliProvider::with_opencode_db(
+        Box::new(CodexCliProvider::with_store(
             config.codex_cli.clone(),
             opencode.clone(),
+            store.clone(),
         )),
         Box::new(AntigravityProvider::new(config.antigravity.clone())),
-        Box::new(OllamaCloudProvider::with_opencode_db(
+        Box::new(OllamaCloudProvider::with_store(
             config.ollama_cloud.clone(),
             opencode.clone(),
+            store.clone(),
         )),
         Box::new(MuseSparkProvider::new(config.muse_spark.clone())),
         Box::new(OpenCodeGoProvider::with_opencode_db(
@@ -501,6 +686,22 @@ async fn poll_fresh() -> Result<BTreeMap<ProviderId, UsageSnapshot>> {
             continue;
         }
         if let Ok(snap) = p.poll().await {
+            if let Some(s) = &store {
+                for (kind, w) in &snap.windows {
+                    if let Some(fraction) = w.fraction_used {
+                        let _ = s.record_quota_snapshot(
+                            &llm_usage_core::storage::QuotaSnapshotRecord {
+                                id: None,
+                                provider: snap.provider.to_string(),
+                                timestamp: snap.timestamp,
+                                window_kind: kind.clone(),
+                                fraction_used: fraction,
+                                resets_at: w.ends_at,
+                            },
+                        );
+                    }
+                }
+            }
             out.insert(p.id(), snap);
         }
     }

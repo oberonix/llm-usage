@@ -70,16 +70,25 @@ pub struct OllamaCloudProvider {
     /// successful responses are stored — auth failures and parse
     /// failures must keep re-trying.
     last_good: std::sync::Mutex<Option<CachedFetch>>,
+    store: Option<std::sync::Arc<crate::storage::Store>>,
 }
 
 impl OllamaCloudProvider {
     pub fn new(cfg: OllamaCloudConfig) -> Self {
-        Self::with_opencode_db(cfg, Some(crate::opencode::default_db_path()))
+        Self::with_store(cfg, Some(crate::opencode::default_db_path()), None)
     }
 
     pub fn with_opencode_db(
         cfg: OllamaCloudConfig,
         opencode_db: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self::with_store(cfg, opencode_db, None)
+    }
+
+    pub fn with_store(
+        cfg: OllamaCloudConfig,
+        opencode_db: Option<std::path::PathBuf>,
+        store: Option<std::sync::Arc<crate::storage::Store>>,
     ) -> Self {
         let http = reqwest::Client::builder()
             // Browser-like UA so the page doesn't decide we're a bot and
@@ -102,6 +111,7 @@ impl OllamaCloudProvider {
             opencode_db,
             base_url: BASE_URL.to_string(),
             last_good: std::sync::Mutex::new(None),
+            store,
         }
     }
 
@@ -260,7 +270,29 @@ impl Provider for OllamaCloudProvider {
         // the fraction_used we already populated above.
         if let Some(db) = &self.opencode_db {
             match crate::opencode::read_events(db, "ollama-cloud") {
-                Ok(events) => fold_opencode_events(&mut snap, &events, now),
+                Ok(events) => {
+                    if let Some(store) = &self.store {
+                        let turns: Vec<crate::storage::ModelTurnRecord> = events
+                            .iter()
+                            .map(|e| crate::storage::ModelTurnRecord {
+                                turn_id: format!(
+                                    "opencode:ollama-cloud:{}:{}",
+                                    e.timestamp.timestamp_millis(),
+                                    e.model
+                                ),
+                                provider: "ollama_cloud".into(),
+                                model: e.model.clone(),
+                                timestamp: e.timestamp,
+                                tokens_in: e.input_tokens,
+                                tokens_out: e.output_tokens,
+                                tokens_cached: e.cached_tokens,
+                                tokens_cache_creation: 0,
+                            })
+                            .collect();
+                        let _ = store.record_model_turns_batch(&turns);
+                    }
+                    fold_opencode_events(&mut snap, &events, now);
+                }
                 Err(err) => {
                     tracing::warn!(error = %err, path = %db.display(), "opencode db read failed");
                 }

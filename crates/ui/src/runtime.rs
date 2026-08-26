@@ -43,7 +43,7 @@ struct LoopState {
 }
 
 fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
-    let mut engine = QuotaEngine::new(store);
+    let mut engine = QuotaEngine::new(store.clone());
     if !config.anthropic.warn_at.is_empty() {
         engine.set_thresholds(ProviderId::Anthropic, config.anthropic.warn_at.clone());
     }
@@ -65,18 +65,21 @@ fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
 
     let opencode = config.resolve_opencode_db();
     let providers: Vec<Box<dyn Provider>> = vec![
-        Box::new(AnthropicProvider::with_opencode_db(
+        Box::new(AnthropicProvider::with_store(
             config.anthropic.clone(),
             opencode.clone(),
+            Some(store.clone()),
         )),
-        Box::new(CodexCliProvider::with_opencode_db(
+        Box::new(CodexCliProvider::with_store(
             config.codex_cli.clone(),
             opencode.clone(),
+            Some(store.clone()),
         )),
         Box::new(AntigravityProvider::new(config.antigravity.clone())),
-        Box::new(OllamaCloudProvider::with_opencode_db(
+        Box::new(OllamaCloudProvider::with_store(
             config.ollama_cloud.clone(),
             opencode.clone(),
+            Some(store.clone()),
         )),
         Box::new(MuseSparkProvider::new(config.muse_spark.clone())),
         Box::new(OpenCodeGoProvider::with_opencode_db(
@@ -159,6 +162,18 @@ pub(crate) async fn poll_once(
             &format!("{:?}", snapshot.status),
             snapshot.error.as_deref(),
         );
+        for (kind, w) in &snapshot.windows {
+            if let Some(fraction) = w.fraction_used {
+                let _ = store.record_quota_snapshot(&llm_usage_core::storage::QuotaSnapshotRecord {
+                    id: None,
+                    provider: snapshot.provider.to_string(),
+                    timestamp: snapshot.timestamp,
+                    window_kind: kind.clone(),
+                    fraction_used: fraction,
+                    resets_at: w.ends_at,
+                });
+            }
+        }
         let alerts = engine.evaluate(&snapshot);
         snapshots.insert(snapshot.provider, snapshot);
         for a in alerts {

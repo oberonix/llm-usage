@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
 const DESKTOP_FILE_NAME: &str = "llm-usage.desktop";
 #[cfg(target_os = "macos")]
 const LAUNCH_AGENT_FILE_NAME: &str = "dev.buffbit.llm-usage.plist";

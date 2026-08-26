@@ -18,6 +18,7 @@ use crate::config::AnthropicConfig;
 use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind, WindowUsage};
 use crate::pricing::{anthropic_default, AnthropicTokenUsage, ModelRate};
 use crate::provider::Provider;
+use crate::storage::{ModelTurnRecord, Store};
 use anyhow::Result;
 use async_trait::async_trait;
 #[cfg(test)]
@@ -102,6 +103,8 @@ pub struct AnthropicProvider {
     oauth_backoff: Mutex<OAuthBackoff>,
     /// Optional opencode SQLite path; `None` disables the integration.
     opencode_db: Option<PathBuf>,
+    /// Optional state store for recording model-level turn analytics.
+    store: Option<std::sync::Arc<Store>>,
     /// Incremental aggregation cache. The previous implementation
     /// walked every JSONL in `~/.claude/projects/` and re-parsed every
     /// line on every poll, which pinned the runtime at 90 %+ CPU
@@ -113,10 +116,18 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(cfg: AnthropicConfig) -> Self {
-        Self::with_opencode_db(cfg, Some(crate::opencode::default_db_path()))
+        Self::with_store(cfg, Some(crate::opencode::default_db_path()), None)
     }
 
     pub fn with_opencode_db(cfg: AnthropicConfig, opencode_db: Option<PathBuf>) -> Self {
+        Self::with_store(cfg, opencode_db, None)
+    }
+
+    pub fn with_store(
+        cfg: AnthropicConfig,
+        opencode_db: Option<PathBuf>,
+        store: Option<std::sync::Arc<Store>>,
+    ) -> Self {
         let projects_dir = cfg
             .claude_projects_dir
             .clone()
@@ -133,6 +144,7 @@ impl AnthropicProvider {
             http,
             oauth_backoff: Mutex::new(OAuthBackoff::default()),
             opencode_db,
+            store,
             cache: Mutex::new(ScanCache::default()),
         }
     }
@@ -198,6 +210,26 @@ impl AnthropicProvider {
         if let Some(db) = &self.opencode_db {
             match crate::opencode::read_events(db, "anthropic") {
                 Ok(events) => {
+                    if let Some(store) = &self.store {
+                        let turns: Vec<ModelTurnRecord> = events
+                            .iter()
+                            .map(|e| ModelTurnRecord {
+                                turn_id: format!(
+                                    "opencode:anthropic:{}:{}",
+                                    e.timestamp.timestamp_millis(),
+                                    e.model
+                                ),
+                                provider: "anthropic".into(),
+                                model: e.model.clone(),
+                                timestamp: e.timestamp,
+                                tokens_in: e.input_tokens,
+                                tokens_out: e.output_tokens,
+                                tokens_cached: e.cached_tokens,
+                                tokens_cache_creation: 0,
+                            })
+                            .collect();
+                        let _ = store.record_model_turns_batch(&turns);
+                    }
                     for e in events {
                         let usage = AnthropicTokenUsage {
                             input_tokens: e.input_tokens,
@@ -325,7 +357,7 @@ impl AnthropicProvider {
                     .unwrap_or_else(|| id.to_string())
             })
             .unwrap_or(dedupe_key);
-        if !cache.seen_ids.insert(id_key) {
+        if !cache.seen_ids.insert(id_key.clone()) {
             return;
         }
 
@@ -344,10 +376,26 @@ impl AnthropicProvider {
                 .and_then(|c| c.ephemeral_1h_input_tokens)
                 .unwrap_or(0),
         };
+        let model_str = message.model.unwrap_or_default();
+        if let Some(store) = &self.store {
+            let turn = ModelTurnRecord {
+                turn_id: id_key,
+                provider: "anthropic".into(),
+                model: model_str.clone(),
+                timestamp,
+                tokens_in: tokens.input_tokens,
+                tokens_out: tokens.output_tokens,
+                tokens_cached: tokens.cache_read_input_tokens,
+                tokens_cache_creation: tokens
+                    .cache_creation_5m_input_tokens
+                    .saturating_add(tokens.cache_creation_1h_input_tokens),
+            };
+            let _ = store.record_model_turns_batch(&[turn]);
+        }
         cache.events.push(CachedEvent {
             timestamp,
             tokens,
-            model: message.model.unwrap_or_default(),
+            model: model_str,
         });
     }
 }
