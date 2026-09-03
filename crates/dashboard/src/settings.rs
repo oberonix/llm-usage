@@ -76,6 +76,7 @@ pub struct ConfigDraft {
     pub ollama_cloud_session_cookie: String,
     pub ollama_cloud_warn_at: Vec<f64>,
 
+
     // UI-only state for the setup-login flow. Not persisted.
     pub ollama_cloud_setup_status: Option<String>,
     pub ollama_cloud_setup_rx: Option<std::sync::mpsc::Receiver<SetupResult>>,
@@ -195,6 +196,7 @@ impl ConfigDraft {
             warn_at: self.ollama_cloud_warn_at.clone(),
         };
 
+
         c
     }
 
@@ -262,12 +264,12 @@ impl ConfigDraft {
                 return;
             }
         };
-        let header: String = cookies
-            .iter()
-            .filter(|c| c.domain.trim_start_matches('.').ends_with("ollama.com"))
-            .map(|c| format!("{}={}", c.name, c.value))
-            .collect::<Vec<_>>()
-            .join("; ");
+        let now_ts = chrono::Utc::now().timestamp().max(0) as u64;
+        let matching = cookies.iter().filter(|c| {
+            let d = c.domain.trim_start_matches('.');
+            d == "ollama.com" || d == "www.ollama.com"
+        });
+        let header = deduplicate_and_format_cookies(matching, now_ts);
         if header.is_empty() {
             self.ollama_cloud_setup_status = Some(
                 "No ollama.com cookies found in any installed browser. \
@@ -564,15 +566,12 @@ impl ConfigDraft {
                 return;
             }
         };
-        let header: String = cookies
-            .iter()
-            .filter(|c| {
-                let d = c.domain.trim_start_matches('.');
-                d.ends_with("chatgpt.com") || d.ends_with("openai.com")
-            })
-            .map(|c| format!("{}={}", c.name, c.value))
-            .collect::<Vec<_>>()
-            .join("; ");
+        let now_ts = chrono::Utc::now().timestamp().max(0) as u64;
+        let matching = cookies.iter().filter(|c| {
+            let d = c.domain.trim_start_matches('.');
+            d.ends_with("chatgpt.com") || d.ends_with("openai.com")
+        });
+        let header = deduplicate_and_format_cookies(matching, now_ts);
         if header.is_empty() {
             self.codex_chatgpt_setup_status = Some(
                 "No chatgpt.com / openai.com cookies found in any installed browser. \
@@ -934,6 +933,46 @@ fn format_thresholds(thresholds: &[f64]) -> String {
         .join(", ")
 }
 
+/// Format cookies into a deduplicated `name=val; name2=val2` string.
+/// When duplicate cookie names are encountered (e.g. from multiple installed
+/// browsers), the unexpired cookie with the highest/furthest expiration timestamp
+/// is chosen.
+pub(crate) fn deduplicate_and_format_cookies<'a, I>(cookies: I, now_ts: u64) -> String
+where
+    I: IntoIterator<Item = &'a rookie::common::enums::Cookie>,
+{
+    let mut by_name: std::collections::BTreeMap<&str, &rookie::common::enums::Cookie> =
+        std::collections::BTreeMap::new();
+    for c in cookies {
+        by_name
+            .entry(c.name.as_str())
+            .and_modify(|existing| {
+                let existing_score = cookie_freshness(existing.expires, now_ts);
+                let new_score = cookie_freshness(c.expires, now_ts);
+                if new_score > existing_score {
+                    *existing = c;
+                }
+            })
+            .or_insert(c);
+    }
+    by_name
+        .into_values()
+        .map(|c| format!("{}={}", c.name, c.value))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn cookie_freshness(expires: Option<u64>, now: u64) -> u64 {
+    match expires {
+        // Expired cookie gets score 0
+        Some(exp) if exp <= now => 0,
+        // Future expiration: higher is further out
+        Some(exp) => exp,
+        // Session cookie (no expiry): treat as valid, score above expired
+        None => now + 3600,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1018,5 +1057,45 @@ mod tests {
         let round = draft.to_config();
         assert_eq!(round.poll_interval_secs, 60);
         assert_eq!(round.icon_rotation_secs, 5);
+    }
+
+    #[test]
+    fn deduplicate_and_format_cookies_prefers_unexpired_cookie() {
+        let now: u64 = 1000;
+        let c1 = rookie::common::enums::Cookie {
+            domain: "ollama.com".into(),
+            name: "__Secure-session".into(),
+            value: "expired_val".into(),
+            path: "/".into(),
+            expires: Some(500), // in the past
+            http_only: true,
+            secure: true,
+            same_site: 0,
+        };
+        let c2 = rookie::common::enums::Cookie {
+            domain: "ollama.com".into(),
+            name: "__Secure-session".into(),
+            value: "fresh_val".into(),
+            path: "/".into(),
+            expires: Some(2000), // in the future
+            http_only: true,
+            secure: true,
+            same_site: 0,
+        };
+        let c3 = rookie::common::enums::Cookie {
+            domain: "ollama.com".into(),
+            name: "aid".into(),
+            value: "aid_val".into(),
+            path: "/".into(),
+            expires: None, // session cookie
+            http_only: true,
+            secure: true,
+            same_site: 0,
+        };
+        let cookies = vec![c1, c2, c3];
+        let header = deduplicate_and_format_cookies(&cookies, now);
+        assert!(header.contains("__Secure-session=fresh_val"));
+        assert!(!header.contains("expired_val"));
+        assert!(header.contains("aid=aid_val"));
     }
 }

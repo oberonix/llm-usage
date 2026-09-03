@@ -88,6 +88,10 @@ impl OllamaCloudProvider {
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                  (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
             )
+            // Never follow redirects to login/authkit pages — an expired
+            // session cookie causes a 303 to /signin, which must be surfaced
+            // as an authentication error rather than parsed as settings HTML.
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15))
             .build()
             .expect("reqwest");
@@ -124,6 +128,16 @@ impl OllamaCloudProvider {
             .send()
             .await
             .with_context(|| format!("GET {}", url))?;
+        if resp.status().is_redirection() {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            return Err(anyhow!(
+                "auth rejected (redirect to {loc}) — session cookie likely expired"
+            ));
+        }
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED
             || resp.status() == reqwest::StatusCode::FORBIDDEN
         {
@@ -136,6 +150,14 @@ impl OllamaCloudProvider {
             return Err(anyhow!("settings page {}", resp.status()));
         }
         let text = resp.text().await.context("read body")?;
+        if text.contains("<title>Sign in</title>")
+            || text.contains("hosted-authkit")
+            || text.contains("signin.ollama.com")
+        {
+            return Err(anyhow!(
+                "auth rejected (served sign-in page) — session cookie likely expired"
+            ));
+        }
         Ok(text)
     }
 }
@@ -225,6 +247,9 @@ impl Provider for OllamaCloudProvider {
             w.fraction_used = Some(row.percent / 100.0);
             w.ends_at = row.reset_at;
             w.started_at = Some(now);
+            if let Some(rc) = row.request_count {
+                w.request_count = rc;
+            }
             w.mark_stale_if_expired(now);
         }
 
@@ -295,6 +320,7 @@ fn fold_opencode_events(
 struct Parsed {
     plan: Option<String>,
     rows: Vec<UsageRow>,
+    extra_balance: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -302,18 +328,18 @@ struct UsageRow {
     label: String,
     percent: f64,
     reset_at: Option<DateTime<Utc>>,
+    request_count: Option<u64>,
 }
 
-/// Walk the DOM looking for the two `<div class="flex justify-between …">`
-/// header rows that pair a label span with an "X% used" span. The
-/// reset timestamp lives in a sibling `<div class="local-time" data-time="…">`
-/// under the same usage block — we find it by jumping up to the row's
-/// grandparent and scanning its descendants.
+/// Walk the DOM looking for the usage panels.
+/// Handles both the original layout (<2026-09) and the redesign (2026-09+)
+/// with segmented progress meters, request counts, and extra usage balance.
 fn parse_settings(html: &str) -> Parsed {
     let doc = Html::parse_document(html);
     let mut out = Parsed::default();
 
     // Plan: <h2 …>Cloud Usage<span class="capitalize">pro</span></h2>
+    // or <h2 …><span>Cloud usage</span><span class="… capitalize">pro</span></h2>
     if let Ok(plan_sel) = Selector::parse("h2 span.capitalize") {
         if let Some(el) = doc.select(&plan_sel).next() {
             let txt: String = el.text().collect::<String>().trim().to_string();
@@ -327,9 +353,10 @@ fn parse_settings(html: &str) -> Parsed {
         Ok(s) => s,
         Err(_) => return out,
     };
-    let span_sel = Selector::parse("span.text-sm").unwrap();
+    let span_sel = Selector::parse("span").unwrap();
     let local_time_sel = Selector::parse("div.local-time").unwrap();
-    // "27.8% used" — allow integers and decimals, ignore surrounding whitespace.
+    let segment_sel = Selector::parse("[data-usage-segment]").unwrap();
+    // "27.8% used" or "0.7% used" — allow integers and decimals, ignore surrounding whitespace.
     let percent_re = Regex::new(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*%\s*used\s*$").unwrap();
 
     for header in doc.select(&row_sel) {
@@ -337,19 +364,28 @@ fn parse_settings(html: &str) -> Parsed {
         if spans.len() < 2 {
             continue;
         }
-        let label: String = spans[0].text().collect::<String>().trim().to_string();
-        let percent_text: String = spans[1].text().collect::<String>().trim().to_string();
-        let Some(cap) = percent_re.captures(&percent_text) else {
-            continue;
-        };
-        let Ok(percent) = cap[1].parse::<f64>() else {
+        let mut percent_info = None;
+        for (i, span) in spans.iter().enumerate() {
+            let text = span.text().collect::<String>();
+            if let Some(cap) = percent_re.captures(&text) {
+                if let Ok(pct) = cap[1].parse::<f64>() {
+                    let label = if i > 0 {
+                        spans[i - 1].text().collect::<String>().trim().to_string()
+                    } else {
+                        spans[1].text().collect::<String>().trim().to_string()
+                    };
+                    percent_info = Some((label, pct));
+                    break;
+                }
+            }
+        }
+        let Some((label, percent)) = percent_info else {
             continue;
         };
 
-        // Reset time lives on the row's grandparent: header is the
-        // `flex justify-between` div, parent is the row container,
-        // and the local-time div is a sibling of header inside parent.
+        // Reset time and segment requests live inside the row's container element.
         let mut reset_at: Option<DateTime<Utc>> = None;
+        let mut request_count: Option<u64> = None;
         if let Some(parent_node) = header.parent() {
             if let Some(parent_el) = ElementRef::wrap(parent_node) {
                 if let Some(lt) = parent_el.select(&local_time_sel).next() {
@@ -359,6 +395,19 @@ fn parse_settings(html: &str) -> Parsed {
                             .map(|d| d.with_timezone(&Utc));
                     }
                 }
+                let mut total_reqs: u64 = 0;
+                let mut has_segments = false;
+                for seg in parent_el.select(&segment_sel) {
+                    if let Some(req_str) = seg.value().attr("data-requests") {
+                        if let Ok(count) = req_str.parse::<u64>() {
+                            total_reqs = total_reqs.saturating_add(count);
+                            has_segments = true;
+                        }
+                    }
+                }
+                if has_segments {
+                    request_count = Some(total_reqs);
+                }
             }
         }
 
@@ -366,7 +415,79 @@ fn parse_settings(html: &str) -> Parsed {
             label,
             percent,
             reset_at,
+            request_count,
         });
+    }
+
+    // Fallback: if no rows matched `div.flex.justify-between`, try extracting from `[data-usage-track]`
+    if out.rows.is_empty() {
+        if let Ok(track_sel) = Selector::parse("[data-usage-track]") {
+            let track_re = Regex::new(r"^(.*?)\s+([0-9]+(?:\.[0-9]+)?)\s*%\s*used").unwrap();
+            for track in doc.select(&track_sel) {
+                if let Some(label_attr) = track.value().attr("aria-label") {
+                    if let Some(cap) = track_re.captures(label_attr) {
+                        let label = cap[1].trim().to_string();
+                        if let Ok(percent) = cap[2].parse::<f64>() {
+                            let mut reset_at = None;
+                            let mut request_count = None;
+                            let mut curr = track.parent();
+                            for _ in 0..3 {
+                                if let Some(node) = curr {
+                                    if let Some(el) = ElementRef::wrap(node) {
+                                        if let Some(lt) = el.select(&local_time_sel).next() {
+                                            if let Some(t) = lt.value().attr("data-time") {
+                                                reset_at = DateTime::parse_from_rfc3339(t)
+                                                    .ok()
+                                                    .map(|d| d.with_timezone(&Utc));
+                                            }
+                                        }
+                                        let mut total_reqs: u64 = 0;
+                                        let mut has_segments = false;
+                                        for seg in el.select(&segment_sel) {
+                                            if let Some(req_str) = seg.value().attr("data-requests")
+                                            {
+                                                if let Ok(count) = req_str.parse::<u64>() {
+                                                    total_reqs = total_reqs.saturating_add(count);
+                                                    has_segments = true;
+                                                }
+                                            }
+                                        }
+                                        if has_segments {
+                                            request_count = Some(total_reqs);
+                                        }
+                                        if reset_at.is_some() {
+                                            break;
+                                        }
+                                    }
+                                    curr = node.parent();
+                                } else {
+                                    break;
+                                }
+                            }
+                            out.rows.push(UsageRow {
+                                label,
+                                percent,
+                                reset_at,
+                                request_count,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Extra usage: <div id="extra-usage">...<div class="text-2xl font-medium leading-tight">$0</div>...</div>
+    if let Ok(extra_sel) = Selector::parse("#extra-usage") {
+        if let Some(extra_el) = doc.select(&extra_sel).next() {
+            let money_re = Regex::new(r"\$\s*([0-9]+(?:\.[0-9]+)?)").unwrap();
+            let text = extra_el.text().collect::<String>();
+            if let Some(cap) = money_re.captures(&text) {
+                if let Ok(bal) = cap[1].parse::<f64>() {
+                    out.extra_balance = Some(bal);
+                }
+            }
+        }
     }
 
     out
@@ -388,6 +509,11 @@ fn build_headline(parsed: &Parsed, now: DateTime<Utc>) -> String {
             .map(|t| format_reset(t, now))
             .unwrap_or_default();
         parts.push(format!("{} {:.0}%{}", short_label, row.percent, reset));
+    }
+    if let Some(extra) = parsed.extra_balance {
+        if extra > 0.0 {
+            parts.push(format!("${:.2} extra", extra));
+        }
     }
     if parts.is_empty() {
         "scraped".into()
@@ -448,6 +574,55 @@ mod tests {
 </body></html>
 "#;
 
+    const NEW_SAMPLE: &str = r#"
+<html><body>
+  <div>
+    <h2 class="text-xl font-medium flex items-center space-x-2">
+      <span>Cloud usage</span>
+      <span class="text-xs font-normal px-2 py-0.5 rounded-full bg-neutral-100 text-neutral-600 capitalize">pro</span>
+    </h2>
+    <p class="text-xs text-neutral-500 mb-4">
+      Cloud models and capabilities such as web search contribute to session and weekly limits.
+    </p>
+    <div>
+      <div class="flex justify-between mb-2">
+        <span class="text-sm ">Session usage</span>
+        <span class="text-sm ">0.7% used</span>
+      </div>
+      <div class="relative group" data-usage-meter>
+        <div class="relative h-3 overflow-hidden rounded-full bg-neutral-200" data-usage-track aria-label="Session usage 0.7% used">
+          <div class="flex h-full overflow-hidden bg-neutral-950" style="width: 0.7%; ">
+            <button type="button" data-usage-segment data-model="kimi-k2.6" data-requests="13" aria-label="kimi-k2.6: 13 requests"></button>
+          </div>
+        </div>
+      </div>
+      <div class="text-xs text-neutral-500 mt-1 local-time" data-time="2026-09-03T19:00:00Z">Resets in 2 hours.</div>
+    </div>
+    <div>
+      <div class="flex justify-between mb-2">
+        <span class="text-sm">Weekly usage</span>
+        <span class="text-sm ">40.3% used</span>
+      </div>
+      <div class="relative group" data-usage-meter>
+        <div class="relative h-3 overflow-hidden rounded-full bg-neutral-200" data-usage-track aria-label="Weekly usage 40.3% used">
+          <div class="flex h-full overflow-hidden bg-neutral-950" style="width: 40.3%">
+            <button type="button" data-usage-segment data-model="kimi-k2.7-code" data-requests="399"></button>
+            <button type="button" data-usage-segment data-model="kimi-k2.6" data-requests="300"></button>
+            <button type="button" data-usage-segment data-model="glm-5.3" data-requests="689"></button>
+            <button type="button" data-usage-segment data-model="glm-5.2" data-requests="49"></button>
+          </div>
+        </div>
+      </div>
+      <div class="text-xs text-neutral-500 mt-1 local-time" data-time="2026-09-07T00:00:00Z">Resets in 3 days.</div>
+    </div>
+    <div id="extra-usage">
+      <div class="mb-1 text-xs text-neutral-500">Balance remaining</div>
+      <div class="text-2xl font-medium leading-tight">$0</div>
+    </div>
+  </div>
+</body></html>
+"#;
+
     #[test]
     fn parses_real_settings_layout() {
         let parsed = parse_settings(SAMPLE);
@@ -465,6 +640,35 @@ mod tests {
 
         assert_eq!(parsed.rows[1].label, "Weekly usage");
         assert!((parsed.rows[1].percent - 83.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parses_redesigned_settings_layout() {
+        let parsed = parse_settings(NEW_SAMPLE);
+        assert_eq!(parsed.plan.as_deref(), Some("pro"));
+        assert_eq!(parsed.rows.len(), 2);
+
+        assert_eq!(parsed.rows[0].label, "Session usage");
+        assert!((parsed.rows[0].percent - 0.7).abs() < 1e-6);
+        assert_eq!(parsed.rows[0].request_count, Some(13));
+        assert_eq!(
+            parsed.rows[0].reset_at,
+            DateTime::parse_from_rfc3339("2026-09-03T19:00:00Z")
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        );
+
+        assert_eq!(parsed.rows[1].label, "Weekly usage");
+        assert!((parsed.rows[1].percent - 40.3).abs() < 1e-6);
+        assert_eq!(parsed.rows[1].request_count, Some(1437));
+        assert_eq!(
+            parsed.rows[1].reset_at,
+            DateTime::parse_from_rfc3339("2026-09-07T00:00:00Z")
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        );
+
+        assert_eq!(parsed.extra_balance, Some(0.0));
     }
 
     #[test]
@@ -590,6 +794,34 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/settings"))
             .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=stale");
+        let err = p.fetch_settings_html().await.unwrap_err().to_string();
+        assert!(err.contains("session cookie"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_settings_303_redirect_yields_auth_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .respond_with(ResponseTemplate::new(303).insert_header("Location", "/signin"))
+            .mount(&server)
+            .await;
+        let p = provider_against(&server, "session=stale");
+        let err = p.fetch_settings_html().await.unwrap_err().to_string();
+        assert!(err.contains("session cookie"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_settings_signin_page_yields_auth_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<html><head><title>Sign in</title></head><body>login</body></html>",
+            ))
             .mount(&server)
             .await;
         let p = provider_against(&server, "session=stale");

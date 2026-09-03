@@ -86,11 +86,16 @@ impl Target {
     /// `name=value; …` string for this target.
     fn is_ready(self, url: &str, header: &str) -> bool {
         match self {
-            // Unchanged: the authenticated Ollama dashboard lives at
-            // /settings, and the cookie store may lag a tick behind
-            // navigation (webkit2gtk loads it lazily) so we also wait
-            // for a non-empty header.
-            Target::Ollama => url.contains("/settings") && !header.is_empty(),
+            // Landing on /settings or completing auth with __Secure-session
+            // on ollama.com (outside signin/auth flows).
+            Target::Ollama => {
+                (url.contains("/settings")
+                    || (url.contains("ollama.com")
+                        && !url.contains("/signin")
+                        && !url.contains("/auth")
+                        && header.contains("__Secure-session")))
+                    && !header.is_empty()
+            }
             // ChatGPT has no tidy post-login landmark, so key off the
             // session cookie itself: `__Secure-next-auth.session-token`
             // is only set once auth completes. Require we're back on
@@ -223,10 +228,7 @@ fn main() -> Result<()> {
                 let header = format_cookies(&cookies, target.domains());
 
                 if !target.is_ready(&url, &header) {
-                    window.set_title(&format!(
-                        "Sign in to {} — waiting…",
-                        target.product()
-                    ));
+                    window.set_title(&format!("Sign in to {} — waiting…", target.product()));
                     return;
                 }
 
@@ -248,27 +250,32 @@ fn main() -> Result<()> {
     });
 }
 
-/// Combine every cookie whose domain matches one of `domains` into a
-/// single Cookie request-header string (`name1=value1; name2=value2`).
-/// We keep all matching cookies rather than just the auth one because
-/// the settings/usage pages may rely on CSRF / preference cookies as a
-/// sanity check.
+/// Combine cookies matching domains into a deduplicated `Cookie` request-header string.
+/// For Ollama, avoids including third-party Hosted Authkit subdomains like `signin.ollama.com`.
 fn format_cookies(cookies: &[cookie::Cookie<'static>], domains: &[&str]) -> String {
-    cookies
-        .iter()
-        .filter(|c| {
-            c.domain()
-                .map(|d| {
-                    let d = d.trim_start_matches('.');
-                    // Exact host or a true sub-domain only — a bare
-                    // `ends_with("openai.com")` would also swallow a
-                    // cookie scoped to `evilopenai.com`.
-                    domains
-                        .iter()
-                        .any(|suffix| d == *suffix || d.ends_with(&format!(".{suffix}")))
+    let mut by_name: std::collections::BTreeMap<String, &cookie::Cookie<'static>> =
+        std::collections::BTreeMap::new();
+    for c in cookies {
+        let matches = c
+            .domain()
+            .map(|d| {
+                let d = d.trim_start_matches('.');
+                domains.iter().any(|suffix| {
+                    if *suffix == "ollama.com" {
+                        d == "ollama.com" || d == "www.ollama.com"
+                    } else {
+                        d == *suffix || d.ends_with(&format!(".{suffix}"))
+                    }
                 })
-                .unwrap_or(false)
-        })
+            })
+            .unwrap_or(false);
+
+        if matches {
+            by_name.entry(c.name().to_string()).or_insert(c);
+        }
+    }
+    by_name
+        .into_values()
         .map(|c| format!("{}={}", c.name(), c.value()))
         .collect::<Vec<_>>()
         .join("; ")
@@ -374,11 +381,24 @@ mod tests {
     }
 
     #[test]
+    fn format_cookies_excludes_signin_ollama_subdomain() {
+        let v = vec![
+            cookie("ollama.com", "__Secure-session", "abc"),
+            cookie("signin.ollama.com", "session", "workos"),
+        ];
+        let s = format_cookies(&v, Target::Ollama.domains());
+        assert!(s.contains("__Secure-session=abc"));
+        assert!(!s.contains("session=workos"));
+    }
+
+    #[test]
     fn ollama_ready_requires_settings_path_and_cookies() {
         let t = Target::Ollama;
         assert!(!t.is_ready("https://ollama.com/signin", "s=1"));
         assert!(!t.is_ready("https://ollama.com/settings", ""));
         assert!(t.is_ready("https://ollama.com/settings", "s=1"));
+        assert!(t.is_ready("https://ollama.com/", "__Secure-session=tok"));
+        assert!(!t.is_ready("https://ollama.com/signin", "__Secure-session=tok"));
     }
 
     #[test]
