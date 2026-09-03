@@ -16,6 +16,20 @@
 //! the tray, alerts, and icon rotation treat Muse Spark like any
 //! other quota-bearing provider.
 //!
+//! Quota reverse-engineering (3 data points — see
+//! `/tmp/muse_quota_fit.jsonl`): fitting three `/usage` snapshots
+//! against machine-wide log consumption pins the metered metric to
+//! **non-cached input plus output**, with Current ≈ 4.41 M units per
+//! fixed 5 h window (10:57–15:57 local) and Weekly ≈ 13.2 M per 7 d
+//! (3× ratio, weekly baseline ≈ 0). The third snapshot confirmed the
+//! prediction exactly (58.0 % / 20.05 %) — but ONLY when fitted
+//! against the snapshot's "as of" time: the `/usage` session
+//! counters are live at render while the quota percentages lag by
+//! minutes. These fitted limits back the `quota_estimate` fractions
+//! (on by default, headline tagged `~` and `(est.)`); a local
+//! estimate systematically leads the official display, so the
+//! labeling stays even though the flag defaults on.
+//!
 //! ## Observed schema (verified against Muse Code 1.0.x session logs
 //! under `~/.local/share/muse/sessions/YYYY/MM/DD/*/session.jsonl`,
 //! including `subagent/*/session.jsonl`)
@@ -177,8 +191,18 @@ impl Provider for MuseSparkProvider {
             ));
         }
 
+        // Estimate slots. The "Current" quota window is a fixed 5 h
+        // slot (boundaries at 00:57 + 5k local, inferred from one
+        // observed 10:57–15:57 window); "Weekly" runs Sunday 17:00 to
+        // Sunday 17:00 local. Both rules are approximate — see
+        // `current_slot` / `weekly_slot`.
+        let (slot5_start, slot5_end) = current_slot(now);
+        let (slot7_start, slot7_end) = weekly_slot(now);
+        let estimate = self.cfg.quota_estimate;
+
         let mut hour = Bucket::default();
         let mut today = Bucket::default();
+        let mut five = Bucket::default();
         let mut week = Bucket::default();
         let mut month = Bucket::default();
         for e in &events {
@@ -188,7 +212,18 @@ impl Provider for MuseSparkProvider {
             if same_local_day(e.timestamp, now) {
                 today.add(e);
             }
-            if same_iso_week(e.timestamp, now) {
+            if e.timestamp >= slot5_start {
+                five.add(e);
+            }
+            if estimate {
+                // Estimate mode counts the week window inside the
+                // Sunday–Sunday quota slot so the numerator matches
+                // the fitted denominator; otherwise it stays the
+                // calendar ISO week like every sibling provider.
+                if e.timestamp >= slot7_start {
+                    week.add(e);
+                }
+            } else if same_iso_week(e.timestamp, now) {
                 week.add(e);
             }
             if e.timestamp.year() == now.year() && e.timestamp.month() == now.month() {
@@ -228,20 +263,58 @@ impl Provider for MuseSparkProvider {
         }
         t.recompute_fraction();
 
+        // The 5 h activity window mirrors Codex's rolling-5 h row so
+        // the card has the same density; in estimate mode it doubles
+        // as the "Current" quota window below.
+        let w5 = snap.window_mut(WindowKind::FiveHourRolling);
+        w5.tokens_in = five.input_tokens;
+        w5.tokens_out = five.output_tokens;
+        w5.request_count = five.turns;
+        w5.spend_usd = Some(five.cost_usd);
+        let current_frac = if estimate {
+            match self.cfg.current_limit_units {
+                Some(limit) if limit > 0 => {
+                    let frac = five.uncached_units as f64 / limit as f64;
+                    w5.fraction_used = Some(frac);
+                    w5.ends_at = Some(slot5_end);
+                    w5.started_at = Some(slot5_start);
+                    Some(frac)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let w = snap.window_mut(WindowKind::ThisWeek);
         w.tokens_in = week.input_tokens;
         w.tokens_out = week.output_tokens;
         w.request_count = week.turns;
         w.spend_usd = Some(week.cost_usd);
-        // Same quota treatment for the weekly budget: `ends_at` is
-        // the ISO-week boundary, which also feeds the tray icon's
-        // weekly bar and pace marker via the shared "week" label.
-        w.limit_usd = self.cfg.weekly_budget_usd;
-        if w.limit_usd.is_some() {
-            w.ends_at = Some(end_of_iso_week(now));
-            w.started_at = Some(now);
-        }
-        w.recompute_fraction();
+        let weekly_frac = if estimate {
+            match self.cfg.weekly_limit_units {
+                Some(limit) if limit > 0 => {
+                    let frac = week.uncached_units as f64 / limit as f64;
+                    w.fraction_used = Some(frac);
+                    w.ends_at = Some(slot7_end);
+                    w.started_at = Some(slot7_start);
+                    Some(frac)
+                }
+                _ => None,
+            }
+        } else {
+            // Dollar-budget quota treatment for the weekly budget:
+            // `ends_at` is the ISO-week boundary, which also feeds
+            // the tray icon's weekly bar and pace marker via the
+            // shared "week" label.
+            w.limit_usd = self.cfg.weekly_budget_usd;
+            if w.limit_usd.is_some() {
+                w.ends_at = Some(end_of_iso_week(now));
+                w.started_at = Some(now);
+            }
+            w.recompute_fraction();
+            w.fraction_used
+        };
 
         let m = snap.window_mut(WindowKind::ThisMonth);
         m.tokens_in = month.input_tokens;
@@ -250,13 +323,30 @@ impl Provider for MuseSparkProvider {
         m.spend_usd = Some(month.cost_usd);
         m.recompute_fraction();
 
-        snap.headline = Some(if self.cfg.show_spend {
-            format!(
+        snap.headline = Some(match (estimate, current_frac, weekly_frac) {
+            // Estimated quota headline in `/usage` vocabulary. The
+            // "~" before each percent plus the "(est.)" tag are
+            // load-bearing: these fractions are fitted from a
+            // handful of snapshots, and the official display lags
+            // live consumption by minutes.
+            (true, Some(c), Some(wk)) => {
+                format!(
+                    "Current ~{:.0}% · Weekly ~{:.0}% (est.)",
+                    c * 100.0,
+                    wk * 100.0
+                )
+            }
+            (true, Some(c), None) => {
+                format!("Current ~{:.0}% (est.)", c * 100.0)
+            }
+            (true, None, Some(wk)) => {
+                format!("Weekly ~{:.0}% (est.)", wk * 100.0)
+            }
+            _ if self.cfg.show_spend => format!(
                 "${:.2} today · ${:.2} 7d · {} turns",
                 today.cost_usd, week.cost_usd, week.turns
-            )
-        } else {
-            format!("{} turns today · {} turns 7d", today.turns, week.turns)
+            ),
+            _ => format!("{} turns today · {} turns 7d", today.turns, week.turns),
         });
         if !self.cfg.show_spend {
             snap.strip_spend();
@@ -270,6 +360,10 @@ struct Bucket {
     turns: u64,
     input_tokens: u64,
     output_tokens: u64,
+    /// Non-cached input plus output (reasoning folded into output):
+    /// the fitted subscription meter. Cached tokens ride the prompt
+    /// cache and meter at zero weight.
+    uncached_units: u64,
     cost_usd: f64,
 }
 
@@ -296,6 +390,12 @@ impl Bucket {
         self.output_tokens = self
             .output_tokens
             .saturating_add(e.output_tokens.saturating_add(e.reasoning_tokens));
+        self.uncached_units = self.uncached_units.saturating_add(
+            e.input_tokens
+                .saturating_sub(e.cached_tokens)
+                .saturating_add(e.output_tokens)
+                .saturating_add(e.reasoning_tokens),
+        );
         self.cost_usd += muse_spark_cost_usd(
             e.input_tokens,
             e.output_tokens,
@@ -528,6 +628,60 @@ fn end_of_iso_week(now: DateTime<Utc>) -> DateTime<Utc> {
         .unwrap_or(now + chrono::Duration::days(7))
 }
 
+/// Start and end of the fixed 5 h "Current" quota slot containing
+/// `now`. Boundaries sit at 00:57 + 5k hours local — inferred from a
+/// single observed window (10:57–15:57), so treat the alignment as
+/// approximate: if a future `/usage` reset lands off these marks,
+/// the anchor needs revisiting, not the 5 h length (the reset stayed
+/// fixed across snapshots 45 min apart, ruling out a rolling
+/// window).
+fn current_slot(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let local = now.with_timezone(&chrono::Local);
+    let today = local.date_naive();
+    let mut start_naive = today.and_hms_opt(0, 57, 0).expect("00:57 exists");
+    while local.naive_local() < start_naive {
+        start_naive -= chrono::Duration::hours(5);
+    }
+    while local.naive_local() >= start_naive + chrono::Duration::hours(5) {
+        start_naive += chrono::Duration::hours(5);
+    }
+    let end_naive = start_naive + chrono::Duration::hours(5);
+    (
+        to_utc_or(start_naive, now - chrono::Duration::hours(5)),
+        to_utc_or(end_naive, now),
+    )
+}
+
+/// Start and end of the 7 d "Weekly" quota slot containing `now`:
+/// most recent Sunday 17:00 local through the following Sunday.
+/// Inferred from one observed reset (Sun Sep 6, 5 PM) — same
+/// approximate-alignment caveat as [`current_slot`].
+fn weekly_slot(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let local = now.with_timezone(&chrono::Local);
+    let days_since_sunday = i64::from(local.weekday().number_from_sunday()) - 1;
+    let mut start_naive = (local.date_naive() - chrono::Days::new(days_since_sunday as u64))
+        .and_hms_opt(17, 0, 0)
+        .expect("17:00 exists");
+    if local.naive_local() < start_naive {
+        // Sunday before 17:00 belongs to the slot that ends today.
+        start_naive -= chrono::Duration::days(7);
+    }
+    let end_naive = start_naive + chrono::Duration::days(7);
+    (
+        to_utc_or(start_naive, now - chrono::Duration::days(7)),
+        to_utc_or(end_naive, now),
+    )
+}
+
+/// Local-naive → UTC with a DST-fold fallback to `or`.
+fn to_utc_or(naive: chrono::NaiveDateTime, or: DateTime<Utc>) -> DateTime<Utc> {
+    chrono::Local
+        .from_local_datetime(&naive)
+        .single()
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or(or)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,6 +737,12 @@ mod tests {
         MuseSparkProvider::with_sessions_dir(MuseSparkConfig::default(), dir.path().to_path_buf())
     }
 
+    fn activity_only_provider_for(dir: &TempDir) -> MuseSparkProvider {
+        let mut cfg = MuseSparkConfig::default();
+        cfg.quota_estimate = false;
+        MuseSparkProvider::with_sessions_dir(cfg, dir.path().to_path_buf())
+    }
+
     #[tokio::test]
     async fn parses_nested_frame_and_flat_record() {
         let now = Utc::now();
@@ -596,7 +756,7 @@ mod tests {
             r#"{"schema_version":1,"payload":{"event":{"kind":"something_else"}}}"#.to_string(),
         ];
         let dir = fixture_dir_with(&lines);
-        let p = provider_for(&dir);
+        let p = activity_only_provider_for(&dir);
         let snap = p.poll().await.unwrap();
         assert!(matches!(snap.status, ProviderStatus::Ok));
         let today = snap.window(WindowKind::Today).expect("today window");
@@ -651,6 +811,9 @@ mod tests {
         let mut cfg = MuseSparkConfig::default();
         cfg.weekly_budget_usd = Some(11.0);
         cfg.daily_budget_usd = Some(11.0);
+        // Estimate off: this test covers the dollar-budget path, and
+        // the estimate would otherwise override the week fraction.
+        cfg.quota_estimate = false;
         // show_spend stays false: spend hidden, but the budget
         // fractions must survive via their ends_at markers.
         let p = MuseSparkProvider::with_sessions_dir(cfg, dir.path().to_path_buf());
@@ -682,6 +845,9 @@ mod tests {
         )]);
         let mut cfg = MuseSparkConfig::default();
         cfg.show_spend = true;
+        // Estimate off so the spend headline (not the estimate
+        // headline) is what gets asserted here.
+        cfg.quota_estimate = false;
         let p = MuseSparkProvider::with_sessions_dir(cfg, dir.path().to_path_buf());
         let snap = p.poll().await.unwrap();
         // All input cached: 1M × $0.15 = $0.15.
@@ -716,5 +882,114 @@ mod tests {
         assert!(end_of_iso_week(now) > now);
         // ISO-week boundary is at most 7 days out.
         assert!((end_of_iso_week(now) - now).num_days() <= 7);
+    }
+
+    #[test]
+    fn quota_estimate_is_on_by_default() {
+        assert!(MuseSparkConfig::default().quota_estimate);
+    }
+
+    #[tokio::test]
+    async fn estimate_emits_labeled_current_and_weekly_fractions() {
+        let now = Utc::now();
+        let m = micros(now);
+        // Uncached units: (1000 − 100) + 200 + 10 = 1110, plus
+        // (500 − 0) + 50 = 550 → 1660 total.
+        let dir = fixture_dir_with(&[
+            usage_line(m, "usage-1", "provider", 1000, 200, 100, 10),
+            usage_line(m, "usage-2", "provider", 500, 50, 0, 0),
+        ]);
+        let mut cfg = MuseSparkConfig::default();
+        cfg.quota_estimate = true;
+        cfg.current_limit_units = Some(3320);
+        cfg.weekly_limit_units = Some(3320);
+        // show_spend stays false: the estimate fractions must stand
+        // on their own via ends_at, with spend hidden.
+        let p = MuseSparkProvider::with_sessions_dir(cfg, dir.path().to_path_buf());
+        let snap = p.poll().await.unwrap();
+        // 1660 / 3320 = exactly 50 % on both windows.
+        let five = snap.window(WindowKind::FiveHourRolling).unwrap();
+        assert_eq!(five.fraction_used, Some(0.5));
+        assert!(five.ends_at.is_some(), "estimate needs a reset time");
+        assert!(five.spend_usd.is_none());
+        let week = snap.window(WindowKind::ThisWeek).unwrap();
+        assert_eq!(week.fraction_used, Some(0.5));
+        assert!(week.ends_at.is_some());
+        assert_eq!(
+            snap.headline.as_deref(),
+            Some("Current ~50% · Weekly ~50% (est.)")
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_without_limits_falls_back_to_turns() {
+        let now = Utc::now();
+        let dir = fixture_dir_with(&[usage_line(
+            micros(now),
+            "usage-1",
+            "provider",
+            100,
+            10,
+            0,
+            0,
+        )]);
+        let mut cfg = MuseSparkConfig::default();
+        cfg.quota_estimate = true;
+        cfg.current_limit_units = None;
+        cfg.weekly_limit_units = None;
+        let p = MuseSparkProvider::with_sessions_dir(cfg, dir.path().to_path_buf());
+        let snap = p.poll().await.unwrap();
+        assert!(
+            snap.windows.values().all(|w| w.fraction_used.is_none()),
+            "no limits → no estimate fractions"
+        );
+        assert_eq!(snap.headline.as_deref(), Some("1 turns today · 1 turns 7d"));
+    }
+
+    /// Build a UTC instant from local wall-clock components so slot
+    /// tests hold in any machine timezone.
+    fn local_utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        chrono::Local
+            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .single()
+            .expect("unambiguous local time")
+            .with_timezone(&Utc)
+    }
+
+    fn local_ymdhm(dt: DateTime<Utc>) -> (i32, u32, u32, u32, u32) {
+        use chrono::Timelike;
+        let l = dt.with_timezone(&chrono::Local);
+        (l.year(), l.month(), l.day(), l.hour(), l.minute())
+    }
+
+    #[test]
+    fn current_slot_pins_the_observed_window() {
+        // Thu 13:30 → slot [10:57, 15:57], the observed window.
+        let (s, e) = current_slot(local_utc(2026, 9, 3, 13, 30));
+        assert_eq!(local_ymdhm(s), (2026, 9, 3, 10, 57));
+        assert_eq!(local_ymdhm(e), (2026, 9, 3, 15, 57));
+        // Early morning belongs to the overnight slot. (Slots step
+        // 5 h back from 00:57, so this is [19:57, 00:57] — the
+        // [20:57, 01:57] grid would not contain the observed 10:57
+        // boundary.)
+        let (s, e) = current_slot(local_utc(2026, 9, 3, 0, 5));
+        assert_eq!(local_ymdhm(s), (2026, 9, 2, 19, 57));
+        assert_eq!(local_ymdhm(e), (2026, 9, 3, 0, 57));
+    }
+
+    #[test]
+    fn weekly_slot_runs_sunday_17_to_sunday_17() {
+        // Thu → Sun Aug 30 17:00 – Sun Sep 6 17:00, the observed reset.
+        let (s, e) = weekly_slot(local_utc(2026, 9, 3, 13, 30));
+        assert_eq!(local_ymdhm(s), (2026, 8, 30, 17, 0));
+        assert_eq!(local_ymdhm(e), (2026, 9, 6, 17, 0));
+        // Sunday before 17:00 still belongs to the ending slot.
+        let (s, e) = weekly_slot(local_utc(2026, 9, 6, 10, 0));
+        assert_eq!(local_ymdhm(s), (2026, 8, 30, 17, 0));
+        assert_eq!(local_ymdhm(e), (2026, 9, 6, 17, 0));
+        // Sunday evening opens the next slot.
+        let (s, e) = weekly_slot(local_utc(2026, 9, 6, 18, 0));
+        assert_eq!(local_ymdhm(s), (2026, 9, 6, 17, 0));
+        assert_eq!(local_ymdhm(e), (2026, 9, 13, 17, 0));
     }
 }

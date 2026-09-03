@@ -84,6 +84,9 @@ pub struct ConfigDraft {
     pub muse_daily_budget_usd: f64,
     pub muse_daily_budget_enabled: bool,
     pub muse_warn_at: Vec<f64>,
+    pub muse_quota_estimate: bool,
+    pub muse_current_limit_munits: f64,
+    pub muse_weekly_limit_munits: f64,
 
     // UI-only state for the setup-login flow. Not persisted.
     pub ollama_cloud_setup_status: Option<String>,
@@ -163,6 +166,11 @@ impl ConfigDraft {
             muse_daily_budget_usd: c.muse_spark.daily_budget_usd.unwrap_or(5.0),
             muse_daily_budget_enabled: c.muse_spark.daily_budget_usd.is_some(),
             muse_warn_at: c.muse_spark.warn_at.clone(),
+            muse_quota_estimate: c.muse_spark.quota_estimate,
+            muse_current_limit_munits: c.muse_spark.current_limit_units.unwrap_or(4_410_000) as f64
+                / 1_000_000.0,
+            muse_weekly_limit_munits: c.muse_spark.weekly_limit_units.unwrap_or(13_200_000) as f64
+                / 1_000_000.0,
 
             ollama_cloud_setup_status: None,
             ollama_cloud_setup_rx: None,
@@ -226,6 +234,9 @@ impl ConfigDraft {
                 None
             },
             warn_at: self.muse_warn_at.clone(),
+            quota_estimate: self.muse_quota_estimate,
+            current_limit_units: Some((self.muse_current_limit_munits * 1_000_000.0) as u64),
+            weekly_limit_units: Some((self.muse_weekly_limit_munits * 1_000_000.0) as u64),
             ..c.muse_spark
         };
 
@@ -496,6 +507,25 @@ impl ConfigDraft {
             field_row(ui, "Alert at", |ui| {
                 alert_preset_combo(ui, "muse_spark_alert", &mut self.muse_warn_at);
             });
+            ui.checkbox(&mut self.muse_quota_estimate, "Show estimated quota");
+            field_row(ui, "Current limit", |ui| {
+                ui.add_enabled(
+                    self.muse_quota_estimate,
+                    egui::DragValue::new(&mut self.muse_current_limit_munits)
+                        .speed(0.01)
+                        .range(0.0..=1000.0)
+                        .suffix("M units"),
+                );
+            });
+            field_row(ui, "Weekly limit", |ui| {
+                ui.add_enabled(
+                    self.muse_quota_estimate,
+                    egui::DragValue::new(&mut self.muse_weekly_limit_munits)
+                        .speed(0.1)
+                        .range(0.0..=1000.0)
+                        .suffix("M units"),
+                );
+            });
             field_row(ui, "Weekly budget", |ui| {
                 ui.checkbox(&mut self.muse_weekly_budget_enabled, "set");
                 ui.add_enabled(
@@ -519,9 +549,12 @@ impl ConfigDraft {
             help(
                 ui,
                 "Usage comes from your local Muse session logs — no sign-in \
-                 needed. Muse Spark is pay-as-you-go with no plan quota, so \
-                 the budgets above are what turn activity into quota bars \
-                 and alerts; leave them unset for turns-and-tokens only.",
+                 needed. The estimated quota divides uncached-token activity \
+                 by the limits above (reverse-engineered from /usage \
+                 snapshots, ~4.41 M per 5 h Current window and ~13.2 M per \
+                 Weekly window) and tags the headline with ~ and (est.). \
+                 Untick for turns-and-tokens only; the $ budgets below apply \
+                 when the estimate is off.",
             );
         });
     }

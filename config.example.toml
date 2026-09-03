@@ -76,12 +76,20 @@ enabled = true
 # No sign-in needed — usage is read from your local Muse session logs
 # (defaults to ~/.local/share/muse/sessions).
 # sessions_dir = "/path/to/muse/sessions"
-# Muse Spark is pay-as-you-go with no plan quota, so quota bars and
-# alerts only appear once you set a budget to track against.
-# When false (default) only turns and tokens are shown; flip to true
-# to also display the $ estimate (standard tier: $1.25/1M in,
+# Estimated quota (default on): the Current/Weekly bars divide
+# uncached-token activity by the limits below, reverse-engineered
+# from /usage snapshots on the Everyday Usage plan (~4.41M per fixed
+# 5h window, ~13.2M per Sun–Sun week). Headlines carry ~ and (est.)
+# because the fit is approximate and the official display lags
+# minutes behind. Set false for turns-and-tokens only.
+quota_estimate = true
+current_limit_units = 4410000
+weekly_limit_units = 13200000
+# When false (default) only quota/turns/tokens are shown; flip to
+# true to also display the $ estimate (standard tier: $1.25/1M in,
 # $4.25/1M out, $0.15/1M cached).
 show_spend = false
+# Dollar budgets apply when the estimate is off.
 # weekly_budget_usd = 20.0
 # daily_budget_usd = 5.0
 warn_at = [0.75, 0.9]

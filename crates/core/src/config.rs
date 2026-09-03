@@ -195,6 +195,24 @@ pub struct MuseSparkConfig {
     /// When false (default) the UI shows turns and tokens but hides
     /// the pay-as-you-go $ estimate.
     pub show_spend: bool,
+    /// Reverse-engineered quota estimate. When true (the default)
+    /// the provider adds `fraction_used` to the `5h` ("Current") and
+    /// `week` ("Weekly") windows from local uncached-token activity
+    /// divided by the limits below, with reset times from the
+    /// inferred slot rules. The limits are fitted from a handful of
+    /// `/usage` snapshots (see `providers/muse_spark.rs`), the
+    /// official display lags minutes behind live consumption, and a
+    /// local estimate must never pose as the real numbers — the
+    /// headline carries a "~" prefix plus an "(est.)" tag while this
+    /// is on. Set false for activity-only display.
+    pub quota_estimate: bool,
+    /// Uncached-token limit for the fixed 5 h "Current" window.
+    /// Default 4.41 M fitted from `/usage` on the "Muse Code Everyday
+    /// Usage" plan; adjust if your plan differs.
+    pub current_limit_units: Option<u64>,
+    /// Uncached-token limit for the 7 d "Weekly" window. Default
+    /// 13.2 M from the same fit.
+    pub weekly_limit_units: Option<u64>,
 }
 
 impl Default for MuseSparkConfig {
@@ -206,6 +224,9 @@ impl Default for MuseSparkConfig {
             daily_budget_usd: None,
             warn_at: vec![0.75, 0.9],
             show_spend: false,
+            quota_estimate: true,
+            current_limit_units: Some(4_410_000),
+            weekly_limit_units: Some(13_200_000),
         }
     }
 }
@@ -349,6 +370,18 @@ mod tests {
         assert_eq!(parsed.ollama_cloud.warn_at, cfg.ollama_cloud.warn_at);
         assert_eq!(parsed.muse_spark.warn_at, cfg.muse_spark.warn_at);
         assert_eq!(parsed.muse_spark.show_spend, cfg.muse_spark.show_spend);
+        assert_eq!(
+            parsed.muse_spark.quota_estimate,
+            cfg.muse_spark.quota_estimate
+        );
+        assert_eq!(
+            parsed.muse_spark.current_limit_units,
+            cfg.muse_spark.current_limit_units
+        );
+        assert_eq!(
+            parsed.muse_spark.weekly_limit_units,
+            cfg.muse_spark.weekly_limit_units
+        );
     }
 
     #[test]
