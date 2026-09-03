@@ -86,6 +86,7 @@ pub fn provider_omarchy_meta(provider: ProviderId) -> (&'static str, &'static st
         ProviderId::Anthropic => ("claude", "Claude Code"),
         ProviderId::CodexCli => ("codex", "Codex"),
         ProviderId::OllamaCloud => ("ollama", "Ollama Cloud"),
+        ProviderId::MuseSpark => ("muse", "Muse Spark"),
     }
 }
 
@@ -99,10 +100,7 @@ pub fn snapshot_to_omarchy_record(snap: &UsageSnapshot) -> OmarchyAgentRecord {
             .error
             .clone()
             .unwrap_or_else(|| "Unavailable".to_string()),
-        ProviderStatus::Degraded => snap
-            .error
-            .clone()
-            .unwrap_or_else(|| "Degraded".to_string()),
+        ProviderStatus::Degraded => snap.error.clone().unwrap_or_else(|| "Degraded".to_string()),
         ProviderStatus::Ok => String::new(),
     };
 
@@ -115,10 +113,7 @@ pub fn snapshot_to_omarchy_record(snap: &UsageSnapshot) -> OmarchyAgentRecord {
                 "month" => "Monthly (30-day)".to_string(),
                 other => other.to_string(),
             };
-            let resets_at = w
-                .ends_at
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default();
+            let resets_at = w.ends_at.map(|dt| dt.to_rfc3339()).unwrap_or_default();
             limits.push(OmarchyLimit {
                 label: omarchy_label,
                 percent: frac.clamp(0.0, 2.0),
@@ -134,7 +129,9 @@ pub fn snapshot_to_omarchy_record(snap: &UsageSnapshot) -> OmarchyAgentRecord {
         .unwrap_or(0);
 
     let week_window = snap.window(WindowKind::ThisWeek);
-    let total_prompts = week_window.map(|w| w.request_count).unwrap_or(today_prompts);
+    let total_prompts = week_window
+        .map(|w| w.request_count)
+        .unwrap_or(today_prompts);
 
     let now = snap.timestamp;
     let today_str = now.format("%Y-%m-%d").to_string();
@@ -142,7 +139,9 @@ pub fn snapshot_to_omarchy_record(snap: &UsageSnapshot) -> OmarchyAgentRecord {
     // 7-day trailing histogram (day-6 .. today)
     let mut recent_days = Vec::with_capacity(7);
     for offset in (0..7).rev() {
-        let day_date = (now - Duration::days(offset)).format("%Y-%m-%d").to_string();
+        let day_date = (now - Duration::days(offset))
+            .format("%Y-%m-%d")
+            .to_string();
         let count = if day_date == today_str {
             today_total_tokens
         } else {
@@ -200,7 +199,8 @@ pub fn export_snapshots_to_omarchy(snapshots: &BTreeMap<ProviderId, UsageSnapsho
     let Some(dir) = omarchy_usage_dir() else {
         return Ok(());
     };
-    std::fs::create_dir_all(&dir).with_context(|| format!("create omarchy usage dir {}", dir.display()))?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create omarchy usage dir {}", dir.display()))?;
 
     for snap in snapshots.values() {
         let (id_slug, _) = provider_omarchy_meta(snap.provider);

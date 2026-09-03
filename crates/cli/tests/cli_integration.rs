@@ -176,6 +176,10 @@ warn_at = []
 enabled = false
 warn_at = []
 
+[muse_spark]
+enabled = false
+warn_at = []
+
 [alerts]
 debounce_secs = 3600
 disabled = true

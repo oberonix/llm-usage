@@ -11,7 +11,8 @@
 use llm_usage_core::config::Config;
 use llm_usage_core::provider::Provider;
 use llm_usage_core::providers::{
-    AnthropicProvider, AntigravityProvider, CodexCliProvider, OllamaCloudProvider,
+    AnthropicProvider, AntigravityProvider, CodexCliProvider, MuseSparkProvider,
+    OllamaCloudProvider,
 };
 
 #[tokio::main]
@@ -42,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
             config.ollama_cloud.clone(),
             opencode,
         )),
+        Box::new(MuseSparkProvider::new(config.muse_spark.clone())),
     ];
 
     for p in providers {

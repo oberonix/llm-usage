@@ -38,6 +38,7 @@ pub struct Config {
     pub antigravity: AntigravityConfig,
     pub codex_cli: CodexCliConfig,
     pub ollama_cloud: OllamaCloudConfig,
+    pub muse_spark: MuseSparkConfig,
     pub alerts: AlertsConfig,
 }
 
@@ -58,6 +59,7 @@ impl Default for Config {
             antigravity: AntigravityConfig::default(),
             codex_cli: CodexCliConfig::default(),
             ollama_cloud: OllamaCloudConfig::default(),
+            muse_spark: MuseSparkConfig::default(),
             alerts: AlertsConfig::default(),
         }
     }
@@ -171,6 +173,39 @@ impl Default for OllamaCloudConfig {
             enabled: false,
             session_cookie: None,
             warn_at: vec![0.75, 0.9],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MuseSparkConfig {
+    pub enabled: bool,
+    /// Override path; defaults to the OS data dir's
+    /// `muse/sessions` (e.g. `~/.local/share/muse/sessions`).
+    pub sessions_dir: Option<PathBuf>,
+    /// Optional pay-as-you-go budgets. Muse Spark exposes no plan
+    /// quota — these turn local token activity into quota-like
+    /// windows (with reset times at the week/day boundary) so the
+    /// tray, alerts, and icon rotation treat them like any other
+    /// provider's quota bars. `None` (default) means activity only.
+    pub weekly_budget_usd: Option<f64>,
+    pub daily_budget_usd: Option<f64>,
+    pub warn_at: Vec<f64>,
+    /// When false (default) the UI shows turns and tokens but hides
+    /// the pay-as-you-go $ estimate.
+    pub show_spend: bool,
+}
+
+impl Default for MuseSparkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sessions_dir: None,
+            weekly_budget_usd: None,
+            daily_budget_usd: None,
+            warn_at: vec![0.75, 0.9],
+            show_spend: false,
         }
     }
 }
@@ -312,6 +347,8 @@ mod tests {
         assert_eq!(parsed.anthropic.warn_at, cfg.anthropic.warn_at);
         assert_eq!(parsed.codex_cli.warn_at, cfg.codex_cli.warn_at);
         assert_eq!(parsed.ollama_cloud.warn_at, cfg.ollama_cloud.warn_at);
+        assert_eq!(parsed.muse_spark.warn_at, cfg.muse_spark.warn_at);
+        assert_eq!(parsed.muse_spark.show_spend, cfg.muse_spark.show_spend);
     }
 
     #[test]

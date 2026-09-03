@@ -24,11 +24,12 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 use crate::runtime::{RuntimeHandle, RuntimeMessage};
 
 /// Order providers iterate in when the icon rotates. Matches the menu order.
-const PROVIDER_ORDER: [ProviderId; 4] = [
+const PROVIDER_ORDER: [ProviderId; 5] = [
     ProviderId::Anthropic,
     ProviderId::Antigravity,
     ProviderId::CodexCli,
     ProviderId::OllamaCloud,
+    ProviderId::MuseSpark,
 ];
 
 /// Lower bound to keep a hand-edited config from making the icon flicker.
@@ -442,6 +443,11 @@ mod tests {
     }
 
     #[test]
+    fn provider_order_includes_muse_spark_for_menu_and_icon_rotation() {
+        assert!(PROVIDER_ORDER.contains(&ProviderId::MuseSpark));
+    }
+
+    #[test]
     fn format_quota_row_includes_bar_pct_label_and_reset() {
         let mut w = WindowUsage::default();
         w.fraction_used = Some(0.42);
@@ -523,23 +529,30 @@ mod tests {
     // path resolver is pure and easy to pin down.
 
     #[test]
-    fn data_source_paths_includes_default_three_when_no_overrides() {
+    fn data_source_paths_includes_default_four_when_no_overrides() {
         let cfg = Config::default();
         let paths = data_source_paths(&cfg);
         let labels: Vec<&str> = paths.iter().map(|(_, _, l)| *l).collect();
         // Order matters in the live code (Claude first, then Codex,
-        // then opencode) — the watcher logs by label, so pinning the
-        // order keeps the operator's mental model consistent.
+        // then Muse, then opencode) — the watcher logs by label, so
+        // pinning the order keeps the operator's mental model
+        // consistent.
         assert_eq!(
             labels,
-            vec!["claude_projects", "codex_sessions", "opencode"]
+            vec![
+                "claude_projects",
+                "codex_sessions",
+                "muse_sessions",
+                "opencode"
+            ]
         );
         // Recursion mode: JSONLs nest under project / day dirs so
-        // both Claude and Codex need recursive; opencode is one DB
-        // file in a flat dir.
+        // Claude, Codex, and Muse all need recursive; opencode is
+        // one DB file in a flat dir.
         assert!(matches!(paths[0].1, RecursiveMode::Recursive));
         assert!(matches!(paths[1].1, RecursiveMode::Recursive));
-        assert!(matches!(paths[2].1, RecursiveMode::NonRecursive));
+        assert!(matches!(paths[2].1, RecursiveMode::Recursive));
+        assert!(matches!(paths[3].1, RecursiveMode::NonRecursive));
     }
 
     #[test]
@@ -893,6 +906,17 @@ fn data_source_paths(config: &Config) -> Vec<(std::path::PathBuf, RecursiveMode,
         .or_else(|| dirs::home_dir().map(|h| h.join(".codex").join("sessions")));
     if let Some(p) = codex_sessions {
         out.push((p, RecursiveMode::Recursive, "codex_sessions"));
+    }
+
+    // Muse Spark session logs — config override or
+    // `~/.local/share/muse/sessions`.
+    let muse_sessions = config
+        .muse_spark
+        .sessions_dir
+        .clone()
+        .or_else(|| dirs::data_dir().map(|h| h.join("muse").join("sessions")));
+    if let Some(p) = muse_sessions {
+        out.push((p, RecursiveMode::Recursive, "muse_sessions"));
     }
 
     // opencode SQLite — watch the parent dir non-recursively so we

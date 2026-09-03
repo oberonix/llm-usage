@@ -64,6 +64,41 @@ pub fn anthropic_default(model: &str) -> ModelRate {
     }
 }
 
+/// Default Muse Spark pricing (Meta Model API standard tier, 2026):
+/// $1.25 / 1M input, $4.25 / 1M output, $0.15 / 1M cached input.
+/// Expressed through the shared [`ModelRate`] shape so the standard
+/// cost math applies: cached input is 0.12× the input rate
+/// (1.25 × 0.12 = 0.15). Callers must pass cached tokens as the
+/// read bucket — session logs report them as a subset of input
+/// (OpenAI-style), matching `cost_usd`'s additive buckets only when
+/// the caller moves them out of `input_tokens` first, as
+/// [`muse_spark_cost_usd`] does.
+pub fn muse_spark_default() -> ModelRate {
+    ModelRate {
+        input_per_mtok: 1.25,
+        output_per_mtok: 4.25,
+        cache_write_5m_mult: 1.0,
+        cache_write_1h_mult: 1.0,
+        cache_read_mult: 0.12,
+    }
+}
+
+/// Cost of one Muse Spark step. `cached` is a subset of `input`
+/// (verified against session logs: each step's cached count ≈ the
+/// previous step's input), so only the uncached remainder bills at
+/// the full input rate. Reasoning tokens bill at the output rate —
+/// Meta publishes no separate reasoning price, and every sibling
+/// provider bills thinking at output.
+pub fn muse_spark_cost_usd(input: u64, output: u64, cached: u64, reasoning: u64) -> f64 {
+    let usage = AnthropicTokenUsage {
+        input_tokens: input.saturating_sub(cached),
+        output_tokens: output.saturating_add(reasoning),
+        cache_read_input_tokens: cached.min(input),
+        ..Default::default()
+    };
+    usage.cost_usd(muse_spark_default())
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AnthropicTokenUsage {
     pub input_tokens: u64,
@@ -184,5 +219,24 @@ mod tests {
         let r = anthropic_default("anything");
         let u = AnthropicTokenUsage::default();
         assert_eq!(u.cost_usd(r), 0.0);
+    }
+
+    #[test]
+    fn muse_spark_standard_tier_rates() {
+        // 1M input + 1M output, nothing cached:
+        // 1.25 + 4.25 = $5.50.
+        assert!((muse_spark_cost_usd(1_000_000, 1_000_000, 0, 0) - 5.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn muse_spark_cached_subset_bills_at_cached_rate() {
+        // 1M input fully cached: 1M × $0.15, not 1M × $1.25.
+        assert!((muse_spark_cost_usd(1_000_000, 0, 1_000_000, 0) - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn muse_spark_reasoning_bills_as_output() {
+        // 1M reasoning tokens at the $4.25 output rate.
+        assert!((muse_spark_cost_usd(0, 0, 0, 1_000_000) - 4.25).abs() < 1e-9);
     }
 }

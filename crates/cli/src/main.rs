@@ -19,7 +19,8 @@ use llm_usage_core::config::Config;
 use llm_usage_core::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowUsage};
 use llm_usage_core::provider::Provider;
 use llm_usage_core::providers::{
-    AnthropicProvider, AntigravityProvider, CodexCliProvider, OllamaCloudProvider,
+    AnthropicProvider, AntigravityProvider, CodexCliProvider, MuseSparkProvider,
+    OllamaCloudProvider,
 };
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::collections::BTreeMap;
@@ -154,12 +155,13 @@ async fn run_omarchy_export(target: &str) -> Result<()> {
         "claude" | "anthropic" => Some(ProviderId::Anthropic),
         "codex" | "codex_cli" | "openai" => Some(ProviderId::CodexCli),
         "ollama" | "ollama_cloud" => Some(ProviderId::OllamaCloud),
+        "muse" | "muse_spark" | "musespark" => Some(ProviderId::MuseSpark),
         _ => None,
     };
 
     let Some(id) = provider_id else {
         eprintln!("Unknown provider for Omarchy export: {target}");
-        eprintln!("Available: antigravity, claude, codex, ollama, all");
+        eprintln!("Available: antigravity, claude, codex, ollama, muse, all");
         std::process::exit(1);
     };
 
@@ -169,10 +171,25 @@ async fn run_omarchy_export(target: &str) -> Result<()> {
             let config = Config::load_or_default()?;
             let opencode = config.resolve_opencode_db();
             match id {
-                ProviderId::Antigravity => AntigravityProvider::new(config.antigravity).poll().await?,
-                ProviderId::Anthropic => AnthropicProvider::with_opencode_db(config.anthropic, opencode).poll().await?,
-                ProviderId::CodexCli => CodexCliProvider::with_opencode_db(config.codex_cli, opencode).poll().await?,
-                ProviderId::OllamaCloud => OllamaCloudProvider::with_opencode_db(config.ollama_cloud, opencode).poll().await?,
+                ProviderId::Antigravity => {
+                    AntigravityProvider::new(config.antigravity).poll().await?
+                }
+                ProviderId::Anthropic => {
+                    AnthropicProvider::with_opencode_db(config.anthropic, opencode)
+                        .poll()
+                        .await?
+                }
+                ProviderId::CodexCli => {
+                    CodexCliProvider::with_opencode_db(config.codex_cli, opencode)
+                        .poll()
+                        .await?
+                }
+                ProviderId::OllamaCloud => {
+                    OllamaCloudProvider::with_opencode_db(config.ollama_cloud, opencode)
+                        .poll()
+                        .await?
+                }
+                ProviderId::MuseSpark => MuseSparkProvider::new(config.muse_spark).poll().await?,
             }
         }
     };
@@ -312,6 +329,7 @@ fn build_screen(
         ProviderId::Antigravity,
         ProviderId::CodexCli,
         ProviderId::OllamaCloud,
+        ProviderId::MuseSpark,
     ];
 
     let mut first = true;
@@ -464,6 +482,7 @@ async fn poll_fresh() -> Result<BTreeMap<ProviderId, UsageSnapshot>> {
             config.ollama_cloud.clone(),
             opencode,
         )),
+        Box::new(MuseSparkProvider::new(config.muse_spark.clone())),
     ];
     let mut out = BTreeMap::new();
     for p in &providers {

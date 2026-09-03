@@ -10,7 +10,8 @@ use llm_usage_core::config::Config;
 use llm_usage_core::model::{ProviderId, UsageSnapshot};
 use llm_usage_core::provider::Provider;
 use llm_usage_core::providers::{
-    AnthropicProvider, AntigravityProvider, CodexCliProvider, OllamaCloudProvider,
+    AnthropicProvider, AntigravityProvider, CodexCliProvider, MuseSparkProvider,
+    OllamaCloudProvider,
 };
 use llm_usage_core::quota::QuotaEngine;
 use llm_usage_core::storage::Store;
@@ -55,6 +56,9 @@ fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
     if !config.ollama_cloud.warn_at.is_empty() {
         engine.set_thresholds(ProviderId::OllamaCloud, config.ollama_cloud.warn_at.clone());
     }
+    if !config.muse_spark.warn_at.is_empty() {
+        engine.set_thresholds(ProviderId::MuseSpark, config.muse_spark.warn_at.clone());
+    }
 
     let opencode = config.resolve_opencode_db();
     let providers: Vec<Box<dyn Provider>> = vec![
@@ -71,6 +75,7 @@ fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
             config.ollama_cloud.clone(),
             opencode,
         )),
+        Box::new(MuseSparkProvider::new(config.muse_spark.clone())),
     ];
 
     LoopState {

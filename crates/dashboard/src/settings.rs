@@ -4,7 +4,8 @@
 
 use eframe::egui::{self, Color32, RichText};
 use llm_usage_core::config::{
-    self, AnthropicConfig, AntigravityConfig, CodexCliConfig, Config, OllamaCloudConfig,
+    self, AnthropicConfig, AntigravityConfig, CodexCliConfig, Config, MuseSparkConfig,
+    OllamaCloudConfig,
 };
 use llm_usage_core::model::ProviderId;
 use std::path::PathBuf;
@@ -76,6 +77,13 @@ pub struct ConfigDraft {
     pub ollama_cloud_session_cookie: String,
     pub ollama_cloud_warn_at: Vec<f64>,
 
+    pub muse_enabled: bool,
+    pub muse_show_spend: bool,
+    pub muse_weekly_budget_usd: f64,
+    pub muse_weekly_budget_enabled: bool,
+    pub muse_daily_budget_usd: f64,
+    pub muse_daily_budget_enabled: bool,
+    pub muse_warn_at: Vec<f64>,
 
     // UI-only state for the setup-login flow. Not persisted.
     pub ollama_cloud_setup_status: Option<String>,
@@ -148,6 +156,14 @@ impl ConfigDraft {
             ollama_cloud_session_cookie: c.ollama_cloud.session_cookie.clone().unwrap_or_default(),
             ollama_cloud_warn_at: c.ollama_cloud.warn_at.clone(),
 
+            muse_enabled: c.muse_spark.enabled,
+            muse_show_spend: c.muse_spark.show_spend,
+            muse_weekly_budget_usd: c.muse_spark.weekly_budget_usd.unwrap_or(20.0),
+            muse_weekly_budget_enabled: c.muse_spark.weekly_budget_usd.is_some(),
+            muse_daily_budget_usd: c.muse_spark.daily_budget_usd.unwrap_or(5.0),
+            muse_daily_budget_enabled: c.muse_spark.daily_budget_usd.is_some(),
+            muse_warn_at: c.muse_spark.warn_at.clone(),
+
             ollama_cloud_setup_status: None,
             ollama_cloud_setup_rx: None,
         }
@@ -196,6 +212,22 @@ impl ConfigDraft {
             warn_at: self.ollama_cloud_warn_at.clone(),
         };
 
+        c.muse_spark = MuseSparkConfig {
+            enabled: self.muse_enabled,
+            show_spend: self.muse_show_spend,
+            weekly_budget_usd: if self.muse_weekly_budget_enabled {
+                Some(self.muse_weekly_budget_usd)
+            } else {
+                None
+            },
+            daily_budget_usd: if self.muse_daily_budget_enabled {
+                Some(self.muse_daily_budget_usd)
+            } else {
+                None
+            },
+            warn_at: self.muse_warn_at.clone(),
+            ..c.muse_spark
+        };
 
         c
     }
@@ -449,6 +481,49 @@ impl ConfigDraft {
         self.render_codex(ui);
         self.render_antigravity(ui);
         self.render_ollama_cloud(ui);
+        self.render_muse_spark(ui);
+    }
+
+    fn render_muse_spark(&mut self, ui: &mut egui::Ui) {
+        provider_card(ui, tint(ProviderId::MuseSpark), |ui| {
+            section_header_row(ui, "Muse Spark (Muse Code)", Some(ProviderId::MuseSpark));
+            enabled_row(
+                ui,
+                &mut self.muse_enabled,
+                Some(&mut self.muse_show_spend),
+                "Show $ spend (estimate)",
+            );
+            field_row(ui, "Alert at", |ui| {
+                alert_preset_combo(ui, "muse_spark_alert", &mut self.muse_warn_at);
+            });
+            field_row(ui, "Weekly budget", |ui| {
+                ui.checkbox(&mut self.muse_weekly_budget_enabled, "set");
+                ui.add_enabled(
+                    self.muse_weekly_budget_enabled,
+                    egui::DragValue::new(&mut self.muse_weekly_budget_usd)
+                        .speed(1.0)
+                        .range(0.0..=100_000.0)
+                        .prefix("$"),
+                );
+            });
+            field_row(ui, "Daily budget", |ui| {
+                ui.checkbox(&mut self.muse_daily_budget_enabled, "set");
+                ui.add_enabled(
+                    self.muse_daily_budget_enabled,
+                    egui::DragValue::new(&mut self.muse_daily_budget_usd)
+                        .speed(1.0)
+                        .range(0.0..=100_000.0)
+                        .prefix("$"),
+                );
+            });
+            help(
+                ui,
+                "Usage comes from your local Muse session logs — no sign-in \
+                 needed. Muse Spark is pay-as-you-go with no plan quota, so \
+                 the budgets above are what turn activity into quota bars \
+                 and alerts; leave them unset for turns-and-tokens only.",
+            );
+        });
     }
 
     fn render_anthropic(&mut self, ui: &mut egui::Ui) {

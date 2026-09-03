@@ -27,6 +27,7 @@ pub enum ProviderId {
     Antigravity,
     CodexCli,
     OllamaCloud,
+    MuseSpark,
 }
 
 impl fmt::Display for ProviderId {
@@ -36,6 +37,7 @@ impl fmt::Display for ProviderId {
             ProviderId::Antigravity => "antigravity",
             ProviderId::CodexCli => "codex_cli",
             ProviderId::OllamaCloud => "ollama_cloud",
+            ProviderId::MuseSpark => "muse_spark",
         };
         f.write_str(s)
     }
@@ -48,6 +50,7 @@ impl ProviderId {
             ProviderId::Antigravity => "Antigravity",
             ProviderId::CodexCli => "Codex",
             ProviderId::OllamaCloud => "Ollama Cloud",
+            ProviderId::MuseSpark => "Muse Spark",
         }
     }
 
@@ -61,6 +64,7 @@ impl ProviderId {
             ProviderId::Antigravity => (0x42, 0xA5, 0xF5),
             ProviderId::CodexCli => (0x9C, 0x6B, 0xFF),
             ProviderId::OllamaCloud => (0x3B, 0x82, 0xF6),
+            ProviderId::MuseSpark => (0x06, 0xB6, 0xD4),
         }
     }
 }

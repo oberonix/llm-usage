@@ -23,8 +23,8 @@ own providers (and one optional, off-by-default update check).
   cap, with a magenta pacing marker showing elapsed-time vs. usage so
   you can tell "comfortably ahead" from "about to run out".
 - **Multi-provider.** Anthropic (Pro/Max), Codex CLI (ChatGPT plan),
-  and Ollama Cloud — each with the windows that matter (5-hour,
-  weekly, and activity rollups).
+  Ollama Cloud, and Muse Spark — each with the windows that matter
+  (5-hour, weekly, and activity rollups).
 - **Alerts before the wall.** Pick the fractions you care about
   (`0.5, 0.75, 0.9`, …); get one desktop notification per threshold
   per window. Debounced in SQLite so a restart never re-spams you.
@@ -48,6 +48,7 @@ own providers (and one optional, off-by-default update check).
 | **Anthropic** (Pro/Max) | 5h / weekly / weekly-Sonnet / weekly-Opus | local JSONL × per-model pricing | `GET /api/oauth/usage` using the OAuth token in `~/.claude/.credentials.json` — the same endpoint Claude Code's own `/usage` view uses |
 | **Codex CLI** (ChatGPT plan) | 5h / weekly + 1h/today/month activity | reverse-engineered per-token estimate | `~/.codex/sessions/**` rollouts; optional live quota via a saved chatgpt.com cookie |
 | **Ollama Cloud** | plan usage from the account page | — (no usage API) | `ollama.com/settings` scraped with a saved browser session cookie |
+| **Muse Spark** (Muse Code) | 1h / today / week / month activity + opt-in $ budgets | pay-as-you-go estimate from published pricing (opt-in) | `~/.local/share/muse/sessions/**/session.jsonl` usage records; no plan quota exists, so quota bars appear only once you set a weekly/daily budget |
 
 > **Best-effort by design.** None of these sources is an official,
 > documented usage API — they're the same local files and endpoints

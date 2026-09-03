@@ -475,7 +475,7 @@ impl DashboardApp {
             let rect = resp.rect;
             let underline_color = Color32::from_rgb(0x4C, 0xAF, 0x50);
             let y = rect.bottom() + 2.0;
-            let stroke = egui::Stroke::new(3.0, underline_color);
+            let stroke = egui::Stroke::new(3.0_f32, underline_color);
             ui.painter().line_segment(
                 [
                     egui::pos2(rect.left() + 8.0, y),
@@ -514,6 +514,7 @@ impl DashboardApp {
             (ProviderId::Antigravity, self.config.antigravity.enabled),
             (ProviderId::CodexCli, self.config.codex_cli.enabled),
             (ProviderId::OllamaCloud, self.config.ollama_cloud.enabled),
+            (ProviderId::MuseSpark, self.config.muse_spark.enabled),
         ];
         let mut shown = 0usize;
         for (id, enabled) in provider_iter {
@@ -547,7 +548,7 @@ impl DashboardApp {
                 ui.add_space(4.0);
                 ui.weak(
                     "Switch to the Settings tab to enable Anthropic, \
-                     Codex, or Ollama Cloud.",
+                     Codex, Ollama Cloud, or Muse Spark.",
                 );
             });
         }
@@ -1214,7 +1215,7 @@ pub fn card_frame(ui: &mut egui::Ui, tint: Color32, body: impl FnOnce(&mut egui:
         .noninteractive
         .bg_fill
         .gamma_multiply(1.05);
-    let stroke = egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let stroke = egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color);
     let outer = egui::Frame::default()
         .fill(body_fill)
         .stroke(stroke)

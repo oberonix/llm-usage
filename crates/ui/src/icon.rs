@@ -226,6 +226,10 @@ fn provider_label(id: ProviderId) -> &'static str {
         ProviderId::Antigravity => "AGY",
         ProviderId::CodexCli => "COD",
         ProviderId::OllamaCloud => "OLC",
+        // "MUS"/"MSK" would render mostly blank — the 5×7 font only
+        // ships A/C/D/E/G/I/L/M/N/O/T — so the icon uses MET (Meta,
+        // the provider id in Muse's own session logs) instead.
+        ProviderId::MuseSpark => "MET",
     }
 }
 
@@ -432,6 +436,17 @@ mod tests {
         assert_eq!(provider_label(ProviderId::Antigravity), "AGY");
         assert_eq!(provider_label(ProviderId::CodexCli), "COD");
         assert_eq!(provider_label(ProviderId::OllamaCloud), "OLC");
+        assert_eq!(provider_label(ProviderId::MuseSpark), "MET");
+    }
+
+    #[test]
+    fn muse_spark_label_uses_only_shipped_glyphs() {
+        // Every char in the label must have a real glyph — otherwise
+        // the icon renders a blank hole (the pre-existing AGY/Y
+        // precedent nobody wants to repeat).
+        for ch in provider_label(ProviderId::MuseSpark).chars() {
+            assert_ne!(glyph(ch), &GLYPH_BLANK, "label char {ch} has no glyph");
+        }
     }
 
     fn snap_with_quota(short: Option<f64>, weekly: Option<f64>, with_reset: bool) -> UsageSnapshot {

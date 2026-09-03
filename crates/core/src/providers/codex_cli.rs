@@ -940,8 +940,18 @@ mod tests {
         let now = chrono::Utc::now().to_rfc3339();
         let f = day.join("rollout-test.jsonl");
         let mut out = std::fs::File::create(&f).unwrap();
-        writeln!(out, r#"{{"type":"session_meta","timestamp":"{}","payload":{{"id":"sess-1"}}}}"#, now).unwrap();
-        writeln!(out, r#"{{"type":"turn_context","timestamp":"{}","payload":{{"model":"gpt-5-codex"}}}}"#, now).unwrap();
+        writeln!(
+            out,
+            r#"{{"type":"session_meta","timestamp":"{}","payload":{{"id":"sess-1"}}}}"#,
+            now
+        )
+        .unwrap();
+        writeln!(
+            out,
+            r#"{{"type":"turn_context","timestamp":"{}","payload":{{"model":"gpt-5-codex"}}}}"#,
+            now
+        )
+        .unwrap();
         writeln!(out, r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":1000,"output_tokens":200,"cached_input_tokens":100,"total_tokens":1200}}}}}}}}"#, now).unwrap();
         // Duplicate snapshot — should be skipped.
         writeln!(out, r#"{{"type":"event_msg","timestamp":"{}","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":1000,"output_tokens":200,"cached_input_tokens":100,"total_tokens":1200}}}}}}}}"#, now).unwrap();

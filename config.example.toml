@@ -71,6 +71,21 @@ enabled = false
 # session_cookie = "session=…; csrf=…"
 warn_at = [0.75, 0.9]
 
+[muse_spark]
+enabled = true
+# No sign-in needed — usage is read from your local Muse session logs
+# (defaults to ~/.local/share/muse/sessions).
+# sessions_dir = "/path/to/muse/sessions"
+# Muse Spark is pay-as-you-go with no plan quota, so quota bars and
+# alerts only appear once you set a budget to track against.
+# When false (default) only turns and tokens are shown; flip to true
+# to also display the $ estimate (standard tier: $1.25/1M in,
+# $4.25/1M out, $0.15/1M cached).
+show_spend = false
+# weekly_budget_usd = 20.0
+# daily_budget_usd = 5.0
+warn_at = [0.75, 0.9]
+
 [alerts]
 # Currently informational — alerts are throttled by window_id
 # (one alert per provider × threshold × hour/week/month bucket)
