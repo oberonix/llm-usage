@@ -75,6 +75,48 @@ pub fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".opencode.db"))
 }
 
+/// Default path to `~/.local/share/opencode/auth.json`.
+pub fn default_auth_json_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("opencode").join("auth.json"))
+}
+
+/// Look up the OpenCode Go API key from `auth.json`.
+/// Checks `"opencode-go"`, `"opencode"`, and `"opencode-zen"` keys,
+/// extracting the string value or `sub.key` / `sub.token` / `sub.apiKey`.
+pub fn find_opencode_go_api_key(custom_path: Option<&Path>) -> Option<String> {
+    let path = match custom_path {
+        Some(p) => p.to_path_buf(),
+        None => default_auth_json_path()?,
+    };
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+    let obj = value.as_object()?;
+    for provider in &["opencode-go", "opencode", "opencode-zen"] {
+        if let Some(entry) = obj.get(*provider) {
+            if let Some(s) = entry.as_str() {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            } else if let Some(sub) = entry.as_object() {
+                for key_name in &["key", "token", "apiKey", "access"] {
+                    if let Some(val) = sub.get(*key_name).and_then(|v| v.as_str()) {
+                        let trimmed = val.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+
 /// Read every assistant row in the last 14 days whose
 /// `data.providerID` matches `provider_id`. Returns an empty Vec if
 /// the database doesn't exist; bubbles up SQLite errors only.
@@ -515,4 +557,47 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|e| e.cost_usd.is_none()));
     }
+
+    #[test]
+    fn find_opencode_go_api_key_finds_nested_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"opencode-go": {"type": "api", "key": "sk-go-12345"}}"#,
+        )
+        .unwrap();
+        let key = find_opencode_go_api_key(Some(&path));
+        assert_eq!(key.as_deref(), Some("sk-go-12345"));
+    }
+
+    #[test]
+    fn find_opencode_go_api_key_prefers_opencode_go_over_opencode() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{"opencode": {"key": "sk-generic"}, "opencode-go": {"key": "sk-primary"}}"#,
+        )
+        .unwrap();
+        let key = find_opencode_go_api_key(Some(&path));
+        assert_eq!(key.as_deref(), Some("sk-primary"));
+    }
+
+    #[test]
+    fn find_opencode_go_api_key_handles_string_value() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, r#"{"opencode": "sk-string-val"}"#).unwrap();
+        let key = find_opencode_go_api_key(Some(&path));
+        assert_eq!(key.as_deref(), Some("sk-string-val"));
+    }
+
+    #[test]
+    fn find_opencode_go_api_key_missing_file_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        assert_eq!(find_opencode_go_api_key(Some(&path)), None);
+    }
 }
+

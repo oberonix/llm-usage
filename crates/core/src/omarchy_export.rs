@@ -87,6 +87,7 @@ pub fn provider_omarchy_meta(provider: ProviderId) -> (&'static str, &'static st
         ProviderId::CodexCli => ("codex", "Codex"),
         ProviderId::OllamaCloud => ("ollama", "Ollama Cloud"),
         ProviderId::MuseSpark => ("muse", "Muse Spark"),
+        ProviderId::OpenCodeGo => ("opencode_go", "OpenCode Go"),
     }
 }
 

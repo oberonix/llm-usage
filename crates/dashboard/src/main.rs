@@ -515,6 +515,7 @@ impl DashboardApp {
             (ProviderId::CodexCli, self.config.codex_cli.enabled),
             (ProviderId::OllamaCloud, self.config.ollama_cloud.enabled),
             (ProviderId::MuseSpark, self.config.muse_spark.enabled),
+            (ProviderId::OpenCodeGo, self.config.opencode_go.enabled),
         ];
         let mut shown = 0usize;
         for (id, enabled) in provider_iter {
@@ -1141,10 +1142,12 @@ fn pace_fraction(
     w: &llm_usage_core::model::WindowUsage,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<f64> {
-    let window_secs: i64 = match label {
-        "5h" => 5 * 3600,
-        "week" | "Sonnet" | "Opus" => 7 * 86_400,
-        _ => return None,
+    let window_secs: i64 = if label == "5h" || label.ends_with(" 5h") {
+        5 * 3600
+    } else if label == "week" || label.ends_with(" week") || label == "Sonnet" || label == "Opus" {
+        7 * 86_400
+    } else {
+        return None;
     };
     let ends = w.ends_at?;
     let remaining = (ends - now).num_seconds().max(0).min(window_secs);
@@ -1498,6 +1501,26 @@ mod tests {
         assert_eq!(fraction_color(0.84), a);
         assert_eq!(fraction_color(0.85), r);
         assert_eq!(fraction_color(1.0), r);
+    }
+
+    #[test]
+    fn pace_fraction_supports_antigravity_and_standard_labels() {
+        let now = chrono::Utc::now();
+        let mut w = llm_usage_core::model::WindowUsage::default();
+        w.ends_at = Some(now + chrono::Duration::hours(1));
+        for label in ["5h", "Claude 5h", "Gemini 5h"] {
+            let p = pace_fraction(label, &w, now).expect(label);
+            assert!((p - 0.8).abs() < 0.01, "{label}: got {p}");
+        }
+
+        w.ends_at = Some(now + chrono::Duration::days(2));
+        for label in ["week", "Sonnet", "Opus", "Claude week", "Gemini week"] {
+            let p = pace_fraction(label, &w, now).expect(label);
+            assert!((p - (5.0 / 7.0)).abs() < 0.01, "{label}: got {p}");
+        }
+
+        assert!(pace_fraction("month", &w, now).is_none());
+        assert!(pace_fraction("today", &w, now).is_none());
     }
 
     #[test]

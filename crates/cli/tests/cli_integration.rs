@@ -180,6 +180,10 @@ warn_at = []
 enabled = false
 warn_at = []
 
+[opencode_go]
+enabled = false
+warn_at = []
+
 [alerts]
 debounce_secs = 3600
 disabled = true

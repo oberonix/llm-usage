@@ -11,7 +11,7 @@ use llm_usage_core::model::{ProviderId, UsageSnapshot};
 use llm_usage_core::provider::Provider;
 use llm_usage_core::providers::{
     AnthropicProvider, AntigravityProvider, CodexCliProvider, MuseSparkProvider,
-    OllamaCloudProvider,
+    OllamaCloudProvider, OpenCodeGoProvider,
 };
 use llm_usage_core::quota::QuotaEngine;
 use llm_usage_core::storage::Store;
@@ -59,6 +59,9 @@ fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
     if !config.muse_spark.warn_at.is_empty() {
         engine.set_thresholds(ProviderId::MuseSpark, config.muse_spark.warn_at.clone());
     }
+    if !config.opencode_go.warn_at.is_empty() {
+        engine.set_thresholds(ProviderId::OpenCodeGo, config.opencode_go.warn_at.clone());
+    }
 
     let opencode = config.resolve_opencode_db();
     let providers: Vec<Box<dyn Provider>> = vec![
@@ -73,9 +76,13 @@ fn build_state(config: &Config, store: Arc<Store>) -> LoopState {
         Box::new(AntigravityProvider::new(config.antigravity.clone())),
         Box::new(OllamaCloudProvider::with_opencode_db(
             config.ollama_cloud.clone(),
-            opencode,
+            opencode.clone(),
         )),
         Box::new(MuseSparkProvider::new(config.muse_spark.clone())),
+        Box::new(OpenCodeGoProvider::with_opencode_db(
+            config.opencode_go.clone(),
+            opencode,
+        )),
     ];
 
     LoopState {

@@ -23,7 +23,7 @@ own providers (and one optional, off-by-default update check).
   cap, with a magenta pacing marker showing elapsed-time vs. usage so
   you can tell "comfortably ahead" from "about to run out".
 - **Multi-provider.** Anthropic (Pro/Max), Codex CLI (ChatGPT plan),
-  Ollama Cloud, and Muse Spark — each with the windows that matter
+  Ollama Cloud, Muse Spark, and OpenCode Go — each with the windows that matter
   (5-hour, weekly, and activity rollups).
 - **Alerts before the wall.** Pick the fractions you care about
   (`0.5, 0.75, 0.9`, …); get one desktop notification per threshold
@@ -49,6 +49,8 @@ own providers (and one optional, off-by-default update check).
 | **Codex CLI** (ChatGPT plan) | 5h / weekly + 1h/today/month activity | reverse-engineered per-token estimate | `~/.codex/sessions/**` rollouts; optional live quota via a saved chatgpt.com cookie |
 | **Ollama Cloud** | plan usage from the account page | — (no usage API) | `ollama.com/settings` scraped with a saved browser session cookie |
 | **Muse Spark** (Muse Code) | Current (~5h) + Weekly quota bars (reverse-engineered estimate, on by default) + 1h / today / month activity | pay-as-you-go estimate from published pricing (opt-in) | `~/.local/share/muse/sessions/**/session.jsonl` usage records; no pollable quota endpoint exists, so quota % comes from fitted limits (~4.41M uncached units / 5h, ~13.2M / week) tagged ~ and (est.) |
+| **OpenCode Go** | 5h rolling / 7d weekly / monthly quota bars + 1h / today / month activity | — ($10/mo flat plan) | `GET https://opencode.ai/zen/go/v1/usage` via auto-detected key in `~/.local/share/opencode/auth.json` or config override; local tokens and turns from `opencode.db` |
+
 
 > **Best-effort by design.** None of these sources is an official,
 > documented usage API — they're the same local files and endpoints

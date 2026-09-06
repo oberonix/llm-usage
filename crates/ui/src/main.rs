@@ -24,12 +24,13 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 use crate::runtime::{RuntimeHandle, RuntimeMessage};
 
 /// Order providers iterate in when the icon rotates. Matches the menu order.
-const PROVIDER_ORDER: [ProviderId; 5] = [
+const PROVIDER_ORDER: [ProviderId; 6] = [
     ProviderId::Anthropic,
     ProviderId::Antigravity,
     ProviderId::CodexCli,
     ProviderId::OllamaCloud,
     ProviderId::MuseSpark,
+    ProviderId::OpenCodeGo,
 ];
 
 /// Lower bound to keep a hand-edited config from making the icon flicker.
@@ -448,6 +449,11 @@ mod tests {
     }
 
     #[test]
+    fn provider_order_includes_opencode_go_for_menu_and_icon_rotation() {
+        assert!(PROVIDER_ORDER.contains(&ProviderId::OpenCodeGo));
+    }
+
+    #[test]
     fn format_quota_row_includes_bar_pct_label_and_reset() {
         let mut w = WindowUsage::default();
         w.fraction_used = Some(0.42);
@@ -596,6 +602,9 @@ mod tests {
         )));
         assert!(is_meaningful_data_path(&PathBuf::from(
             "/home/u/.local/share/opencode/opencode.db"
+        )));
+        assert!(is_meaningful_data_path(&PathBuf::from(
+            "/home/u/.local/share/opencode/auth.json"
         )));
     }
 
@@ -876,9 +885,12 @@ fn is_meaningful_data_path(p: &std::path::Path) -> bool {
     if p.extension().is_some_and(|ext| ext == "jsonl") {
         return true;
     }
-    // The opencode SQLite file proper is interesting; its WAL /
-    // SHM siblings are not.
-    matches!(p.file_name().and_then(|n| n.to_str()), Some("opencode.db"))
+    // The opencode SQLite file proper and auth credentials are
+    // interesting; SQLite's WAL / SHM siblings are not.
+    matches!(
+        p.file_name().and_then(|n| n.to_str()),
+        Some("opencode.db" | "auth.json")
+    )
 }
 
 /// The three (or fewer, depending on what's installed) local paths
@@ -928,6 +940,19 @@ fn data_source_paths(config: &Config) -> Vec<(std::path::PathBuf, RecursiveMode,
                 RecursiveMode::NonRecursive,
                 "opencode",
             ));
+        }
+    }
+
+    // Custom opencode auth.json if in a different directory
+    if let Some(custom_auth) = &config.opencode_go.auth_json_path {
+        if let Some(parent) = custom_auth.parent() {
+            if !out.iter().any(|(p, _, _)| p == parent) {
+                out.push((
+                    parent.to_path_buf(),
+                    RecursiveMode::NonRecursive,
+                    "opencode_auth",
+                ));
+            }
         }
     }
 

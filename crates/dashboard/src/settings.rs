@@ -5,9 +5,10 @@
 use eframe::egui::{self, Color32, RichText};
 use llm_usage_core::config::{
     self, AnthropicConfig, AntigravityConfig, CodexCliConfig, Config, MuseSparkConfig,
-    OllamaCloudConfig,
+    OllamaCloudConfig, OpenCodeGoConfig,
 };
 use llm_usage_core::model::ProviderId;
+use llm_usage_core::opencode::find_opencode_go_api_key;
 use std::path::PathBuf;
 
 /// Pre-baked dropdown options for the poll interval.
@@ -87,6 +88,10 @@ pub struct ConfigDraft {
     pub muse_quota_estimate: bool,
     pub muse_current_limit_munits: f64,
     pub muse_weekly_limit_munits: f64,
+
+    pub opencode_go_enabled: bool,
+    pub opencode_go_api_key: String,
+    pub opencode_go_warn_at: Vec<f64>,
 
     // UI-only state for the setup-login flow. Not persisted.
     pub ollama_cloud_setup_status: Option<String>,
@@ -172,6 +177,10 @@ impl ConfigDraft {
             muse_weekly_limit_munits: c.muse_spark.weekly_limit_units.unwrap_or(13_200_000) as f64
                 / 1_000_000.0,
 
+            opencode_go_enabled: c.opencode_go.enabled,
+            opencode_go_api_key: c.opencode_go.api_key.clone().unwrap_or_default(),
+            opencode_go_warn_at: c.opencode_go.warn_at.clone(),
+
             ollama_cloud_setup_status: None,
             ollama_cloud_setup_rx: None,
         }
@@ -238,6 +247,13 @@ impl ConfigDraft {
             current_limit_units: Some((self.muse_current_limit_munits * 1_000_000.0) as u64),
             weekly_limit_units: Some((self.muse_weekly_limit_munits * 1_000_000.0) as u64),
             ..c.muse_spark
+        };
+
+        c.opencode_go = OpenCodeGoConfig {
+            enabled: self.opencode_go_enabled,
+            api_key: empty_to_none(&self.opencode_go_api_key),
+            warn_at: self.opencode_go_warn_at.clone(),
+            ..c.opencode_go
         };
 
         c
@@ -493,6 +509,7 @@ impl ConfigDraft {
         self.render_antigravity(ui);
         self.render_ollama_cloud(ui);
         self.render_muse_spark(ui);
+        self.render_opencode_go(ui);
     }
 
     fn render_muse_spark(&mut self, ui: &mut egui::Ui) {
@@ -555,6 +572,48 @@ impl ConfigDraft {
                  Weekly window) and tags the headline with ~ and (est.). \
                  Untick for turns-and-tokens only; the $ budgets below apply \
                  when the estimate is off.",
+            );
+        });
+    }
+
+    fn render_opencode_go(&mut self, ui: &mut egui::Ui) {
+        provider_card(ui, tint(ProviderId::OpenCodeGo), |ui| {
+            section_header_row(ui, "OpenCode Go", Some(ProviderId::OpenCodeGo));
+            enabled_row(
+                ui,
+                &mut self.opencode_go_enabled,
+                None,
+                "",
+            );
+            field_row(ui, "Alert at", |ui| {
+                alert_preset_combo(ui, "opencode_go_alert", &mut self.opencode_go_warn_at);
+            });
+            let auto_key = find_opencode_go_api_key(None);
+            field_row(ui, "API key", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.opencode_go_api_key)
+                        .password(true)
+                        .hint_text(if auto_key.is_some() {
+                            "Auto-detected from auth.json"
+                        } else {
+                            "sk-..."
+                        })
+                        .desired_width(260.0),
+                );
+            });
+            if auto_key.is_some() && self.opencode_go_api_key.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("✓ Found in ~/.local/share/opencode/auth.json")
+                            .color(Color32::from_rgb(0x4C, 0xAF, 0x50)),
+                    );
+                });
+            }
+            help(
+                ui,
+                "OpenCode Go is a $10/mo flat-rate subscription providing curated \
+                 open-source coding models with 5h, weekly, and monthly rate limits. \
+                 Leave the API key blank to automatically use credentials from opencode auth login.",
             );
         });
     }
@@ -1139,6 +1198,9 @@ mod tests {
         cfg.ollama_cloud.enabled = true;
         cfg.ollama_cloud.session_cookie = Some("session=abc".into());
         cfg.ollama_cloud.warn_at = vec![0.9];
+        cfg.opencode_go.enabled = true;
+        cfg.opencode_go.api_key = Some("sk-opencode-test".into());
+        cfg.opencode_go.warn_at = vec![0.8];
 
         let draft = ConfigDraft::from_config(&cfg);
         let round = draft.to_config();
@@ -1154,6 +1216,12 @@ mod tests {
             Some("session=abc")
         );
         assert_eq!(round.ollama_cloud.warn_at, vec![0.9]);
+        assert!(round.opencode_go.enabled);
+        assert_eq!(
+            round.opencode_go.api_key.as_deref(),
+            Some("sk-opencode-test")
+        );
+        assert_eq!(round.opencode_go.warn_at, vec![0.8]);
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub enum ProviderId {
     CodexCli,
     OllamaCloud,
     MuseSpark,
+    OpenCodeGo,
 }
 
 impl fmt::Display for ProviderId {
@@ -38,6 +39,7 @@ impl fmt::Display for ProviderId {
             ProviderId::CodexCli => "codex_cli",
             ProviderId::OllamaCloud => "ollama_cloud",
             ProviderId::MuseSpark => "muse_spark",
+            ProviderId::OpenCodeGo => "opencode_go",
         };
         f.write_str(s)
     }
@@ -51,6 +53,7 @@ impl ProviderId {
             ProviderId::CodexCli => "Codex",
             ProviderId::OllamaCloud => "Ollama Cloud",
             ProviderId::MuseSpark => "Muse Spark",
+            ProviderId::OpenCodeGo => "OpenCode Go",
         }
     }
 
@@ -65,6 +68,7 @@ impl ProviderId {
             ProviderId::CodexCli => (0x9C, 0x6B, 0xFF),
             ProviderId::OllamaCloud => (0x3B, 0x82, 0xF6),
             ProviderId::MuseSpark => (0x06, 0xB6, 0xD4),
+            ProviderId::OpenCodeGo => (0x10, 0xB9, 0x81),
         }
     }
 }

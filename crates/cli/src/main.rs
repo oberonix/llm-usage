@@ -20,7 +20,7 @@ use llm_usage_core::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowUsa
 use llm_usage_core::provider::Provider;
 use llm_usage_core::providers::{
     AnthropicProvider, AntigravityProvider, CodexCliProvider, MuseSparkProvider,
-    OllamaCloudProvider,
+    OllamaCloudProvider, OpenCodeGoProvider,
 };
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::collections::BTreeMap;
@@ -156,12 +156,13 @@ async fn run_omarchy_export(target: &str) -> Result<()> {
         "codex" | "codex_cli" | "openai" => Some(ProviderId::CodexCli),
         "ollama" | "ollama_cloud" => Some(ProviderId::OllamaCloud),
         "muse" | "muse_spark" | "musespark" => Some(ProviderId::MuseSpark),
+        "opencode" | "opencode_go" | "opencode-go" => Some(ProviderId::OpenCodeGo),
         _ => None,
     };
 
     let Some(id) = provider_id else {
         eprintln!("Unknown provider for Omarchy export: {target}");
-        eprintln!("Available: antigravity, claude, codex, ollama, muse, all");
+        eprintln!("Available: antigravity, claude, codex, ollama, muse, opencode_go, all");
         std::process::exit(1);
     };
 
@@ -190,6 +191,11 @@ async fn run_omarchy_export(target: &str) -> Result<()> {
                         .await?
                 }
                 ProviderId::MuseSpark => MuseSparkProvider::new(config.muse_spark).poll().await?,
+                ProviderId::OpenCodeGo => {
+                    OpenCodeGoProvider::with_opencode_db(config.opencode_go, opencode)
+                        .poll()
+                        .await?
+                }
             }
         }
     };
@@ -330,6 +336,7 @@ fn build_screen(
         ProviderId::CodexCli,
         ProviderId::OllamaCloud,
         ProviderId::MuseSpark,
+        ProviderId::OpenCodeGo,
     ];
 
     let mut first = true;
@@ -480,9 +487,13 @@ async fn poll_fresh() -> Result<BTreeMap<ProviderId, UsageSnapshot>> {
         Box::new(AntigravityProvider::new(config.antigravity.clone())),
         Box::new(OllamaCloudProvider::with_opencode_db(
             config.ollama_cloud.clone(),
-            opencode,
+            opencode.clone(),
         )),
         Box::new(MuseSparkProvider::new(config.muse_spark.clone())),
+        Box::new(OpenCodeGoProvider::with_opencode_db(
+            config.opencode_go.clone(),
+            opencode,
+        )),
     ];
     let mut out = BTreeMap::new();
     for p in &providers {
@@ -531,10 +542,12 @@ fn pace_index(
     now: chrono::DateTime<chrono::Utc>,
     cells: usize,
 ) -> Option<usize> {
-    let window_secs: i64 = match label {
-        "5h" => 5 * 3600,
-        "week" | "Sonnet" | "Opus" => 7 * 86_400,
-        _ => return None,
+    let window_secs: i64 = if label == "5h" || label.ends_with(" 5h") {
+        5 * 3600
+    } else if label == "week" || label.ends_with(" week") || label == "Sonnet" || label == "Opus" {
+        7 * 86_400
+    } else {
+        return None;
     };
     let ends = w.ends_at?;
     let remaining = (ends - now).num_seconds().max(0).min(window_secs);
@@ -885,20 +898,22 @@ mod tests {
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
         w.ends_at = Some(now + chrono::Duration::hours(1));
-        let idx = pace_index("5h", &w, now, 10).unwrap();
-        assert_eq!(idx, 7, "got {idx}");
+        for label in ["5h", "Claude 5h", "Gemini 5h"] {
+            let idx = pace_index(label, &w, now, 10).unwrap();
+            assert_eq!(idx, 7, "{label}: got {idx}");
+        }
     }
 
     #[test]
     fn pace_index_week_variants_all_use_seven_day_window() {
-        // The Sonnet- and Opus-specific weekly windows share the same
-        // duration as plain "week"; if a refactor accidentally drops
+        // The Sonnet-, Opus-, and Antigravity-specific weekly windows share the
+        // same duration as plain "week"; if a refactor accidentally drops
         // one of them we want a test failure, not a silent missing
         // pace marker.
         let now = chrono::Utc::now();
         let mut w = WindowUsage::default();
         w.ends_at = Some(now + chrono::Duration::days(2));
-        for label in ["week", "Sonnet", "Opus"] {
+        for label in ["week", "Sonnet", "Opus", "Claude week", "Gemini week"] {
             let idx = pace_index(label, &w, now, 10).expect(label);
             // 5 of 7 days elapsed → ~0.71 → cell 6.
             assert_eq!(idx, 6, "{label}: got {idx}");

@@ -9,7 +9,7 @@
 //! No font rendering, no SVG — we paint into a 22×22 RGBA buffer
 //! directly. tray-icon scales for HiDPI panels.
 
-use llm_usage_core::model::{ProviderId, UsageSnapshot};
+use llm_usage_core::model::{ProviderId, UsageSnapshot, WindowUsage};
 use tray_icon::Icon;
 
 const SIZE: u32 = 22;
@@ -151,27 +151,42 @@ fn provider_tint(id: ProviderId) -> (u8, u8, u8) {
     id.tint_rgb()
 }
 
+fn pick_higher_usage<'a>(
+    a: Option<&'a WindowUsage>,
+    b: Option<&'a WindowUsage>,
+) -> Option<&'a WindowUsage> {
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            let fx = x.fraction_used.unwrap_or(0.0);
+            let fy = y.fraction_used.unwrap_or(0.0);
+            if fx >= fy {
+                Some(x)
+            } else {
+                Some(y)
+            }
+        }
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
 /// Pick the (short-window, weekly) bar data out of a snapshot.
 /// Includes both the utilization fraction and the pace through the
 /// time window (so the icon can draw the red pace marker).
 pub fn pick_bars(snap: &UsageSnapshot) -> (BarSlot, BarSlot) {
     let now = chrono::Utc::now();
-    let session = bar_slot_for(
-        snap.windows
-            .get("5h")
-            .or_else(|| snap.windows.get("Claude 5h"))
-            .or_else(|| snap.windows.get("Gemini 5h")),
-        "5h",
-        now,
-    );
-    let weekly = bar_slot_for(
-        snap.windows
-            .get("week")
-            .or_else(|| snap.windows.get("Claude week"))
-            .or_else(|| snap.windows.get("Gemini week")),
-        "week",
-        now,
-    );
+    let session_w = snap
+        .windows
+        .get("5h")
+        .or_else(|| pick_higher_usage(snap.windows.get("Claude 5h"), snap.windows.get("Gemini 5h")));
+    let session = bar_slot_for(session_w, "5h", now);
+
+    let weekly_w = snap
+        .windows
+        .get("week")
+        .or_else(|| pick_higher_usage(snap.windows.get("Claude week"), snap.windows.get("Gemini week")));
+    let weekly = bar_slot_for(weekly_w, "week", now);
     (session, weekly)
 }
 
@@ -230,6 +245,7 @@ fn provider_label(id: ProviderId) -> &'static str {
         // ships A/C/D/E/G/I/L/M/N/O/T — so the icon uses MET (Meta,
         // the provider id in Muse's own session logs) instead.
         ProviderId::MuseSpark => "MET",
+        ProviderId::OpenCodeGo => "OCG",
     }
 }
 
@@ -449,6 +465,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn opencode_go_label_uses_only_shipped_glyphs() {
+        for ch in provider_label(ProviderId::OpenCodeGo).chars() {
+            assert_ne!(glyph(ch), &GLYPH_BLANK, "label char {ch} has no glyph");
+        }
+    }
+
     fn snap_with_quota(short: Option<f64>, weekly: Option<f64>, with_reset: bool) -> UsageSnapshot {
         let now = chrono::Utc::now();
         let mut windows: BTreeMap<String, WindowUsage> = BTreeMap::new();
@@ -550,6 +573,40 @@ mod tests {
         assert_eq!(short.fraction, Some(0.72));
         assert_eq!(week.fraction, Some(0.24));
         assert!(short.pace.is_some());
+        assert!(week.pace.is_some());
+    }
+
+    #[test]
+    fn pick_bars_prefers_higher_usage_between_claude_and_gemini() {
+        let now = chrono::Utc::now();
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Antigravity,
+            timestamp: now,
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        snap.windows.insert(
+            "Claude week".into(),
+            WindowUsage {
+                fraction_used: Some(0.0),
+                ends_at: Some(now + chrono::Duration::days(7)),
+                ..Default::default()
+            },
+        );
+        snap.windows.insert(
+            "Gemini week".into(),
+            WindowUsage {
+                fraction_used: Some(0.41),
+                ends_at: Some(now + chrono::Duration::days(4)),
+                ..Default::default()
+            },
+        );
+
+        let (_short, week) = pick_bars(&snap);
+        assert_eq!(week.fraction, Some(0.41));
         assert!(week.pace.is_some());
     }
 

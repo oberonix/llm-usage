@@ -39,6 +39,7 @@ pub struct Config {
     pub codex_cli: CodexCliConfig,
     pub ollama_cloud: OllamaCloudConfig,
     pub muse_spark: MuseSparkConfig,
+    pub opencode_go: OpenCodeGoConfig,
     pub alerts: AlertsConfig,
 }
 
@@ -60,6 +61,7 @@ impl Default for Config {
             codex_cli: CodexCliConfig::default(),
             ollama_cloud: OllamaCloudConfig::default(),
             muse_spark: MuseSparkConfig::default(),
+            opencode_go: OpenCodeGoConfig::default(),
             alerts: AlertsConfig::default(),
         }
     }
@@ -233,6 +235,33 @@ impl Default for MuseSparkConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct OpenCodeGoConfig {
+    pub enabled: bool,
+    /// Explicit API key; if None, automatically discovered from
+    /// `~/.local/share/opencode/auth.json` (keys "opencode-go" or "opencode").
+    pub api_key: Option<String>,
+    /// Override path for auth.json; defaults to ~/.local/share/opencode/auth.json.
+    pub auth_json_path: Option<PathBuf>,
+    /// Override base URL; defaults to https://opencode.ai.
+    pub base_url: Option<String>,
+    pub warn_at: Vec<f64>,
+}
+
+impl Default for OpenCodeGoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api_key: None,
+            auth_json_path: None,
+            base_url: None,
+            warn_at: vec![0.75, 0.9],
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AlertsConfig {
     /// Reserved for a future time-based debounce. The current throttle
     /// is window-id based: `quota::window_id_for` derives a key like
@@ -382,6 +411,8 @@ mod tests {
             parsed.muse_spark.weekly_limit_units,
             cfg.muse_spark.weekly_limit_units
         );
+        assert_eq!(parsed.opencode_go.enabled, cfg.opencode_go.enabled);
+        assert_eq!(parsed.opencode_go.warn_at, cfg.opencode_go.warn_at);
     }
 
     #[test]

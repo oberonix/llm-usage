@@ -94,6 +94,18 @@ show_spend = false
 # daily_budget_usd = 5.0
 warn_at = [0.75, 0.9]
 
+[opencode_go]
+enabled = true
+# Optional explicit API key. If omitted or commented out, llm-usage
+# automatically reads your API key from ~/.local/share/opencode/auth.json
+# (under "opencode-go" or "opencode" entry from `opencode auth login`).
+# api_key = "sk-..."
+# auth_json_path = "/path/to/opencode/auth.json"
+# Base URL for the usage endpoint; defaults to https://opencode.ai.
+# base_url = "https://opencode.ai"
+# Quota alert thresholds (0.0..1.0 fractions)
+warn_at = [0.75, 0.9]
+
 [alerts]
 # Currently informational — alerts are throttled by window_id
 # (one alert per provider × threshold × hour/week/month bucket)
