@@ -591,6 +591,24 @@ struct UsageQuantity {
 }
 
 fn default_sessions_dir() -> PathBuf {
+    if let Some(d) = dirs::data_dir() {
+        let p = d.join("muse").join("sessions");
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Some(h) = dirs::home_dir() {
+        let p = h.join(".local").join("share").join("muse").join("sessions");
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Some(h) = dirs::home_dir() {
+        let p = h.join(".muse").join("sessions");
+        if p.exists() {
+            return p;
+        }
+    }
     dirs::data_dir()
         .map(|d| d.join("muse").join("sessions"))
         .unwrap_or_else(|| PathBuf::from(".muse-sessions"))

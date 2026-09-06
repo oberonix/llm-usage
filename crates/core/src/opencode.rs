@@ -70,6 +70,18 @@ pub struct OpencodeEvent {
 /// a project-relative path when the OS data dir can't be resolved
 /// (mostly relevant for tests).
 pub fn default_db_path() -> PathBuf {
+    if let Some(d) = dirs::data_dir() {
+        let p = d.join("opencode").join("opencode.db");
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Some(h) = dirs::home_dir() {
+        let p = h.join(".local").join("share").join("opencode").join("opencode.db");
+        if p.exists() {
+            return p;
+        }
+    }
     dirs::data_dir()
         .map(|d| d.join("opencode").join("opencode.db"))
         .unwrap_or_else(|| PathBuf::from(".opencode.db"))
@@ -77,6 +89,24 @@ pub fn default_db_path() -> PathBuf {
 
 /// Default path to `~/.local/share/opencode/auth.json`.
 pub fn default_auth_json_path() -> Option<PathBuf> {
+    if let Some(d) = dirs::data_dir() {
+        let p = d.join("opencode").join("auth.json");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Some(h) = dirs::home_dir() {
+        let p = h.join(".local").join("share").join("opencode").join("auth.json");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Some(h) = dirs::home_dir() {
+        let p = h.join(".config").join("opencode").join("auth.json");
+        if p.exists() {
+            return Some(p);
+        }
+    }
     dirs::data_dir().map(|d| d.join("opencode").join("auth.json"))
 }
 
