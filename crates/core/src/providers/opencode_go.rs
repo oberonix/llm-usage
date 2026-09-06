@@ -297,11 +297,13 @@ impl Provider for OpenCodeGoProvider {
     }
 }
 
-/// Convert percentage into a 0.0..=1.0 fraction.
-/// If percent > 1.0 (e.g. 42.5), divides by 100.0.
+/// Convert percentage (0.0..=100.0) into a 0.0..=1.0 fraction.
 fn normalize_percent(val: f64) -> f64 {
-    let raw = if val > 1.0 { val / 100.0 } else { val };
-    raw.clamp(0.0, 1.0)
+    if val.is_nan() || val <= 0.0 {
+        0.0
+    } else {
+        (val / 100.0).clamp(0.0, 1.0)
+    }
 }
 
 fn fold_local_events(
@@ -497,7 +499,7 @@ mod tests {
         assert_eq!(normalize_percent(50.0), 0.5);
         assert_eq!(normalize_percent(100.0), 1.0);
         assert_eq!(normalize_percent(0.0), 0.0);
-        assert_eq!(normalize_percent(0.42), 0.42);
+        assert_eq!(normalize_percent(1.0), 0.01);
         assert_eq!(normalize_percent(150.0), 1.0);
     }
 
