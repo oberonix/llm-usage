@@ -39,7 +39,7 @@ use crate::model::{ProviderId, ProviderStatus, UsageSnapshot, WindowKind, Window
 use crate::provider::Provider;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Utc};
 use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use std::time::Duration;
@@ -304,7 +304,7 @@ impl Provider for OllamaCloudProvider {
     }
 }
 
-/// Bucket opencode events into 1h / today / 5h / week / month windows
+/// Bucket opencode events into 5h / week quota windows
 /// and accumulate tokens, requests, and cost. Doesn't touch
 /// `fraction_used` — those come from the page scrape.
 fn fold_opencode_events(
@@ -312,29 +312,17 @@ fn fold_opencode_events(
     events: &[crate::opencode::OpencodeEvent],
     now: DateTime<Utc>,
 ) {
-    let hour_cutoff = now - chrono::Duration::hours(1);
     let five_hour_cutoff = now - chrono::Duration::hours(5);
     let week_cutoff = now - chrono::Duration::days(7);
-    let today = now.date_naive();
-    let this_month = (now.year(), now.month());
 
     for e in events {
-        // Build the list of windows this event qualifies for.
+        // Only fold into existing quota windows (5h, week)
         let mut buckets: Vec<&'static str> = Vec::new();
-        if e.timestamp > hour_cutoff {
-            buckets.push("1h");
-        }
-        if e.timestamp.date_naive() == today {
-            buckets.push("today");
-        }
         if e.timestamp > five_hour_cutoff {
             buckets.push("5h");
         }
         if e.timestamp > week_cutoff {
             buckets.push(WindowKind::ThisWeek.label());
-        }
-        if (e.timestamp.year(), e.timestamp.month()) == this_month {
-            buckets.push("month");
         }
         for label in &buckets {
             let w = snap.windows.entry((*label).to_string()).or_default();

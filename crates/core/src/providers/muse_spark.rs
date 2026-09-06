@@ -212,15 +212,10 @@ impl Provider for MuseSparkProvider {
         let (slot7_start, slot7_end) = weekly_slot(now);
         let estimate = self.cfg.quota_estimate;
 
-        let mut hour = Bucket::default();
         let mut today = Bucket::default();
         let mut five = Bucket::default();
         let mut week = Bucket::default();
-        let mut month = Bucket::default();
         for e in &events {
-            if (now - e.timestamp).num_hours().abs() < 1 {
-                hour.add(e);
-            }
             if same_local_day(e.timestamp, now) {
                 today.add(e);
             }
@@ -238,9 +233,6 @@ impl Provider for MuseSparkProvider {
             } else if same_iso_week(e.timestamp, now) {
                 week.add(e);
             }
-            if e.timestamp.year() == now.year() && e.timestamp.month() == now.month() {
-                month.add(e);
-            }
         }
 
         let mut snap = UsageSnapshot {
@@ -253,27 +245,17 @@ impl Provider for MuseSparkProvider {
             plan_label: None,
         };
 
-        let h = snap.window_mut(WindowKind::LastHour);
-        h.tokens_in = hour.input_tokens;
-        h.tokens_out = hour.output_tokens;
-        h.request_count = hour.turns;
-        h.spend_usd = Some(hour.cost_usd);
-
-        let t = snap.window_mut(WindowKind::Today);
-        t.tokens_in = today.input_tokens;
-        t.tokens_out = today.output_tokens;
-        t.request_count = today.turns;
-        t.spend_usd = Some(today.cost_usd);
-        // A user-supplied daily budget turns `today` into a
-        // quota-like window: `ends_at` both renders the reset
-        // countdown and marks it quota-derived so `strip_spend`
-        // keeps the fraction when spend display is off.
-        t.limit_usd = self.cfg.daily_budget_usd;
-        if t.limit_usd.is_some() {
+        if let Some(daily_budget) = self.cfg.daily_budget_usd {
+            let t = snap.window_mut(WindowKind::Today);
+            t.tokens_in = today.input_tokens;
+            t.tokens_out = today.output_tokens;
+            t.request_count = today.turns;
+            t.spend_usd = Some(today.cost_usd);
+            t.limit_usd = Some(daily_budget);
             t.ends_at = Some(end_of_local_day(now));
             t.started_at = Some(now);
+            t.recompute_fraction();
         }
-        t.recompute_fraction();
 
         // The 5 h activity window mirrors Codex's rolling-5 h row so
         // the card has the same density; in estimate mode it doubles
@@ -327,13 +309,6 @@ impl Provider for MuseSparkProvider {
             w.recompute_fraction();
             w.fraction_used
         };
-
-        let m = snap.window_mut(WindowKind::ThisMonth);
-        m.tokens_in = month.input_tokens;
-        m.tokens_out = month.output_tokens;
-        m.request_count = month.turns;
-        m.spend_usd = Some(month.cost_usd);
-        m.recompute_fraction();
 
         snap.headline = Some(match (estimate, current_frac, weekly_frac) {
             // Estimated quota headline in `/usage` vocabulary. The
@@ -803,12 +778,12 @@ mod tests {
         let p = activity_only_provider_for(&dir);
         let snap = p.poll().await.unwrap();
         assert!(matches!(snap.status, ProviderStatus::Ok));
-        let today = snap.window(WindowKind::Today).expect("today window");
+        let week = snap.window(WindowKind::ThisWeek).expect("week window");
         // usage-1 + usage-3; the zero-valued tool row is skipped.
-        assert_eq!(today.request_count, 2);
-        assert_eq!(today.tokens_in, 1500);
+        assert_eq!(week.request_count, 2);
+        assert_eq!(week.tokens_in, 1500);
         // output folds reasoning in: (200 + 10) + 50.
-        assert_eq!(today.tokens_out, 260);
+        assert_eq!(week.tokens_out, 260);
         // Activity-only by default — no quota fractions anywhere.
         assert!(snap.windows.values().all(|w| w.fraction_used.is_none()));
         assert_eq!(snap.headline.as_deref(), Some("2 turns today · 2 turns 7d"));
@@ -821,10 +796,10 @@ mod tests {
         let dir = fixture_dir_with(&[usage_line(m, "usage-1", "provider", 1000, 100, 0, 0)]);
         let p = provider_for(&dir);
         let first = p.poll().await.unwrap();
-        assert_eq!(first.window(WindowKind::Today).unwrap().request_count, 1);
+        assert_eq!(first.window(WindowKind::ThisWeek).unwrap().request_count, 1);
         // Second poll with no changes: same counts, no double-count.
         let second = p.poll().await.unwrap();
-        assert_eq!(second.window(WindowKind::Today).unwrap().request_count, 1);
+        assert_eq!(second.window(WindowKind::ThisWeek).unwrap().request_count, 1);
         // Append one new step; only it is picked up.
         let path = dir.path().join("2026/09/03/sess-1/session.jsonl");
         let mut f = std::fs::OpenOptions::new()
@@ -839,9 +814,9 @@ mod tests {
         .unwrap();
         drop(f);
         let third = p.poll().await.unwrap();
-        let today = third.window(WindowKind::Today).unwrap();
-        assert_eq!(today.request_count, 2);
-        assert_eq!(today.tokens_in, 3000);
+        let week = third.window(WindowKind::ThisWeek).unwrap();
+        assert_eq!(week.request_count, 2);
+        assert_eq!(week.tokens_in, 3000);
     }
 
     #[tokio::test]
@@ -895,8 +870,8 @@ mod tests {
         let p = MuseSparkProvider::with_sessions_dir(cfg, dir.path().to_path_buf());
         let snap = p.poll().await.unwrap();
         // All input cached: 1M × $0.15 = $0.15.
-        let today = snap.window(WindowKind::Today).unwrap();
-        assert!((today.spend_usd.unwrap() - 0.15).abs() < 1e-9);
+        let week = snap.window(WindowKind::ThisWeek).unwrap();
+        assert!((week.spend_usd.unwrap() - 0.15).abs() < 1e-9);
         assert!(snap.headline.as_deref().unwrap().starts_with("$0.15 today"));
     }
 

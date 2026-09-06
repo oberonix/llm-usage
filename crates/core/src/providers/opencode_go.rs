@@ -315,23 +315,9 @@ fn fold_local_events(
         return;
     }
 
-    let one_hour_ago = now - Duration::hours(1);
-    let today_start = now
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .map(|t| DateTime::<Utc>::from_naive_utc_and_offset(t, Utc))
-        .unwrap_or(now - Duration::hours(24));
     let five_hours_ago = now - Duration::hours(5);
     let seven_days_ago = now - Duration::days(7);
     let thirty_days_ago = now - Duration::days(30);
-
-    let mut h_in = 0u64;
-    let mut h_out = 0u64;
-    let mut h_req = 0u64;
-
-    let mut t_in = 0u64;
-    let mut t_out = 0u64;
-    let mut t_req = 0u64;
 
     let mut r5_in = 0u64;
     let mut r5_out = 0u64;
@@ -347,16 +333,6 @@ fn fold_local_events(
 
     for e in events {
         let ts = e.timestamp;
-        if ts >= one_hour_ago {
-            h_in += e.input_tokens;
-            h_out += e.output_tokens;
-            h_req += 1;
-        }
-        if ts >= today_start {
-            t_in += e.input_tokens;
-            t_out += e.output_tokens;
-            t_req += 1;
-        }
         if ts >= five_hours_ago {
             r5_in += e.input_tokens;
             r5_out += e.output_tokens;
@@ -372,32 +348,6 @@ fn fold_local_events(
             m_out += e.output_tokens;
             m_req += 1;
         }
-    }
-
-    // Insert 1h and today activity windows if events exist
-    if h_req > 0 {
-        windows.insert(
-            WindowKind::LastHour.label().to_string(),
-            WindowUsage {
-                tokens_in: h_in,
-                tokens_out: h_out,
-                request_count: h_req,
-                subview: true,
-                ..Default::default()
-            },
-        );
-    }
-    if t_req > 0 {
-        windows.insert(
-            WindowKind::Today.label().to_string(),
-            WindowUsage {
-                tokens_in: t_in,
-                tokens_out: t_out,
-                request_count: t_req,
-                subview: true,
-                ..Default::default()
-            },
-        );
     }
 
     // Fold metrics into 5h window
@@ -450,11 +400,6 @@ fn build_headline(windows: &BTreeMap<String, WindowUsage>, now: DateTime<Utc>) -
     }
 
     if parts.is_empty() {
-        if let Some(t) = windows.get(WindowKind::Today.label()) {
-            if t.request_count > 0 {
-                return Some(format!("{} turns today", t.request_count));
-            }
-        }
         None
     } else {
         Some(format!("Go · {}", parts.join(" · ")))
