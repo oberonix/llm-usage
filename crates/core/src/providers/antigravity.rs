@@ -219,13 +219,55 @@ fn decode_base64(input: &str) -> Result<String> {
     String::from_utf8(out).context("decoded token was not UTF-8")
 }
 
+fn find_agy_binary() -> std::path::PathBuf {
+    if let Some(home) = dirs::home_dir() {
+        let local = home.join(".local/bin/agy");
+        if local.is_file() {
+            return local;
+        }
+        let cargo = home.join(".cargo/bin/agy");
+        if cargo.is_file() {
+            return cargo;
+        }
+    }
+    for p in ["/opt/homebrew/bin/agy", "/usr/local/bin/agy"] {
+        let pb = std::path::PathBuf::from(p);
+        if pb.is_file() {
+            return pb;
+        }
+    }
+    std::path::PathBuf::from("agy")
+}
+
 fn refresh_agy_keyring_via_cli() -> Result<()> {
-    let output = Command::new("agy")
-        .arg("models")
+    let bin = find_agy_binary();
+    let mut cmd = Command::new(&bin);
+    cmd.arg("models");
+
+    if let Some(home) = dirs::home_dir() {
+        let mut path = std::env::var("PATH").unwrap_or_default();
+        let local_bin = home.join(".local/bin").display().to_string();
+        let cargo_bin = home.join(".cargo/bin").display().to_string();
+        if !path.contains(&local_bin) {
+            path = format!(
+                "{}:{}:/opt/homebrew/bin:/usr/local/bin:{}",
+                local_bin, cargo_bin, path
+            );
+            cmd.env("PATH", path);
+        }
+    }
+
+    let output = cmd
         .output()
         .context("run `agy models` to refresh Antigravity keyring token")?;
     if !output.status.success() {
-        return Err(anyhow!("`agy models` exited with {}", output.status));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "`{} models` exited with {}: {}",
+            bin.display(),
+            output.status,
+            stderr.trim()
+        ));
     }
     Ok(())
 }
