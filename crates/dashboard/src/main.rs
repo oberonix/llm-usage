@@ -1133,26 +1133,15 @@ fn help_bullets(ui: &mut egui::Ui, items: &[&str]) {
 }
 
 /// Where (0..1) the time window currently sits, for the pace
-/// marker overlay. Mirrors `pace_index` in the CLI crate and the
-/// `bar_slot_for` logic in the tray icon — those three need to
-/// agree on what a "5h window" or "weekly window" means so the
-/// three surfaces show the same marker.
+/// marker overlay. Delegates to the shared core helper
+/// (`WindowUsage::pace_fraction`, also used by the CLI and tray
+/// icon) so the three surfaces show the same marker.
 fn pace_fraction(
     label: &str,
     w: &llm_usage_core::model::WindowUsage,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<f64> {
-    let window_secs: i64 = if label == "5h" || label.ends_with(" 5h") {
-        5 * 3600
-    } else if label == "week" || label.ends_with(" week") || label == "Sonnet" || label == "Opus" {
-        7 * 86_400
-    } else {
-        return None;
-    };
-    let ends = w.ends_at?;
-    let remaining = (ends - now).num_seconds().max(0).min(window_secs);
-    let elapsed = window_secs - remaining;
-    Some(elapsed as f64 / window_secs as f64)
+    w.pace_fraction(label, now)
 }
 
 fn reset_label(secs: i64, ends_at: chrono::DateTime<chrono::Utc>) -> String {
@@ -1521,6 +1510,18 @@ mod tests {
 
         assert!(pace_fraction("month", &w, now).is_none());
         assert!(pace_fraction("today", &w, now).is_none());
+    }
+
+    #[test]
+    fn pace_fraction_returns_none_when_reset_beyond_window() {
+        // Live Antigravity/Ollama rows report resets days past a
+        // "5h" label — no marker beats one pinned at the window start.
+        let now = chrono::Utc::now();
+        let mut w = llm_usage_core::model::WindowUsage::default();
+        w.ends_at = Some(now + chrono::Duration::days(5));
+        assert!(pace_fraction("Gemini 5h", &w, now).is_none());
+        w.ends_at = Some(now + chrono::Duration::days(11));
+        assert!(pace_fraction("Claude week", &w, now).is_none());
     }
 
     #[test]

@@ -102,8 +102,11 @@ impl Default for AnthropicConfig {
 #[serde(default)]
 pub struct AntigravityConfig {
     pub enabled: bool,
-    /// Cloud Code backend endpoint. `cloudcode-pa.googleapis.com` is the
-    /// production service; Antigravity's own CLI logs may show daily/staging.
+    /// Cloud Code backend endpoint. This must be the daily host
+    /// (`daily-cloudcode-pa.googleapis.com`): that is what the `agy` CLI
+    /// itself talks to (see its `http_helpers.go` log lines), and only the
+    /// daily host reports live Gemini quota — production answers the same
+    /// RPC with `remainingFraction = 1` on both Gemini buckets.
     pub base_url: String,
     /// Command that prints a Google OAuth access token to stdout.
     pub access_token_command: Option<String>,
@@ -114,7 +117,7 @@ impl Default for AntigravityConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            base_url: "https://cloudcode-pa.googleapis.com".to_string(),
+            base_url: "https://daily-cloudcode-pa.googleapis.com".to_string(),
             access_token_command: None,
             warn_at: vec![0.75, 0.9],
         }
@@ -213,7 +216,9 @@ pub struct MuseSparkConfig {
     /// Usage" plan; adjust if your plan differs.
     pub current_limit_units: Option<u64>,
     /// Uncached-token limit for the 7 d "Weekly" window. Default
-    /// 13.2 M from the same fit.
+    /// 6.0 M, recalibrated Sep-11 against two time-sliced official
+    /// readings (implied range 4.6–7.4 M); the original 13.2 M fit
+    /// under-reported ~2× on live data.
     pub weekly_limit_units: Option<u64>,
 }
 
@@ -228,7 +233,7 @@ impl Default for MuseSparkConfig {
             show_spend: false,
             quota_estimate: true,
             current_limit_units: Some(4_410_000),
-            weekly_limit_units: Some(13_200_000),
+            weekly_limit_units: Some(6_000_000),
         }
     }
 }
@@ -520,6 +525,19 @@ mod tests {
         let cfg = Config::load_from(&p).unwrap();
         assert_eq!(cfg.poll_interval_secs, 600);
         assert!(cfg.anthropic.enabled);
+    }
+
+    #[test]
+    fn antigravity_default_base_url_matches_agy_cli_host() {
+        // The `agy` CLI talks to the daily host (see its http_helpers.go
+        // log lines), and only the daily host reports live Gemini quota —
+        // prod answers the same RPC with remainingFraction = 1 on both
+        // Gemini buckets, which showed up as 0% Gemini usage. Pin the
+        // default so a well-meaning "simplify to prod" edit fails loudly.
+        assert_eq!(
+            AntigravityConfig::default().base_url,
+            "https://daily-cloudcode-pa.googleapis.com"
+        );
     }
 
     #[test]

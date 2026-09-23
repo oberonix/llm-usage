@@ -174,7 +174,7 @@ impl ConfigDraft {
             muse_quota_estimate: c.muse_spark.quota_estimate,
             muse_current_limit_munits: c.muse_spark.current_limit_units.unwrap_or(4_410_000) as f64
                 / 1_000_000.0,
-            muse_weekly_limit_munits: c.muse_spark.weekly_limit_units.unwrap_or(13_200_000) as f64
+            muse_weekly_limit_munits: c.muse_spark.weekly_limit_units.unwrap_or(6_000_000) as f64
                 / 1_000_000.0,
 
             opencode_go_enabled: c.opencode_go.enabled,
@@ -568,10 +568,10 @@ impl ConfigDraft {
                 "Usage comes from your local Muse session logs — no sign-in \
                  needed. The estimated quota divides uncached-token activity \
                  by the limits above (reverse-engineered from /usage \
-                 snapshots, ~4.41 M per 5 h Current window and ~13.2 M per \
-                 Weekly window) and tags the headline with ~ and (est.). \
-                 Untick for turns-and-tokens only; the $ budgets below apply \
-                 when the estimate is off.",
+                 snapshots, ~4.41 M per usage-chained 5 h Current window \
+                 and ~6.0 M per Weekly window) and tags the headline with \
+                 ~ and (est.). Untick for turns-and-tokens only; the $ \
+                 budgets below apply when the estimate is off.",
             );
         });
     }

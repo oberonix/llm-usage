@@ -200,19 +200,11 @@ fn bar_slot_for(
         return out;
     };
     out.fraction = w.fraction_used;
-    // Pace = (window_duration − time_until_reset) / window_duration.
-    // We hardcode the duration per label so we don't need the
-    // provider to surface a "window length" field.
-    let window_secs: i64 = match label {
-        "5h" => 5 * 3600,
-        "week" => 7 * 86_400,
-        _ => return out,
-    };
-    if let Some(ends) = w.ends_at {
-        let remaining = (ends - now).num_seconds().max(0).min(window_secs);
-        let elapsed = window_secs - remaining;
-        out.pace = Some(elapsed as f64 / window_secs as f64);
-    }
+    // Pace comes from the shared core helper (also used by the CLI
+    // and dashboard) so the three surfaces agree. It returns `None`
+    // for unknown labels, missing resets, and resets beyond the
+    // window length — no marker beats a misleading one.
+    out.pace = w.pace_fraction(label, now);
     out
 }
 
@@ -528,6 +520,44 @@ mod tests {
         assert!(s.pace.is_none());
         assert_eq!(w.fraction, Some(0.5));
         assert!(w.pace.is_none());
+    }
+
+    #[test]
+    fn pick_bars_no_pace_when_reset_beyond_window() {
+        // Live Antigravity rows report "5h" resets days out. The
+        // fraction still shows; the pace marker is dropped instead
+        // of pinned at the window start.
+        let now = chrono::Utc::now();
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Antigravity,
+            timestamp: now,
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        snap.windows.insert(
+            "Gemini 5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.77),
+                ends_at: Some(now + chrono::Duration::days(5)),
+                ..Default::default()
+            },
+        );
+        snap.windows.insert(
+            "Gemini week".into(),
+            WindowUsage {
+                fraction_used: Some(0.30),
+                ends_at: Some(now + chrono::Duration::days(11)),
+                ..Default::default()
+            },
+        );
+        let (short, week) = pick_bars(&snap);
+        assert_eq!(short.fraction, Some(0.77));
+        assert!(short.pace.is_none());
+        assert_eq!(week.fraction, Some(0.30));
+        assert!(week.pace.is_none());
     }
 
     #[test]

@@ -58,9 +58,11 @@ enabled = false
 # Uses the Antigravity keyring token by default:
 #   Linux secret-service: service=gemini username=antigravity
 #   macOS keychain: account=antigravity
-# Defaults to https://cloudcode-pa.googleapis.com; Antigravity logs may show
-# daily-cloudcode-pa.googleapis.com, but prod exposes the same quota RPC.
-# base_url = "https://cloudcode-pa.googleapis.com"
+# Defaults to https://daily-cloudcode-pa.googleapis.com — the host the `agy`
+# CLI itself uses. Do not point this at prod cloudcode-pa.googleapis.com:
+# prod answers the same quota RPC but reports full (remaining = 1) Gemini
+# quota, so the dashboard would show 0% Gemini usage.
+# base_url = "https://daily-cloudcode-pa.googleapis.com"
 # access_token_command = "some-command-that-prints-a-google-oauth-access-token"
 warn_at = [0.75, 0.9]
 

@@ -240,10 +240,6 @@ impl Provider for AntigravityProvider {
         self.cfg.enabled
     }
 
-    fn subview_labels(&self) -> &'static [&'static str] {
-        &["Claude/GPT 5h", "Claude/GPT week"]
-    }
-
     async fn poll(&self) -> Result<UsageSnapshot> {
         let json = match self.fetch_quota_json().await {
             Ok(v) => v,

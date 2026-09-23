@@ -531,28 +531,19 @@ fn format_quota_row(label: &str, w: &WindowUsage, use_color: bool) -> String {
 const DIM_GRAY: &str = "\x1b[90m";
 
 // Cell index (0..cells) of the pacing marker, given how much of the
-// underlying window has elapsed. Mirrors the tray icon's pace logic
-// in `crates/ui/src/icon.rs` — only labels with a known total
-// duration get a marker. Returns `None` for labels we can't
-// confidently size (1h / today / month: the renderer would have
-// nothing to compare elapsed-vs-total against).
+// underlying window has elapsed. Delegates to the shared core helper
+// (`WindowUsage::pace_fraction`, also used by the dashboard and tray
+// icon) so the three surfaces agree; this only maps the 0..1 pace to
+// a cell. Returns `None` when there's no trustworthy pace — unknown
+// label, missing reset, or a reset beyond the window length.
 fn pace_index(
     label: &str,
     w: &WindowUsage,
     now: chrono::DateTime<chrono::Utc>,
     cells: usize,
 ) -> Option<usize> {
-    let window_secs: i64 = if label == "5h" || label.ends_with(" 5h") {
-        5 * 3600
-    } else if label == "week" || label.ends_with(" week") || label == "Sonnet" || label == "Opus" {
-        7 * 86_400
-    } else {
-        return None;
-    };
-    let ends = w.ends_at?;
-    let remaining = (ends - now).num_seconds().max(0).min(window_secs);
-    let elapsed = (window_secs - remaining) as f64 / window_secs as f64;
-    Some(((elapsed * (cells - 1) as f64).round() as usize).min(cells - 1))
+    let pace = w.pace_fraction(label, now)?;
+    Some(((pace * (cells - 1) as f64).round() as usize).min(cells - 1))
 }
 
 // 10-cell bar with two layers of colour when `use_color`:
@@ -928,6 +919,20 @@ mod tests {
         let mut w = WindowUsage::default();
         w.ends_at = Some(now - chrono::Duration::hours(1));
         assert_eq!(pace_index("5h", &w, now, 10).unwrap(), 9);
+    }
+
+    #[test]
+    fn pace_index_reset_beyond_window_returns_none() {
+        // Live Antigravity/Ollama rows report resets days past a
+        // "5h" label. No marker beats one pinned at cell 0 reading
+        // "window just started".
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        w.ends_at = Some(now + chrono::Duration::days(5));
+        assert!(pace_index("5h", &w, now, 10).is_none());
+        assert!(pace_index("Gemini 5h", &w, now, 10).is_none());
+        w.ends_at = Some(now + chrono::Duration::days(11));
+        assert!(pace_index("week", &w, now, 10).is_none());
     }
 
     #[test]

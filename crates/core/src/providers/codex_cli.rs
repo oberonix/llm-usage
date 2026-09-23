@@ -584,8 +584,10 @@ fn apply_rate_limits(
     w.fraction_used = Some(raw_frac);
     w.ends_at = bucket.resets_at;
     w.started_at = Some(now);
+    // Carry the provider-reported window length so pace markers use
+    // the real duration instead of the label-implied 5h/7d default.
+    w.window_secs = (bucket.window_minutes > 0).then(|| bucket.window_minutes as i64 * 60);
     w.mark_stale_if_expired(now);
-    let _ = bucket.window_minutes;
 }
 
 fn build_headline(
@@ -1531,6 +1533,36 @@ mod tests {
         assert!((w.fraction_used.unwrap() - 0.97).abs() < 1e-9);
         assert_eq!(w.ends_at, stale_bucket.resets_at);
         assert!(w.stale, "expected stale flag past grace period");
+    }
+
+    #[test]
+    fn apply_rate_limits_records_window_secs_from_bucket() {
+        // The bucket's window_minutes backs the pace marker so a
+        // non-5h/7d window still paces correctly.
+        use crate::model::WindowUsage;
+        let now = chrono::Utc::now();
+        let mut w = WindowUsage::default();
+        apply_rate_limits(
+            &mut w,
+            RateLimitsBucket {
+                used_percent: 10.0,
+                window_minutes: 300,
+                resets_at: Some(now + chrono::Duration::hours(2)),
+            },
+            now,
+        );
+        assert_eq!(w.window_secs, Some(18_000));
+        let mut w = WindowUsage::default();
+        apply_rate_limits(
+            &mut w,
+            RateLimitsBucket {
+                used_percent: 10.0,
+                window_minutes: 10_080,
+                resets_at: Some(now + chrono::Duration::days(3)),
+            },
+            now,
+        );
+        assert_eq!(w.window_secs, Some(604_800));
     }
 
     #[test]

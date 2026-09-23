@@ -133,6 +133,31 @@ pub struct WindowUsage {
     /// `#[serde(default)]` keeps pre-existing snapshots deserialising.
     #[serde(default)]
     pub subview: bool,
+    /// True window length in seconds, when the provider reports it
+    /// (Codex buckets carry `window_minutes`). Pace markers prefer
+    /// this over the label-implied 5h/7d default. Every other
+    /// provider leaves it `None` and the hardcoded durations apply —
+    /// see [`implied_window_secs`]. `#[serde(default)]` keeps
+    /// pre-existing snapshots deserialising.
+    #[serde(default)]
+    pub window_secs: Option<i64>,
+}
+
+/// Window length in seconds implied by labels with known pacing
+/// semantics. Antigravity (`Claude 5h`, `Gemini week`, …) and Ollama
+/// (`5h` for "Session usage") are deliberately hardcoded to the same
+/// 5h/7d rolling windows as Anthropic/Codex: neither source exposes
+/// a trustworthy duration, so a shared assumption beats per-row
+/// guesswork. Returns `None` for labels we can't confidently size
+/// (`1h` / `today` / `month` …).
+pub fn implied_window_secs(label: &str) -> Option<i64> {
+    if label == "5h" || label.ends_with(" 5h") {
+        Some(5 * 3600)
+    } else if label == "week" || label.ends_with(" week") || label == "Sonnet" || label == "Opus" {
+        Some(7 * 86_400)
+    } else {
+        None
+    }
 }
 
 impl WindowUsage {
@@ -151,6 +176,29 @@ impl WindowUsage {
     /// considered stale. Five minutes absorbs clock skew and the
     /// latency between the API reset moment and the next poll.
     pub const STALE_GRACE_SECS: i64 = 5 * 60;
+
+    /// Elapsed fraction (0..1) of this quota window for the pace
+    /// marker overlay. Prefers the provider-reported [`Self::window_secs`]
+    /// when positive, otherwise the label-implied duration from
+    /// [`implied_window_secs`]. Returns `None` when the label has no
+    /// known duration, when `ends_at` is missing, or when the reset
+    /// lands more than a full window in the future: that contradicts
+    /// the assumed window length (observed live on Antigravity and
+    /// Ollama rows), and no marker beats one pinned at zero. A reset
+    /// already past yields 1.0 (window fully elapsed).
+    pub fn pace_fraction(&self, label: &str, now: DateTime<Utc>) -> Option<f64> {
+        let window_secs = self
+            .window_secs
+            .filter(|s| *s > 0)
+            .or_else(|| implied_window_secs(label))?;
+        let ends = self.ends_at?;
+        let remaining = (ends - now).num_seconds();
+        if remaining > window_secs {
+            return None;
+        }
+        let remaining = remaining.max(0);
+        Some((window_secs - remaining) as f64 / window_secs as f64)
+    }
 
     /// Mark the window stale if its reset time is in the past beyond
     /// the grace period. Call this after setting `ends_at` on a fresh
@@ -283,6 +331,7 @@ impl UsageSnapshot {
                     nw.fraction_used = cw.fraction_used;
                     nw.ends_at = cw.ends_at;
                     nw.started_at = cw.started_at;
+                    nw.window_secs = nw.window_secs.or(cw.window_secs);
                     nw.limit_usd = nw.limit_usd.or(cw.limit_usd);
                     nw.limit_tokens = nw.limit_tokens.or(cw.limit_tokens);
                     nw.stale = true;
@@ -795,5 +844,92 @@ mod tests {
         };
         w.mark_stale_if_expired(now);
         assert!(!w.stale);
+    }
+
+    #[test]
+    fn pace_fraction_maps_elapsed_to_zero_one() {
+        // 1h left of a 5h window → 4/5 elapsed.
+        let now = Utc::now();
+        let w = WindowUsage {
+            ends_at: Some(now + chrono::Duration::hours(1)),
+            ..Default::default()
+        };
+        for label in ["5h", "Claude 5h", "Gemini 5h"] {
+            let p = w.pace_fraction(label, now).expect(label);
+            assert!((p - 0.8).abs() < 0.01, "{label}: got {p}");
+        }
+        // 2d left of a 7d window → 5/7 elapsed.
+        let w = WindowUsage {
+            ends_at: Some(now + chrono::Duration::days(2)),
+            ..Default::default()
+        };
+        for label in ["week", "Sonnet", "Opus", "Claude week", "Gemini week"] {
+            let p = w.pace_fraction(label, now).expect(label);
+            assert!((p - (5.0 / 7.0)).abs() < 0.01, "{label}: got {p}");
+        }
+    }
+
+    #[test]
+    fn pace_fraction_returns_none_when_reset_contradicts_window() {
+        // Live Antigravity/Ollama rows report resets days beyond a
+        // "5h" label. A marker pinned at zero would read "window just
+        // started", so report no pace instead.
+        let now = Utc::now();
+        for (label, ends) in [
+            ("5h", now + chrono::Duration::days(5)),
+            ("Gemini 5h", now + chrono::Duration::days(5)),
+            ("week", now + chrono::Duration::days(12)),
+            ("Claude week", now + chrono::Duration::days(11)),
+        ] {
+            let w = WindowUsage {
+                ends_at: Some(ends),
+                ..Default::default()
+            };
+            assert!(w.pace_fraction(label, now).is_none(), "{label}");
+        }
+    }
+
+    #[test]
+    fn pace_fraction_pins_past_reset_to_one() {
+        let now = Utc::now();
+        let w = WindowUsage {
+            ends_at: Some(now - chrono::Duration::hours(1)),
+            ..Default::default()
+        };
+        assert_eq!(w.pace_fraction("5h", now), Some(1.0));
+    }
+
+    #[test]
+    fn pace_fraction_returns_none_without_duration_or_reset() {
+        let now = Utc::now();
+        let w = WindowUsage {
+            ends_at: Some(now + chrono::Duration::hours(1)),
+            ..Default::default()
+        };
+        assert!(w.pace_fraction("today", now).is_none());
+        assert!(w.pace_fraction("month", now).is_none());
+        let w = WindowUsage::default();
+        assert!(w.pace_fraction("5h", now).is_none());
+    }
+
+    #[test]
+    fn pace_fraction_prefers_provider_window_secs() {
+        // Codex reports its own window length; it wins over the label.
+        let now = Utc::now();
+        let w = WindowUsage {
+            ends_at: Some(now + chrono::Duration::minutes(30)),
+            window_secs: Some(3600),
+            ..Default::default()
+        };
+        let p = w.pace_fraction("5h", now).expect("override wins");
+        assert!((p - 0.5).abs() < 0.01, "got {p}");
+        // Non-positive overrides fall back to the label default.
+        let w = WindowUsage {
+            ends_at: Some(now + chrono::Duration::hours(1)),
+            window_secs: Some(0),
+            ..Default::default()
+        };
+        let p = w.pace_fraction("5h", now).expect("label fallback");
+        assert!((p - 0.8).abs() < 0.01, "got {p}");
     }
 }

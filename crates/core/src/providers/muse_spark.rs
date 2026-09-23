@@ -16,18 +16,28 @@
 //! the tray, alerts, and icon rotation treat Muse Spark like any
 //! other quota-bearing provider.
 //!
-//! Quota reverse-engineering (3 data points — see
-//! `/tmp/muse_quota_fit.jsonl`): fitting three `/usage` snapshots
-//! against machine-wide log consumption pins the metered metric to
-//! **non-cached input plus output**, with Current ≈ 4.41 M units per
-//! fixed 5 h window (10:57–15:57 local) and Weekly ≈ 13.2 M per 7 d
-//! (3× ratio, weekly baseline ≈ 0). The third snapshot confirmed the
-//! prediction exactly (58.0 % / 20.05 %) — but ONLY when fitted
-//! against the snapshot's "as of" time: the `/usage` session
-//! counters are live at render while the quota percentages lag by
-//! minutes. These fitted limits back the `quota_estimate` fractions
-//! (on by default, headline tagged `~` and `(est.)`); a local
-//! estimate systematically leads the official display, so the
+//! Quota reverse-engineering: fitting `/usage` snapshots against
+//! machine-wide log consumption pins the metered metric to
+//! **non-cached input plus output**. The first fit (3 points) gave
+//! Current ≈ 4.41 M units per fixed 5 h window and Weekly ≈ 13.2 M
+//! per 7 d — but a Sep-11 calibration (official 11 %/12 % ~23:05 UTC
+//! and 13 %/13 % ~23:20 UTC, time-sliced against log numerators)
+//! showed the app under-reporting ~2× on both windows, so the limits
+//! were recalibrated: Current 4.41 M retained (inside the newly
+//! implied 2.8–5.6 M range), Weekly cut to 6.0 M (implied range
+//! 4.6–7.4 M across both slices). The Current window is
+//! usage-chained, not wall-clock: each 5 h window opens at the first
+//! metered step after the previous one ends, so an idle reset opens
+//! nothing until usage resumes (a fixed :41 grid fit one "Resets at
+//! 7:41 PM" read to the minute but cannot survive idle gaps). The
+//! Sunday-17:00 weekly slot was confirmed twice ("Resets Sep 13 at
+//! 5:00 PM"). Fit against each snapshot's "as of" time: the `/usage`
+//! session counters are live at render while the quota percentages
+//! lag by minutes, and single-sample refits swing with that lag —
+//! treat all four numbers as ±30 % until a quiet-period calibration
+//! pins them. These fitted limits back the `quota_estimate`
+//! fractions (on by default, headline tagged `~` and `(est.)`); a
+//! local estimate systematically leads the official display, so the
 //! labeling stays even though the flag defaults on.
 //!
 //! ## Observed schema (verified against Muse Code 1.0.x session logs
@@ -191,12 +201,14 @@ impl Provider for MuseSparkProvider {
             ));
         }
 
-        // Estimate slots. The "Current" quota window is a fixed 5 h
-        // slot (boundaries at 00:57 + 5k local, inferred from one
-        // observed 10:57–15:57 window); "Weekly" runs Sunday 17:00 to
-        // Sunday 17:00 local. Both rules are approximate — see
-        // `current_slot` / `weekly_slot`.
-        let (slot5_start, slot5_end) = current_slot(now);
+        // Estimate windows. "Current" is a usage-chained 5 h window
+        // (each window opens at the first metered step after the
+        // previous one ends, so an idle reset opens nothing until
+        // usage resumes — there is no wall-clock grid); "Weekly" runs
+        // Sunday 17:00 to Sunday 17:00 local (confirmed by an
+        // official "Resets Sep 13 at 5:00 PM" read). Both rules are
+        // approximate — see `current_window` / `weekly_slot`.
+        let (slot5_start, slot5_end) = current_window(&events, now);
         let (slot7_start, slot7_end) = weekly_slot(now);
         let estimate = self.cfg.quota_estimate;
 
@@ -212,7 +224,7 @@ impl Provider for MuseSparkProvider {
             if same_local_day(e.timestamp, now) {
                 today.add(e);
             }
-            if e.timestamp >= slot5_start {
+            if e.timestamp >= slot5_start && e.timestamp <= slot5_end.min(now) {
                 five.add(e);
             }
             if estimate {
@@ -628,28 +640,42 @@ fn end_of_iso_week(now: DateTime<Utc>) -> DateTime<Utc> {
         .unwrap_or(now + chrono::Duration::days(7))
 }
 
-/// Start and end of the fixed 5 h "Current" quota slot containing
-/// `now`. Boundaries sit at 00:57 + 5k hours local — inferred from a
-/// single observed window (10:57–15:57), so treat the alignment as
-/// approximate: if a future `/usage` reset lands off these marks,
-/// the anchor needs revisiting, not the 5 h length (the reset stayed
+/// Start and end of the usage-chained 5 h "Current" quota window.
+/// Consecutive 5 h windows are chained from first use: each window
+/// opens at the first metered step at/after the previous window's
+/// end, so an idle reset opens no window until usage resumes — there
+/// is deliberately no wall-clock grid. (A fixed :41 grid fit one
+/// observed "Resets at 7:41 PM" read to the minute, but the quota
+/// does not start a window without usage, and 24 h is not a multiple
+/// of 5 h so no daily grid can hold anyway.) Returns the live window
+/// containing `now`, or the most recently ended one when idle past
+/// its end — the numerator is static then and the countdown reads
+/// elapsed. The 5 h length itself is solid (an official reset stayed
 /// fixed across snapshots 45 min apart, ruling out a rolling
-/// window).
-fn current_slot(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-    let local = now.with_timezone(&chrono::Local);
-    let today = local.date_naive();
-    let mut start_naive = today.and_hms_opt(0, 57, 0).expect("00:57 exists");
-    while local.naive_local() < start_naive {
-        start_naive -= chrono::Duration::hours(5);
+/// window); the chaining rule is falsifiable at the next reset after
+/// an idle gap, when a grid would tick to a wall-clock boundary and
+/// chaining holds the expired window instead.
+fn current_window(events: &[TokenEvent], now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    const WINDOW: chrono::Duration = chrono::Duration::hours(5);
+    // Cache order follows file appends, not time, and multi-file
+    // scans interleave — sort, and ignore clock-skewed future steps
+    // (they join the chain on a later poll once `now` passes them).
+    let mut stamps: Vec<DateTime<Utc>> = events
+        .iter()
+        .map(|e| e.timestamp)
+        .filter(|t| *t <= now)
+        .collect();
+    stamps.sort();
+    let Some(first) = stamps.first() else {
+        return (now, now + WINDOW);
+    };
+    let mut start = *first;
+    for t in &stamps {
+        if *t > start + WINDOW {
+            start = *t;
+        }
     }
-    while local.naive_local() >= start_naive + chrono::Duration::hours(5) {
-        start_naive += chrono::Duration::hours(5);
-    }
-    let end_naive = start_naive + chrono::Duration::hours(5);
-    (
-        to_utc_or(start_naive, now - chrono::Duration::hours(5)),
-        to_utc_or(end_naive, now),
-    )
+    (start, start + WINDOW)
 }
 
 /// Start and end of the 7 d "Weekly" quota slot containing `now`:
@@ -962,19 +988,55 @@ mod tests {
         (l.year(), l.month(), l.day(), l.hour(), l.minute())
     }
 
+    fn step_at(hours_from_base: i64, base: DateTime<Utc>) -> TokenEvent {
+        TokenEvent {
+            timestamp: base + chrono::Duration::hours(hours_from_base),
+            input_tokens: 100,
+            output_tokens: 10,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+        }
+    }
+
     #[test]
-    fn current_slot_pins_the_observed_window() {
-        // Thu 13:30 → slot [10:57, 15:57], the observed window.
-        let (s, e) = current_slot(local_utc(2026, 9, 3, 13, 30));
-        assert_eq!(local_ymdhm(s), (2026, 9, 3, 10, 57));
-        assert_eq!(local_ymdhm(e), (2026, 9, 3, 15, 57));
-        // Early morning belongs to the overnight slot. (Slots step
-        // 5 h back from 00:57, so this is [19:57, 00:57] — the
-        // [20:57, 01:57] grid would not contain the observed 10:57
-        // boundary.)
-        let (s, e) = current_slot(local_utc(2026, 9, 3, 0, 5));
-        assert_eq!(local_ymdhm(s), (2026, 9, 2, 19, 57));
-        assert_eq!(local_ymdhm(e), (2026, 9, 3, 0, 57));
+    fn current_window_chains_from_first_use() {
+        // Steps at T, T+1h, T+6h, T+7h with now = T+7h: the T+6h
+        // step opens the second window (first use after T+5h).
+        let base = chrono::Utc::now() - chrono::Duration::hours(7);
+        let events = vec![
+            step_at(0, base),
+            step_at(1, base),
+            step_at(6, base),
+            step_at(7, base),
+        ];
+        let (s, e) = current_window(&events, base + chrono::Duration::hours(7));
+        assert_eq!(s, base + chrono::Duration::hours(6));
+        assert_eq!(e, base + chrono::Duration::hours(11));
+    }
+
+    #[test]
+    fn current_window_holds_expired_window_when_idle() {
+        // An idle reset opens nothing until usage resumes: with the
+        // only step at T and now = T+8h, the reported window is still
+        // [T, T+5h] with a static numerator — not a fresh empty one.
+        let base = chrono::Utc::now() - chrono::Duration::hours(8);
+        let events = vec![step_at(0, base)];
+        let (s, e) = current_window(&events, base + chrono::Duration::hours(8));
+        assert_eq!(s, base);
+        assert_eq!(e, base + chrono::Duration::hours(5));
+    }
+
+    #[test]
+    fn current_window_sorts_and_ignores_future_steps() {
+        // Out-of-order cache plus a clock-skewed future step: the
+        // chain follows timestamp order and the future step joins
+        // only once `now` passes it.
+        let base = chrono::Utc::now() - chrono::Duration::hours(2);
+        let events = vec![step_at(1, base), step_at(0, base), step_at(48, base)];
+        let now = base + chrono::Duration::hours(2);
+        let (s, e) = current_window(&events, now);
+        assert_eq!(s, base);
+        assert_eq!(e, base + chrono::Duration::hours(5));
     }
 
     #[test]
