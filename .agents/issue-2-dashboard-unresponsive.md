@@ -1,84 +1,43 @@
 # Issue 2 — OS "dashboard app is unresponsive" dialog (Omarchy/Wayland)
 
-Status: diagnosed to hypothesis stage, NOT fixed. Issue 1 (agy/Gemini quota
-wrong host) is fixed separately and is unrelated.
+Status: mitigated on 2026-07-24. The warning is no longer reproduced after switching the Hyprland dashboard to XWayland.
 
-## Symptom (user-reported)
+## Symptom
 
-On Omarchy, the OS shows a "not responding" dialog for `llm-usage-dashboard`
-even though the dashboard window itself is interactive and responsive.
-User's hypothesis: "there is a health response that is not being handled."
+Hyprland 0.56.2 displayed its "Application Not Responding" dialog for `llm-usage-dashboard` a few seconds after the dashboard lost focus. The window remained interactive and no dashboard thread was stuck.
 
-## Finding: there is no health-check protocol to handle
+## Confirmed behavior
 
-Searched all crates, `packaging/`, `config.example.toml`, `README.md` for
-`health / heartbeat / ping / watchdog / unresponsive / responsive`:
-no app-level health endpoint, heartbeat, or readiness probe exists anywhere
-in the repo. The only `ready` is the `ready: bool` field in the Omarchy
-JSON export (`crates/core/src/omarchy_export.rs`), which is file output,
-not a live handshake.
+- Hyprland's ANR manager sends an `xdg_wm_base.ping` every 1.5 seconds and uses the configured `misc:anr_missed_pings = 3` threshold.
+- The dashboard main thread remained in normal `poll`/Wayland waits, and CPU usage stayed low.
+- No application-level health endpoint or focus-change deadlock was involved.
+- Native Wayland with eframe 0.29.1 / winit 0.30.13 failed to deliver the required pong reliably while unfocused. `WAYLAND_DEBUG=1` changed the timing and produced immediate ping/pong replies.
+- Repaint-based workarounds were insufficient, so the production workaround avoids the failing native-Wayland path rather than disabling Hyprland's watchdog.
 
-On Wayland (Omarchy uses Hyprland), an OS "not responding" dialog means the
-compositor's shell ping timed out. Ping/pong is answered inside winit's
-event loop, not by app code — so the cause is almost certainly something
-intermittently blocking the dashboard's main thread, not a missing handler.
+## Implemented fixes
 
-## What was ruled out (read, not guessed)
+- `crates/ui/src/main.rs`: retain tray-spawned dashboard children and reap them without blocking the tray event loop.
+- `crates/dashboard/src/settings.rs`: run browser-cookie/keyring discovery on a background thread and return results through mpsc.
+- `crates/dashboard/src/main.rs`: add singleton acquisition/focus diagnostics and poll background results from the dashboard event loop.
+- `crates/dashboard/Cargo.toml`: depend on the exact winit 0.30.13 version expected by eframe.
+- On Hyprland only, create the dashboard through XWayland and apply a `0.8` egui zoom factor to preserve the previous visual scale.
 
-- `DashboardApp::update` per-frame work is cheap: one
-  `request_repaint_after(2s)`, mutex clones of the snapshot map
-  (`crates/dashboard/src/main.rs`, `impl eframe::App`, ~line 318).
-- Snapshot reloads run on notify-watcher threads, not the UI thread
-  (`spawn_snapshots_watcher`, `reload_snapshots`, ~lines 1384–1433).
-- The 14-day Anthropic history walk runs on a spawned thread
-  (`kick_daily_history`, ~lines 1437–1446).
-- Settings launches the setup binary on a spawned thread
-  (`crates/dashboard/src/settings.rs`, ~line 297).
-- Tray event loop uses `ControlFlow::WaitUntil(250ms)`
-  (`crates/ui/src/main.rs`, ~line 122) — stays responsive by construction.
+## Cleanup
 
-## Open suspects (not yet verified)
+- The experimental 500 ms delayed repaint was reverted to the existing 2-second UI refresh.
+- The experimental background repaint/keepalive thread was removed after it failed to stop the warning.
+- Hyprland's ANR settings were not changed or disabled.
+- The zombie reaper and browser-import worker address separate confirmed problems and should remain.
 
-1. **Settings browser-cookie import (`rookie`) may run inline on the egui
-   thread.** The setup-binary spawn is threaded, but the `rookie` import
-   path itself was never traced end-to-end. On Linux it can raise a
-   libsecret/keyring prompt, which blocks. Check: does the "not responding"
-   dialog correlate with using Settings → Ollama Cloud → "Import from
-   browser…"?
-2. **`auto_save_if_changed` file write every frame while editing Settings**
-   (`crates/dashboard/src/main.rs`, ~line 615). Normally fast, but worth
-   confirming it can't stall (full disk, slow fs).
-3. **GPU/vsync stall on Hyprland+NVIDIA.** A blocked swap would also starve
-   the event loop. Check with `WAYLAND_DEBUG=1` whether ping/pong flows.
-4. **Zombie dashboard process.** Observed live: a defunct
-   `[llm-usage-dashb] <defunct>` alongside the running dashboard.
-   `spawn_dashboard` drops the `Child` without reaping
-   (`crates/ui/src/main.rs`, ~line 976–989), so every exited dashboard
-   lingers as a zombie. May also leave stale singleton pid-file state
-   (`dashboard.pid` + `dashboard.focus` in `~/.local/share/llm-usage/`).
-   Probably a hygiene issue rather than the dialog cause, but worth fixing
-   in the same pass.
+## Trade-offs
 
-## Evidence still needed (next steps)
+- The Hyprland path now uses XWayland, adding the normal XWayland bridge overhead and losing native Wayland-only clipboard/drop/color behavior for this window.
+- Other Linux compositors, macOS, and Windows remain on their native backends.
+- The `0.8` zoom is a visual compatibility adjustment for XWayland scaling; egui's own Ctrl+scroll zoom still works at runtime.
+- A future native-Wayland fix should target winit/eframe queue flushing or the unused `smithay-clipboard` secondary queue rather than disabling ANR detection.
 
-1. Next time the dialog appears, capture all of:
-   - screenshot / exact dialog text,
-   - what the dashboard was doing (which tab, idle / typing / just clicked Refresh?),
-   - `hyprctl clients` output,
-   - dashboard stderr / `RUST_LOG=debug` logs,
-   - one stack sample of the dashboard PID:
-     `gdb -p <pid> -batch -ex 'thread apply all bt'` (or `perf record -g -p <pid>` briefly).
-   One capture usually names the blocker.
-2. Audit the Settings `rookie` import path for UI-thread blocking.
-3. Reap dashboard children in the tray (retain `Child`, or spawn detached);
-   add logging to the singleton acquire path so the next zombie leaves a trace.
+## Verification
 
-## Process notes (2026-09-23 session)
-
-- Running tray: `/home/oberonix/code/llm-usage/target/release/llm-usage-tray`
-  (PID 1486 at time of writing).
-- Running dashboard: `target/release/llm-usage-dashboard` + one defunct entry.
-- `~/.local/share/llm-usage/` holds `dashboard.pid`, `dashboard.focus`,
-  `refresh.trigger`, `snapshots.json`, `usage.sqlite`.
-- No code was changed for this issue. Focused work so far: read-only
-  (reads, greps, `ps`, log inspection).
+- The native-Wayland build reproduced Hyprland's dialog after focus loss.
+- The Hyprland XWayland build passed repeated focus-away cycles without a dialog.
+- `cargo check --workspace --all-targets`, `cargo test --workspace`, and warning-denied Clippy pass.

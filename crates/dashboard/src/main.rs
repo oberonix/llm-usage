@@ -62,10 +62,19 @@ fn main() -> Result<()> {
             .with_title("LLM Usage")
     };
 
-    let options = eframe::NativeOptions {
+    let hyprland_x11 =
+        cfg!(target_os = "linux") && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some();
+    let mut options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
+    #[cfg(target_os = "linux")]
+    if hyprland_x11 {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        options.event_loop_builder = Some(Box::new(|builder| {
+            builder.with_x11();
+        }));
+    }
 
     eframe::run_native(
         "llm-usage-dashboard",
@@ -74,6 +83,9 @@ fn main() -> Result<()> {
             // The egui Context is owned by eframe — we hold a clone in
             // the watcher so it can `request_repaint` from a background
             // thread when the snapshot file changes.
+            if hyprland_x11 {
+                cc.egui_ctx.set_zoom_factor(0.8);
+            }
             Ok(Box::new(DashboardApp::new(
                 config,
                 cc.egui_ctx.clone(),
@@ -122,15 +134,42 @@ fn try_acquire_singleton_at(
         std::fs::create_dir_all(parent).ok();
     }
 
-    if let Ok(s) = std::fs::read_to_string(pid_path) {
-        if let Ok(pid) = s.trim().parse::<u32>() {
-            if is_alive(pid) {
-                let _ = std::fs::write(focus_path, chrono::Utc::now().to_rfc3339());
+    match std::fs::read_to_string(pid_path) {
+        Ok(contents) => match contents.trim().parse::<u32>() {
+            Ok(pid) if is_alive(pid) => {
+                if let Err(e) = std::fs::write(focus_path, chrono::Utc::now().to_rfc3339()) {
+                    tracing::warn!(
+                        path = %focus_path.display(),
+                        error = %e,
+                        "failed to write dashboard focus trigger"
+                    );
+                } else {
+                    tracing::debug!(pid, path = %focus_path.display(), "forwarded dashboard focus request");
+                }
                 return SingletonOutcome::Forwarded;
             }
+            Ok(pid) => {
+                tracing::debug!(pid, path = %pid_path.display(), "replacing stale dashboard pid file");
+            }
+            Err(e) => {
+                tracing::warn!(path = %pid_path.display(), error = %e, "invalid dashboard pid file");
+            }
+        },
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(path = %pid_path.display(), error = %e, "failed to read dashboard pid file");
         }
+        Err(_) => {}
     }
-    let _ = std::fs::write(pid_path, my_pid.to_string());
+    if let Err(e) = std::fs::write(pid_path, my_pid.to_string()) {
+        tracing::warn!(
+            pid = my_pid,
+            path = %pid_path.display(),
+            error = %e,
+            "failed to acquire dashboard singleton"
+        );
+    } else {
+        tracing::debug!(pid = my_pid, path = %pid_path.display(), "acquired dashboard singleton");
+    }
     SingletonOutcome::Acquired(pid_path.to_path_buf())
 }
 
@@ -317,6 +356,7 @@ fn spawn_focus_watcher(mode_name: &str, ctx: egui::Context) -> Option<Recommende
 impl eframe::App for DashboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        self.draft.poll_setup_result();
 
         if self.popup_mode {
             // Esc dismisses the popup; otherwise it lingers because we

@@ -14,6 +14,7 @@ use llm_usage_core::updates::UpdateInfo;
 use llm_usage_core::Config;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::BTreeMap;
+use std::process::Child;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
@@ -118,11 +119,14 @@ fn main() -> Result<()> {
     let mut rotation_interval = rotation_interval_from(&config);
     let mut show_pace_marker = config.show_pace_marker;
     let mut latest_update: Option<UpdateInfo> = None;
+    let mut dashboard_children: Vec<Child> = Vec::new();
 
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(
             std::time::Instant::now() + std::time::Duration::from_millis(250),
         );
+
+        reap_dashboard_children(&mut dashboard_children);
 
         // Rotate to the next quota-bearing provider on the configured
         // cadence. If there's only one (or none) eligible, this is a
@@ -198,9 +202,9 @@ fn main() -> Result<()> {
         if let Ok(menu_event) = menu_channel.try_recv() {
             match menu_event.id.0.as_str() {
                 QUIT_ID => *control_flow = ControlFlow::Exit,
-                DASHBOARD_ID => spawn_dashboard(&[]),
-                SETTINGS_ID => spawn_dashboard(&["--tab=settings"]),
-                HELP_ID => spawn_dashboard(&["--tab=help"]),
+                DASHBOARD_ID => spawn_dashboard(&[], &mut dashboard_children),
+                SETTINGS_ID => spawn_dashboard(&["--tab=settings"], &mut dashboard_children),
+                HELP_ID => spawn_dashboard(&["--tab=help"], &mut dashboard_children),
                 UPDATE_ID => {
                     if let Some(info) = &latest_update {
                         open_url(&info.url);
@@ -216,7 +220,7 @@ fn main() -> Result<()> {
             ..
         }) = tray_channel.try_recv()
         {
-            spawn_dashboard(&[]);
+            spawn_dashboard(&[], &mut dashboard_children);
         }
     });
 }
@@ -657,6 +661,46 @@ mod tests {
             .expect("opencode entry present");
         assert_eq!(opencode.0, std::path::PathBuf::from("/tmp/x/y"));
     }
+
+    #[test]
+    #[ignore = "child process fixture"]
+    fn dashboard_child_fixture() {
+        if std::env::var_os("LLM_USAGE_DASHBOARD_CHILD_SLEEP").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    fn spawn_dashboard_child_fixture(sleep: bool) -> std::process::Child {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "tests::dashboard_child_fixture", "--ignored"]);
+        if sleep {
+            command.env("LLM_USAGE_DASHBOARD_CHILD_SLEEP", "1");
+        }
+        command.spawn().unwrap()
+    }
+
+    #[test]
+    fn dashboard_child_reaper_retains_running_child() {
+        let mut children = vec![spawn_dashboard_child_fixture(true)];
+        reap_dashboard_children(&mut children);
+        assert_eq!(children.len(), 1);
+        assert!(children[0].try_wait().unwrap().is_none());
+        children[0].kill().unwrap();
+        children[0].wait().unwrap();
+    }
+
+    #[test]
+    fn dashboard_child_reaper_removes_exited_child() {
+        let mut children = vec![spawn_dashboard_child_fixture(false)];
+        for _ in 0..100 {
+            reap_dashboard_children(&mut children);
+            if children.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(children.is_empty());
+    }
 }
 
 /// Watch the config file for writes and signal the runtime to reload.
@@ -973,7 +1017,7 @@ fn open_url(url: &str) {
     let _ = std::process::Command::new(cmd).arg(url).spawn();
 }
 
-fn spawn_dashboard(args: &[&str]) {
+fn spawn_dashboard(args: &[&str], children: &mut Vec<Child>) {
     let candidate = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("llm-usage-dashboard")));
@@ -986,12 +1030,32 @@ fn spawn_dashboard(args: &[&str]) {
     // hits when the user moves the tray binary out of the sibling
     // directory of the dashboard binary — e.g. `cargo install
     // llm-usage-tray` without also installing the dashboard.
-    if let Err(e) = std::process::Command::new(&cmd).args(args).spawn() {
-        tracing::warn!(
-            command = %cmd, error = %e,
-            "failed to spawn dashboard — is llm-usage-dashboard installed alongside llm-usage-tray?"
-        );
+    match std::process::Command::new(&cmd).args(args).spawn() {
+        Ok(child) => {
+            tracing::debug!(pid = child.id(), command = %cmd, "spawned dashboard");
+            children.push(child);
+        }
+        Err(e) => {
+            tracing::warn!(
+                command = %cmd, error = %e,
+                "failed to spawn dashboard — is llm-usage-dashboard installed alongside llm-usage-tray?"
+            );
+        }
     }
+}
+
+fn reap_dashboard_children(children: &mut Vec<Child>) {
+    children.retain_mut(|child| match child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(status)) => {
+            tracing::debug!(pid = child.id(), %status, "dashboard process exited");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(pid = child.id(), error = %e, "failed to reap dashboard process");
+            true
+        }
+    });
 }
 
 /// Repaint the tray icon and update its tooltip for whichever

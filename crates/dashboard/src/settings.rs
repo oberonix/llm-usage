@@ -96,6 +96,7 @@ pub struct ConfigDraft {
     // UI-only state for the setup-login flow. Not persisted.
     pub ollama_cloud_setup_status: Option<String>,
     pub ollama_cloud_setup_rx: Option<std::sync::mpsc::Receiver<SetupResult>>,
+    browser_import_rx: Option<(SetupTarget, std::sync::mpsc::Receiver<BrowserImportResult>)>,
 }
 
 pub enum SetupResult {
@@ -104,10 +105,16 @@ pub enum SetupResult {
     Failed(String),
 }
 
+enum BrowserImportResult {
+    Imported(String),
+    NoCookies,
+    Failed(String),
+}
+
 /// Which provider's embedded sign-in window to launch. Maps to the
 /// `llm-usage-setup` binary's positional target arg and selects which
 /// draft fields the captured cookie flows back into.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupTarget {
     OllamaCloud,
     Codex,
@@ -183,6 +190,7 @@ impl ConfigDraft {
 
             ollama_cloud_setup_status: None,
             ollama_cloud_setup_rx: None,
+            browser_import_rx: None,
         }
     }
 
@@ -264,6 +272,9 @@ impl ConfigDraft {
     /// `SetupResult` back to the UI via mpsc — `poll_setup_result` picks
     /// it up on the next frame and refreshes the captured-cookie field.
     fn start_setup_tool(&mut self, target: SetupTarget) {
+        if self.browser_import_rx.is_some() {
+            return;
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let exe = match resolve_setup_binary() {
             Some(p) => p,
@@ -310,59 +321,98 @@ impl ConfigDraft {
         });
     }
 
-    /// Read the user's ollama.com session cookie out of an
-    /// already-logged-in browser (Chrome, Firefox, Edge, Brave, Safari,
-    /// Vivaldi, …) using the `rookie` crate. No window pops up; the
-    /// platform may show a keyring auth prompt the first time on Linux
-    /// (Chrome's cookie DB is encrypted with libsecret).
-    fn import_from_browser(&mut self) {
-        let cookies = match rookie::load(Some(vec!["ollama.com".to_string()])) {
-            Ok(c) => c,
-            Err(e) => {
-                self.ollama_cloud_setup_status = Some(format!("Browser import failed: {}", e));
-                return;
-            }
-        };
-        let now_ts = chrono::Utc::now().timestamp().max(0) as u64;
-        let matching = cookies.iter().filter(|c| {
-            let d = c.domain.trim_start_matches('.');
-            d == "ollama.com" || d == "www.ollama.com"
-        });
-        let header = deduplicate_and_format_cookies(matching, now_ts);
-        if header.is_empty() {
-            self.ollama_cloud_setup_status = Some(
-                "No ollama.com cookies found in any installed browser. \
-                 Sign in to ollama.com in your browser first, then click again."
-                    .into(),
-            );
-            return;
-        }
-        let path = match config::config_path() {
-            Ok(p) => p,
-            Err(e) => {
-                self.ollama_cloud_setup_status =
-                    Some(format!("Could not resolve config path: {}", e));
-                return;
-            }
-        };
-        let mut cfg = config::Config::load_or_default().unwrap_or_default();
-        cfg.ollama_cloud.enabled = true;
-        cfg.ollama_cloud.session_cookie = Some(header.clone());
-        if let Err(e) = cfg.save(&path) {
-            self.ollama_cloud_setup_status = Some(format!("Save failed: {}", e));
-            return;
-        }
-        self.ollama_cloud_session_cookie = header;
-        self.ollama_cloud_enabled = true;
-        self.ollama_cloud_setup_status = Some(format!(
-            "Imported from browser. Saved to {}.",
-            path.display()
-        ));
+    fn cookie_job_in_flight(&self) -> bool {
+        self.browser_import_rx.is_some()
+            || self.codex_chatgpt_setup_rx.is_some()
+            || self.ollama_cloud_setup_rx.is_some()
     }
 
-    /// Drain any pending setup result from the channel and apply it to
-    /// the form. Called once per frame from `render`.
-    fn poll_setup_result(&mut self) {
+    fn set_cookie_status(&mut self, target: SetupTarget, status: String) {
+        match target {
+            SetupTarget::OllamaCloud => self.ollama_cloud_setup_status = Some(status),
+            SetupTarget::Codex => self.codex_chatgpt_setup_status = Some(status),
+        }
+    }
+
+    fn start_browser_import(&mut self, target: SetupTarget, ctx: egui::Context) {
+        self.start_browser_import_with(target, ctx, move || browser_cookie_from_browser(target));
+    }
+
+    fn start_browser_import_with<F>(
+        &mut self,
+        target: SetupTarget,
+        ctx: egui::Context,
+        operation: F,
+    ) where
+        F: FnOnce() -> BrowserImportResult + Send + 'static,
+    {
+        if self.cookie_job_in_flight() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.browser_import_rx = Some((target, rx));
+        self.set_cookie_status(
+            target,
+            format!(
+                "Importing from browser for {}… a keyring prompt may appear.",
+                target.signin_label()
+            ),
+        );
+        let spawn_result = std::thread::Builder::new()
+            .name("browser-cookie-import".into())
+            .spawn(move || {
+                let result = operation();
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            });
+        if let Err(e) = spawn_result {
+            self.browser_import_rx = None;
+            self.set_cookie_status(target, format!("Browser import failed to start: {}", e));
+        }
+    }
+
+    fn apply_browser_cookie(&mut self, target: SetupTarget, header: String) {
+        let path = match config::config_path() {
+            Ok(path) => path,
+            Err(e) => {
+                self.set_cookie_status(target, format!("Could not resolve config path: {}", e));
+                return;
+            }
+        };
+        let mut cfg = match Config::load_or_default() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                self.set_cookie_status(target, format!("Config load failed: {}", e));
+                return;
+            }
+        };
+        match target {
+            SetupTarget::OllamaCloud => {
+                cfg.ollama_cloud.enabled = true;
+                cfg.ollama_cloud.session_cookie = Some(header.clone());
+            }
+            SetupTarget::Codex => {
+                cfg.codex_cli.chatgpt_session_cookie = Some(header.clone());
+            }
+        }
+        if let Err(e) = cfg.save(&path) {
+            self.set_cookie_status(target, format!("Save failed: {}", e));
+            return;
+        }
+        match target {
+            SetupTarget::OllamaCloud => {
+                self.ollama_cloud_session_cookie = header;
+                self.ollama_cloud_enabled = true;
+            }
+            SetupTarget::Codex => self.codex_chatgpt_session_cookie = header,
+        }
+        self.set_cookie_status(
+            target,
+            format!("Imported from browser. Saved to {}.", path.display()),
+        );
+    }
+
+    pub(crate) fn poll_setup_result(&mut self) {
         use std::sync::mpsc::TryRecvError;
 
         // Ollama Cloud channel.
@@ -419,11 +469,41 @@ impl ConfigDraft {
                 Err(TryRecvError::Empty) => {}
             }
         }
+        self.poll_browser_import_result();
+    }
+
+    fn poll_browser_import_result(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+
+        let Some((target, rx)) = &self.browser_import_rx else {
+            return;
+        };
+        let target = *target;
+        match rx.try_recv() {
+            Ok(BrowserImportResult::Imported(header)) => {
+                self.browser_import_rx = None;
+                self.apply_browser_cookie(target, header);
+            }
+            Ok(BrowserImportResult::NoCookies) => {
+                self.browser_import_rx = None;
+                self.set_cookie_status(target, browser_no_cookies_message(target).into());
+            }
+            Ok(BrowserImportResult::Failed(message)) => {
+                self.browser_import_rx = None;
+                self.set_cookie_status(target, format!("Browser import failed: {}", message));
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.browser_import_rx = None;
+                self.set_cookie_status(
+                    target,
+                    "Browser import ended unexpectedly — please try again.".into(),
+                );
+            }
+            Err(TryRecvError::Empty) => {}
+        }
     }
 
     pub fn render(&mut self, ui: &mut egui::Ui) {
-        self.poll_setup_result();
-
         section_header(ui, "Polling & display");
         provider_card(ui, neutral_tint(), |ui| {
             field_row(ui, "Max refresh every", |ui| {
@@ -579,12 +659,7 @@ impl ConfigDraft {
     fn render_opencode_go(&mut self, ui: &mut egui::Ui) {
         provider_card(ui, tint(ProviderId::OpenCodeGo), |ui| {
             section_header_row(ui, "OpenCode Go", Some(ProviderId::OpenCodeGo));
-            enabled_row(
-                ui,
-                &mut self.opencode_go_enabled,
-                None,
-                "",
-            );
+            enabled_row(ui, &mut self.opencode_go_enabled, None, "");
             field_row(ui, "Alert at", |ui| {
                 alert_preset_combo(ui, "opencode_go_alert", &mut self.opencode_go_warn_at);
             });
@@ -664,7 +739,7 @@ impl ConfigDraft {
             });
 
             let captured = !self.codex_chatgpt_session_cookie.is_empty();
-            let in_flight = self.codex_chatgpt_setup_rx.is_some();
+            let in_flight = self.cookie_job_in_flight();
             let mut import_now = false;
             let mut launch_now = false;
             render_cookie_import_block(
@@ -682,7 +757,7 @@ impl ConfigDraft {
                 self.start_setup_tool(SetupTarget::Codex);
             }
             if import_now {
-                self.import_chatgpt_cookies_from_browser();
+                self.start_browser_import(SetupTarget::Codex, ui.ctx().clone());
             }
 
             // Help sits after the import block and is kept terse so this
@@ -713,61 +788,6 @@ impl ConfigDraft {
         });
     }
 
-    /// Pull chatgpt.com / openai.com cookies via `rookie` and persist
-    /// them to `codex_cli.chatgpt_session_cookie`. Mirrors
-    /// `import_from_browser` for Ollama Cloud — same dependency, same
-    /// failure modes (no logged-in browser; libsecret keyring on
-    /// Linux). The Codex provider treats the saved cookie as a live
-    /// quota source override that supersedes the rollouts' lagging
-    /// `rate_limits` records.
-    fn import_chatgpt_cookies_from_browser(&mut self) {
-        let cookies = match rookie::load(Some(vec![
-            "chatgpt.com".to_string(),
-            ".chatgpt.com".to_string(),
-            "openai.com".to_string(),
-            ".openai.com".to_string(),
-        ])) {
-            Ok(c) => c,
-            Err(e) => {
-                self.codex_chatgpt_setup_status = Some(format!("Browser import failed: {}", e));
-                return;
-            }
-        };
-        let now_ts = chrono::Utc::now().timestamp().max(0) as u64;
-        let matching = cookies.iter().filter(|c| {
-            let d = c.domain.trim_start_matches('.');
-            d.ends_with("chatgpt.com") || d.ends_with("openai.com")
-        });
-        let header = deduplicate_and_format_cookies(matching, now_ts);
-        if header.is_empty() {
-            self.codex_chatgpt_setup_status = Some(
-                "No chatgpt.com / openai.com cookies found in any installed browser. \
-                 Sign in to chatgpt.com in your browser first, then click again."
-                    .into(),
-            );
-            return;
-        }
-        let path = match config::config_path() {
-            Ok(p) => p,
-            Err(e) => {
-                self.codex_chatgpt_setup_status =
-                    Some(format!("Could not resolve config path: {}", e));
-                return;
-            }
-        };
-        let mut cfg = config::Config::load_or_default().unwrap_or_default();
-        cfg.codex_cli.chatgpt_session_cookie = Some(header.clone());
-        if let Err(e) = cfg.save(&path) {
-            self.codex_chatgpt_setup_status = Some(format!("Save failed: {}", e));
-            return;
-        }
-        self.codex_chatgpt_session_cookie = header;
-        self.codex_chatgpt_setup_status = Some(format!(
-            "Imported from browser. Saved to {}.",
-            path.display()
-        ));
-    }
-
     fn render_ollama_cloud(&mut self, ui: &mut egui::Ui) {
         provider_card(ui, tint(ProviderId::OllamaCloud), |ui| {
             section_header_row(ui, "Ollama Cloud", Some(ProviderId::OllamaCloud));
@@ -777,7 +797,7 @@ impl ConfigDraft {
             });
 
             let captured = !self.ollama_cloud_session_cookie.is_empty();
-            let in_flight = self.ollama_cloud_setup_rx.is_some();
+            let in_flight = self.cookie_job_in_flight();
             let mut launch_now = false;
             let mut import_now = false;
             render_cookie_import_block(
@@ -796,7 +816,7 @@ impl ConfigDraft {
                 self.start_setup_tool(SetupTarget::OllamaCloud);
             }
             if import_now {
-                self.import_from_browser();
+                self.start_browser_import(SetupTarget::OllamaCloud, ui.ctx().clone());
             }
 
             ui.add_space(2.0);
@@ -806,6 +826,57 @@ impl ConfigDraft {
                  Re-import after logging out or rotating.",
             );
         });
+    }
+}
+
+fn browser_cookie_from_browser(target: SetupTarget) -> BrowserImportResult {
+    let cookies = match target {
+        SetupTarget::OllamaCloud => match rookie::load(Some(vec!["ollama.com".to_string()])) {
+            Ok(cookies) => cookies,
+            Err(e) => return BrowserImportResult::Failed(e.to_string()),
+        },
+        SetupTarget::Codex => match rookie::load(Some(vec![
+            "chatgpt.com".to_string(),
+            ".chatgpt.com".to_string(),
+            "openai.com".to_string(),
+            ".openai.com".to_string(),
+        ])) {
+            Ok(cookies) => cookies,
+            Err(e) => return BrowserImportResult::Failed(e.to_string()),
+        },
+    };
+    let now_ts = chrono::Utc::now().timestamp().max(0) as u64;
+    let header = match target {
+        SetupTarget::OllamaCloud => {
+            let matching = cookies.iter().filter(|cookie| {
+                let domain = cookie.domain.trim_start_matches('.');
+                domain == "ollama.com" || domain == "www.ollama.com"
+            });
+            deduplicate_and_format_cookies(matching, now_ts)
+        }
+        SetupTarget::Codex => {
+            let matching = cookies.iter().filter(|cookie| {
+                let domain = cookie.domain.trim_start_matches('.');
+                domain.ends_with("chatgpt.com") || domain.ends_with("openai.com")
+            });
+            deduplicate_and_format_cookies(matching, now_ts)
+        }
+    };
+    if header.is_empty() {
+        BrowserImportResult::NoCookies
+    } else {
+        BrowserImportResult::Imported(header)
+    }
+}
+
+fn browser_no_cookies_message(target: SetupTarget) -> &'static str {
+    match target {
+        SetupTarget::OllamaCloud => {
+            "No ollama.com cookies found in any installed browser. Sign in to ollama.com in your browser first, then click again."
+        }
+        SetupTarget::Codex => {
+            "No chatgpt.com / openai.com cookies found in any installed browser. Sign in to chatgpt.com in your browser first, then click again."
+        }
     }
 }
 
@@ -1039,6 +1110,9 @@ fn render_cookie_import_block(
         {
             on_import(());
         }
+        if in_flight {
+            ui.spinner();
+        }
         if captured && !in_flight {
             ui.colored_label(Color32::from_rgb(0x4C, 0xAF, 0x50), "✓ captured");
         }
@@ -1054,7 +1128,7 @@ fn render_cookie_import_block(
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let popup_label = if in_flight {
-                "Setup window open…"
+                "Working…"
             } else if captured {
                 "Re-run popup sign-in (backup)"
             } else {
@@ -1273,5 +1347,53 @@ mod tests {
         assert!(header.contains("__Secure-session=fresh_val"));
         assert!(!header.contains("expired_val"));
         assert!(header.contains("aid=aid_val"));
+    }
+
+    #[test]
+    fn browser_import_work_runs_off_the_calling_thread() {
+        let (draft_tx, draft_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let starter = std::thread::spawn(move || {
+            let mut draft = ConfigDraft::from_config(&Config::default());
+            draft.start_browser_import_with(
+                SetupTarget::Codex,
+                egui::Context::default(),
+                move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    BrowserImportResult::NoCookies
+                },
+            );
+            draft_tx.send(draft).unwrap();
+        });
+        let mut draft = draft_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("starting the import must not wait for browser I/O");
+        starter.join().unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        draft.poll_setup_result();
+        assert!(draft.cookie_job_in_flight());
+        assert!(draft
+            .codex_chatgpt_setup_status
+            .as_deref()
+            .unwrap()
+            .contains("Importing from browser"));
+        release_tx.send(()).unwrap();
+        for _ in 0..100 {
+            draft.poll_setup_result();
+            if !draft.cookie_job_in_flight() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!draft.cookie_job_in_flight());
+        assert!(draft
+            .codex_chatgpt_setup_status
+            .as_deref()
+            .unwrap()
+            .starts_with("No chatgpt.com"));
     }
 }
