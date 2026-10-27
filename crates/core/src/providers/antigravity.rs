@@ -23,6 +23,7 @@ use std::process::Command;
 use std::time::Duration;
 
 const QUOTA_PATH: &str = "/v1internal:retrieveUserQuotaSummary";
+const USER_QUOTA_PATH: &str = "/v1internal:retrieveUserQuota";
 
 pub struct AntigravityProvider {
     cfg: AntigravityConfig,
@@ -39,9 +40,8 @@ impl AntigravityProvider {
         Self { cfg, http }
     }
 
-    async fn fetch_quota_json(&self) -> Result<Value> {
-        let token = self.resolve_access_token().await?;
-        let url = format!("{}{}", self.cfg.base_url.trim_end_matches('/'), QUOTA_PATH);
+    async fn fetch_endpoint_json(&self, token: &str, path: &str) -> Result<Value> {
+        let url = format!("{}{}", self.cfg.base_url.trim_end_matches('/'), path);
         let resp = self
             .http
             .post(&url)
@@ -241,8 +241,8 @@ impl Provider for AntigravityProvider {
     }
 
     async fn poll(&self) -> Result<UsageSnapshot> {
-        let json = match self.fetch_quota_json().await {
-            Ok(v) => v,
+        let token = match self.resolve_access_token().await {
+            Ok(t) => t,
             Err(e) => {
                 return Ok(UsageSnapshot::unavailable(
                     ProviderId::Antigravity,
@@ -251,8 +251,39 @@ impl Provider for AntigravityProvider {
             }
         };
 
-        let quotas = parse_quota_summary(&json);
+        let mut quotas = Vec::new();
+        let mut summary_err = None;
+        match self.fetch_endpoint_json(&token, QUOTA_PATH).await {
+            Ok(json) => {
+                quotas = parse_quota_summary(&json);
+            }
+            Err(e) => {
+                summary_err = Some(e);
+            }
+        }
+
+        // Upstream retrieveUserQuotaSummary may omit the "Gemini Models" group
+        // and only return "Claude and GPT models". Supplement missing families
+        // from retrieveUserQuota, which reports live per-model buckets.
+        if !quotas.iter().any(|q| q.label.starts_with("Gemini")) {
+            match self.fetch_endpoint_json(&token, USER_QUOTA_PATH).await {
+                Ok(user_json) => {
+                    merge_missing_quotas(&mut quotas, parse_user_quota_buckets(&user_json));
+                }
+                Err(e) if quotas.is_empty() && summary_err.is_none() => {
+                    summary_err = Some(e);
+                }
+                Err(_) => {}
+            }
+        }
+
         if quotas.is_empty() {
+            if let Some(e) = summary_err {
+                return Ok(UsageSnapshot::unavailable(
+                    ProviderId::Antigravity,
+                    format!("Fetch failed: {}", e),
+                ));
+            }
             return Ok(UsageSnapshot::unavailable(
                 ProviderId::Antigravity,
                 "Parse failed — quota response contained no Gemini/Claude usage fractions",
@@ -367,6 +398,69 @@ fn parse_grouped_quota_summary(root: &Value) -> Vec<ParsedQuota> {
     }
     out.sort_by(|a, b| a.label.cmp(&b.label));
     out
+}
+
+fn parse_user_quota_buckets(root: &Value) -> Vec<ParsedQuota> {
+    let Some(buckets) = root.get("buckets").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ParsedQuota> = Vec::new();
+    for bucket in buckets {
+        let Some(obj) = bucket.as_object() else {
+            continue;
+        };
+        let model_id = obj
+            .get("modelId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let family = if model_id.contains("gemini") {
+            "Gemini"
+        } else if model_id.contains("claude") {
+            "Claude"
+        } else {
+            continue;
+        };
+        let Some(remaining) = field_number(obj, &["remainingFraction"]) else {
+            continue;
+        };
+        let window = obj
+            .get("window")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let window_label = if window.contains("week") {
+            "week"
+        } else {
+            "5h"
+        };
+        let candidate = ParsedQuota {
+            label: format!("{} {}", family, window_label),
+            fraction_used: (1.0 - remaining).clamp(0.0, 10.0),
+            started_at: field_time(obj, &["startTime", "startedAt", "windowStartTime"]),
+            ends_at: field_time(obj, &["resetTime", "resetAt", "endTime", "endsAt"]),
+        };
+        if let Some(existing) = out.iter_mut().find(|q| q.label == candidate.label) {
+            if candidate.fraction_used > existing.fraction_used
+                || (existing.ends_at.is_none() && candidate.ends_at.is_some())
+            {
+                *existing = candidate;
+            }
+        } else {
+            out.push(candidate);
+        }
+    }
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    out
+}
+
+fn merge_missing_quotas(quotas: &mut Vec<ParsedQuota>, extra: Vec<ParsedQuota>) {
+    for q in extra {
+        if !quotas.iter().any(|existing| existing.label == q.label) {
+            quotas.push(q);
+        }
+    }
+    quotas.sort_by(|a, b| a.label.cmp(&b.label));
 }
 
 fn visit_quota_objects(value: &Value, path: &mut Vec<String>, out: &mut Vec<ParsedQuota>) {
@@ -542,5 +636,40 @@ mod tests {
         .unwrap();
         assert_eq!(tok.access_token, "access");
         assert!(tok.expires_at.is_some());
+    }
+
+    #[test]
+    fn supplements_missing_gemini_from_user_quota_buckets() {
+        let summary_payload = serde_json::json!({
+            "groups": [
+                {
+                    "displayName": "Claude and GPT models",
+                    "buckets": [
+                        {"window": "weekly", "resetTime": "2026-11-02T19:47:32Z", "remainingFraction": 1.0},
+                        {"window": "5h", "resetTime": "2026-10-27T00:47:32Z", "remainingFraction": 0.75}
+                    ]
+                }
+            ]
+        });
+        let user_quota_payload = serde_json::json!({
+            "buckets": [
+                {"modelId": "chat_20706", "tokenType": "WTUS", "remainingFraction": 1.0},
+                {"modelId": "claude-opus-5-5-high", "tokenType": "WTUS", "resetTime": "2026-10-27T00:47:32Z", "remainingFraction": 0.90},
+                {"modelId": "gemini-2.5-flash", "tokenType": "WTUS", "resetTime": "2026-10-26T20:14:21Z", "remainingFraction": 0.7314774},
+                {"modelId": "gemini-3.8-flash-tiered", "tokenType": "WTUS", "resetTime": "2026-10-26T20:14:21Z", "remainingFraction": 0.7314774}
+            ]
+        });
+
+        let mut quotas = parse_quota_summary(&summary_payload);
+        assert_eq!(quotas.len(), 2);
+        merge_missing_quotas(&mut quotas, parse_user_quota_buckets(&user_quota_payload));
+
+        assert_eq!(quotas.len(), 3);
+        assert_eq!(quotas[0].label, "Claude 5h");
+        assert!((quotas[0].fraction_used - 0.25).abs() < 1e-9);
+        assert_eq!(quotas[1].label, "Claude week");
+        assert_eq!(quotas[2].label, "Gemini 5h");
+        assert!((quotas[2].fraction_used - (1.0 - 0.7314774)).abs() < 1e-9);
+        assert!(quotas[2].ends_at.is_some());
     }
 }

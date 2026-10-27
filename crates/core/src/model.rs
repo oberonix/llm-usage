@@ -314,10 +314,15 @@ impl UsageSnapshot {
         if self.provider != cached.provider {
             return 0;
         }
+        let max_age = Duration::days(Self::STALE_CACHE_MAX_AGE_DAYS);
         let age = self.timestamp - cached.timestamp;
-        if age > Duration::days(Self::STALE_CACHE_MAX_AGE_DAYS) {
+        if age > max_age {
             return 0;
         }
+        let has_fresh_quota = self
+            .windows
+            .values()
+            .any(|w| w.fraction_used.is_some() && !w.stale && !w.subview);
         let mut stale_count = 0;
         for (label, cw) in &cached.windows {
             if cw.fraction_used.is_none() {
@@ -325,6 +330,12 @@ impl UsageSnapshot {
             }
             if cw.subview {
                 continue; // sub-views mirror the live response, never the cache
+            }
+            if cw
+                .ends_at
+                .is_some_and(|ends| self.timestamp - ends > max_age)
+            {
+                continue; // window itself expired beyond max cache age
             }
             match self.windows.get_mut(label) {
                 Some(nw) if nw.fraction_used.is_none() => {
@@ -338,6 +349,11 @@ impl UsageSnapshot {
                     stale_count += 1;
                 }
                 None => {
+                    if has_fresh_quota
+                        && cw.ends_at.is_some_and(|ends| ends <= self.timestamp)
+                    {
+                        continue; // live quota poll succeeded and this missing window already reset
+                    }
                     // Window didn't exist on the new snapshot at all
                     // — e.g. poll() returned Err and produced an
                     // `unavailable` snapshot. Reinstate the cached
@@ -636,6 +652,90 @@ mod tests {
         let n = fresh.merge_stale_from(&cached);
         assert_eq!(n, 0);
         assert!(fresh.windows.is_empty());
+    }
+
+    #[test]
+    fn merge_stale_from_drops_expired_missing_window_when_poll_has_fresh_quota() {
+        let now = Utc::now();
+        let mut cached = UsageSnapshot {
+            provider: ProviderId::Antigravity,
+            timestamp: now - chrono::Duration::minutes(5),
+            status: ProviderStatus::Degraded,
+            error: Some("Showing cached quota — provider returned no fresh data this poll".into()),
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        cached.windows.insert(
+            "Claude 5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.10),
+                ends_at: Some(now + chrono::Duration::hours(3)),
+                ..Default::default()
+            },
+        );
+        cached.windows.insert(
+            "Gemini week".into(),
+            WindowUsage {
+                fraction_used: Some(0.05),
+                ends_at: Some(now - chrono::Duration::days(4)),
+                stale: true,
+                ..Default::default()
+            },
+        );
+
+        let mut fresh = UsageSnapshot {
+            provider: ProviderId::Antigravity,
+            timestamp: now,
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: Some("Claude 5h 10% · Gemini 5h 4%".into()),
+            plan_label: None,
+        };
+        fresh.windows.insert(
+            "Claude 5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.10),
+                ends_at: Some(now + chrono::Duration::hours(3)),
+                ..Default::default()
+            },
+        );
+        fresh.windows.insert(
+            "Gemini 5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.04),
+                ends_at: Some(now + chrono::Duration::hours(4)),
+                ..Default::default()
+            },
+        );
+
+        let n = fresh.merge_stale_from(&cached);
+        assert_eq!(n, 0);
+        assert!(!fresh.windows.contains_key("Gemini week"));
+        assert_eq!(fresh.status, ProviderStatus::Ok);
+        assert!(fresh.error.is_none());
+    }
+
+    #[test]
+    fn merge_stale_from_ignores_window_whose_reset_exceeds_max_age() {
+        let now = Utc::now();
+        let mut cached = cached_snapshot_with_fraction(ProviderId::Antigravity);
+        cached.timestamp = now - chrono::Duration::minutes(5);
+        cached.windows.insert(
+            "Gemini 5h".into(),
+            WindowUsage {
+                fraction_used: Some(0.02),
+                ends_at: Some(now - chrono::Duration::days(10)),
+                stale: true,
+                ..Default::default()
+            },
+        );
+
+        let mut fresh = UsageSnapshot::unavailable(ProviderId::Antigravity, "boom");
+        let n = fresh.merge_stale_from(&cached);
+        assert_eq!(n, 2);
+        assert!(!fresh.windows.contains_key("Gemini 5h"));
     }
 
     #[test]
