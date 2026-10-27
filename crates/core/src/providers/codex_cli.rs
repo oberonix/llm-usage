@@ -56,7 +56,7 @@ use crate::provider::Provider;
 use crate::storage::{ModelTurnRecord, Store};
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -161,19 +161,34 @@ impl CodexCliProvider {
         Self::build(cfg, codex_dir, opencode_db, store)
     }
 
+    fn load_auth_json_token(&self) -> Option<String> {
+        let auth_path = self.codex_dir.join("auth.json");
+        let raw = std::fs::read_to_string(auth_path).ok()?;
+        let parsed: Value = serde_json::from_str(&raw).ok()?;
+        parsed
+            .get("tokens")
+            .and_then(|t| t.get("access_token"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+    }
+
     /// Pull live quota data from chatgpt.com. Returns `Ok(None)`
-    /// when the configured session cookie is empty. Caches the
-    /// bearer + the response in `self.wham`. Carefully scoped lock
-    /// acquisition: never hold a `MutexGuard` across an `.await`,
-    /// otherwise the future stops being `Send` and tokio can't
-    /// schedule it on the multi-thread runtime.
+    /// when neither `<codex_dir>/auth.json` nor `chatgpt_session_cookie`
+    /// is available. Caches the bearer + the response in `self.wham`.
+    /// Carefully scoped lock acquisition: never hold a `MutexGuard`
+    /// across an `.await`, otherwise the future stops being `Send` and
+    /// tokio can't schedule it on the multi-thread runtime.
     async fn fetch_live_quota(
         &self,
         now: chrono::DateTime<Utc>,
     ) -> Result<Option<crate::chatgpt_oauth::WhamUsage>> {
-        let Some(cookie_header) = self.cfg.chatgpt_session_cookie.as_deref() else {
+        let auth_token = self.load_auth_json_token();
+        let cookie_header = self.cfg.chatgpt_session_cookie.as_deref();
+        if auth_token.is_none() && cookie_header.is_none() {
             return Ok(None);
-        };
+        }
         let Some(http) = &self.http else {
             return Ok(None);
         };
@@ -195,6 +210,31 @@ impl CodexCliProvider {
         if let Some(u) = cached {
             return Ok(Some(u));
         }
+
+        // 1. Prefer the local Codex CLI OAuth access_token (`~/.codex/auth.json`)
+        //    when present, since the Codex CLI / app keeps it refreshed via OAuth.
+        let mut last_err: Option<anyhow::Error> = None;
+        if let Some(token) = auth_token.as_deref() {
+            match crate::chatgpt_oauth::fetch_wham_usage(http, "", token).await {
+                Ok(usage) => {
+                    let mut cache = self.wham.lock().expect("poisoned");
+                    cache.last_usage = Some(usage.clone());
+                    cache.last_usage_at = Some(now);
+                    return Ok(Some(usage));
+                }
+                Err(e) => {
+                    last_err = Some(e.into());
+                }
+            }
+        }
+
+        // 2. Fall back to the configured browser session cookie if present.
+        let Some(cookie_header) = cookie_header else {
+            return match last_err {
+                Some(e) => Err(e),
+                None => Ok(None),
+            };
+        };
 
         // Decide whether to re-mint the bearer. Cache lock scoped
         // to this block so we don't carry the guard into the
@@ -235,11 +275,7 @@ impl CodexCliProvider {
         opencode_db: Option<PathBuf>,
         store: Option<Arc<Store>>,
     ) -> Self {
-        let http = if cfg.chatgpt_session_cookie.is_some() {
-            crate::chatgpt_oauth::build_http_client().ok()
-        } else {
-            None
-        };
+        let http = crate::chatgpt_oauth::build_http_client().ok();
         Self {
             cfg,
             codex_dir,
@@ -401,7 +437,6 @@ impl Provider for CodexCliProvider {
         let mut bucket_7d = Bucket::default();
         let mut bucket_1h = Bucket::default();
         let mut bucket_today = Bucket::default();
-        let mut bucket_month = Bucket::default();
         for e in &collected.events {
             if e.timestamp > five_hour_cutoff {
                 bucket_5h.add(e);
@@ -415,9 +450,6 @@ impl Provider for CodexCliProvider {
             let ts_local = e.timestamp.with_timezone(&chrono::Local);
             if ts_local.date_naive() == now_local.date_naive() {
                 bucket_today.add(e);
-            }
-            if ts_local.year() == now_local.year() && ts_local.month() == now_local.month() {
-                bucket_month.add(e);
             }
         }
 
@@ -443,16 +475,14 @@ impl Provider for CodexCliProvider {
         ww.request_count = bucket_7d.turns;
         ww.spend_usd = Some(bucket_7d.cost_usd);
 
-        // Activity-only windows (1h / today / month). No quota fraction
-        // or reset — they render below the quota bars and give the
-        // Codex card the same density as Anthropic's. Skipped when the
-        // bucket is empty so an idle card doesn't grow three
+        // Activity-only windows (1h / today). No quota fraction
+        // or reset — they render below the quota bars. Skipped when the
+        // bucket is empty so an idle card doesn't grow
         // "no activity" rows. `spend_usd` is dropped later by
         // `strip_spend()` when the user hasn't opted into spend.
         for (kind, b) in [
             (WindowKind::LastHour, &bucket_1h),
             (WindowKind::Today, &bucket_today),
-            (WindowKind::ThisMonth, &bucket_month),
         ] {
             if b.turns == 0 {
                 continue;
@@ -499,7 +529,9 @@ impl Provider for CodexCliProvider {
         // percentages; if they cannot, we surface the live-source error
         // so the UI explains why only activity counts are visible.
         let mut live_quota_error: Option<String> = None;
-        if self.http.is_some() && self.cfg.chatgpt_session_cookie.is_some() {
+        if self.http.is_some()
+            && (self.cfg.chatgpt_session_cookie.is_some() || self.load_auth_json_token().is_some())
+        {
             match self.fetch_live_quota(now).await {
                 Ok(Some(usage)) => {
                     let (mut five_h, mut week) = (WindowUsage::default(), WindowUsage::default());
@@ -568,6 +600,13 @@ impl Provider for CodexCliProvider {
             mark_degraded_if_quota_missing(&mut snap, error);
         }
 
+        if snap.windows.values().any(|w| w.stale) && snap.error.is_none() {
+            snap.status = ProviderStatus::Degraded;
+            snap.error = Some(
+                "Showing cached rollout quota — last Codex session window has expired".to_string(),
+            );
+        }
+
         snap.plan_label = plan_label.as_deref().map(crate::model::title_case_first);
         snap.headline = Some(build_headline(
             plan_label.as_deref(),
@@ -599,16 +638,14 @@ fn format_rate_limit_error(kind: &str) -> String {
 }
 
 fn mark_degraded_if_quota_missing(snap: &mut UsageSnapshot, live_error: String) {
-    let has_quota_fraction = snap
+    let has_fresh_quota_fraction = snap
         .window(WindowKind::FiveHourRolling)
-        .and_then(|w| w.fraction_used)
-        .is_some()
+        .is_some_and(|w| w.fraction_used.is_some() && !w.stale)
         || snap
             .window(WindowKind::ThisWeek)
-            .and_then(|w| w.fraction_used)
-            .is_some();
+            .is_some_and(|w| w.fraction_used.is_some() && !w.stale);
 
-    if !has_quota_fraction && snap.status == ProviderStatus::Ok {
+    if !has_fresh_quota_fraction && snap.status == ProviderStatus::Ok {
         snap.status = ProviderStatus::Degraded;
         snap.error = Some(format!(
             "Codex quota unavailable: {live_error}. Re-import ChatGPT cookies from Settings."
@@ -1541,6 +1578,21 @@ mod tests {
         mark_degraded_if_quota_missing(&mut snap, "chatgpt.com session expired".into());
         assert_eq!(snap.status, ProviderStatus::Ok);
         assert!(snap.error.is_none());
+    }
+
+    #[test]
+    fn live_quota_error_degrades_when_rollout_quota_is_stale() {
+        let mut snap = empty_codex_snapshot();
+        let w = snap.window_mut(WindowKind::FiveHourRolling);
+        w.fraction_used = Some(0.42);
+        w.stale = true;
+        mark_degraded_if_quota_missing(&mut snap, "chatgpt.com session expired".into());
+        assert_eq!(snap.status, ProviderStatus::Degraded);
+        assert!(snap
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Re-import ChatGPT cookies"));
     }
 
     #[test]

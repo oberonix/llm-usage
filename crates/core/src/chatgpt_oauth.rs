@@ -199,24 +199,25 @@ pub struct MintedBearer {
 }
 
 /// Fetch the current Codex quota usage from chatgpt.com using the
-/// supplied bearer + cookies.
+/// supplied bearer + optional cookies.
 pub async fn fetch_wham_usage(
     http: &reqwest::Client,
     cookie_header: &str,
     bearer: &str,
 ) -> Result<WhamUsage, ChatGptAuthError> {
-    let resp = http
+    let mut req = http
         .get(USAGE_URL)
-        .header(reqwest::header::COOKIE, cookie_header)
         .header(reqwest::header::ACCEPT, "application/json")
         .bearer_auth(bearer)
         // chatgpt.com gates some `/backend-api` routes on a
         // matching Sec-Fetch-Site = "same-origin" + cors mode;
         // browsers send these automatically.
         .header("Sec-Fetch-Mode", "cors")
-        .header("Sec-Fetch-Site", "same-origin")
-        .send()
-        .await?;
+        .header("Sec-Fetch-Site", "same-origin");
+    if !cookie_header.is_empty() {
+        req = req.header(reqwest::header::COOKIE, cookie_header);
+    }
+    let resp = req.send().await?;
     classify_or_pass(&resp)?;
     if !resp.status().is_success() {
         return Err(ChatGptAuthError::Http(resp.status()));
@@ -227,14 +228,17 @@ pub async fn fetch_wham_usage(
 /// Surface common error shapes as typed variants so the caller can
 /// react without sniffing strings. Specifically: an explicit
 /// `cf-mitigated` header (Cloudflare challenge / block) becomes
-/// `Blocked`; a 401 against `/api/auth/session` becomes `Expired`.
+/// `Blocked`; a 401 against `/api/auth/session` or `/backend-api/wham/usage`
+/// becomes `Expired`.
 fn classify_or_pass(resp: &reqwest::Response) -> Result<(), ChatGptAuthError> {
     if let Some(v) = resp.headers().get("cf-mitigated") {
         if let Ok(s) = v.to_str() {
             return Err(ChatGptAuthError::Blocked(s.to_string()));
         }
     }
-    if resp.status() == StatusCode::UNAUTHORIZED && resp.url().path().contains("/api/auth/session")
+    if resp.status() == StatusCode::UNAUTHORIZED
+        && (resp.url().path().contains("/api/auth/session")
+            || resp.url().path().contains("/backend-api/wham/usage"))
     {
         return Err(ChatGptAuthError::Expired);
     }
