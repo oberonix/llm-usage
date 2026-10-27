@@ -111,7 +111,9 @@ fn antigravity_headers() -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
     h.insert(
         reqwest::header::USER_AGENT,
-        reqwest::header::HeaderValue::from_static("antigravity/2.1.0 darwin/arm64"),
+        reqwest::header::HeaderValue::from_static(
+            "antigravity/cli/1.4.2 (aidev_client; os_type=darwin; arch=arm64; auth_method=consumer)",
+        ),
     );
     h.insert(
         "x-goog-api-client",
@@ -397,7 +399,9 @@ fn parse_grouped_quota_summary(root: &Value) -> Vec<ParsedQuota> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let family = if group_name.contains("gemini") {
+        let family = if group_name.contains("argon") {
+            "Argon"
+        } else if group_name.contains("gemini") {
             "Gemini"
         } else if group_name.contains("claude") {
             "Claude"
@@ -561,6 +565,8 @@ fn label_for_quota(map: &serde_json::Map<String, Value>, path: &[String]) -> Opt
 
     let family = if haystack.contains("claude") || haystack.contains("anthropic") {
         "Claude"
+    } else if haystack.contains("argon") {
+        "Argon"
     } else if haystack.contains("gemini") || haystack.contains("google") {
         "Gemini"
     } else {
@@ -656,18 +662,26 @@ mod tests {
                         {"window": "weekly", "resetTime": "2026-06-18T23:57:55Z", "remainingFraction": 0.74540466},
                         {"window": "5h", "resetTime": "2026-06-12T23:33:05Z", "remainingFraction": 0.2746008}
                     ]
+                },
+                {
+                    "displayName": "Gemini 4 Argon",
+                    "buckets": [
+                        {"bucketId": "gemini-argon-wtu-weekly", "window": "weekly", "resetTime": "2026-06-18T22:40:16Z", "remainingFraction": 0.87427294}
+                    ]
                 }
             ]
         });
 
         let parsed = parse_quota_summary(&payload);
-        assert_eq!(parsed.len(), 4);
-        assert_eq!(parsed[0].label, "Claude 5h");
-        assert!((parsed[0].fraction_used - 0.7253992).abs() < 1e-9);
-        assert_eq!(parsed[1].label, "Claude week");
-        assert_eq!(parsed[2].label, "Gemini 5h");
-        assert!((parsed[2].fraction_used - 0.996275).abs() < 1e-9);
-        assert_eq!(parsed[3].label, "Gemini week");
+        assert_eq!(parsed.len(), 5);
+        assert_eq!(parsed[0].label, "Argon week");
+        assert!((parsed[0].fraction_used - 0.12572706).abs() < 1e-9);
+        assert_eq!(parsed[1].label, "Claude 5h");
+        assert!((parsed[1].fraction_used - 0.7253992).abs() < 1e-9);
+        assert_eq!(parsed[2].label, "Claude week");
+        assert_eq!(parsed[3].label, "Gemini 5h");
+        assert!((parsed[3].fraction_used - 0.996275).abs() < 1e-9);
+        assert_eq!(parsed[4].label, "Gemini week");
     }
 
     #[test]

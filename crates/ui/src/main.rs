@@ -353,6 +353,8 @@ fn menu_window_order(label: &str) -> u32 {
         "Claude week" => 31,
         "Gemini 5h" => 32,
         "Gemini week" => 33,
+        "Argon 5h" => 34,
+        "Argon week" => 35,
         "Sonnet" => 21,
         "Opus" => 22,
         _ => 50,

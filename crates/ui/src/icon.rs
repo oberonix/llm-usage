@@ -176,16 +176,19 @@ fn pick_higher_usage<'a>(
 /// time window (so the icon can draw the red pace marker).
 pub fn pick_bars(snap: &UsageSnapshot) -> (BarSlot, BarSlot) {
     let now = chrono::Utc::now();
-    let session_w = snap
-        .windows
-        .get("5h")
-        .or_else(|| pick_higher_usage(snap.windows.get("Claude 5h"), snap.windows.get("Gemini 5h")));
+    let session_w = snap.windows.get("5h").or_else(|| {
+        let cg = pick_higher_usage(snap.windows.get("Claude 5h"), snap.windows.get("Gemini 5h"));
+        pick_higher_usage(cg, snap.windows.get("Argon 5h"))
+    });
     let session = bar_slot_for(session_w, "5h", now);
 
-    let weekly_w = snap
-        .windows
-        .get("week")
-        .or_else(|| pick_higher_usage(snap.windows.get("Claude week"), snap.windows.get("Gemini week")));
+    let weekly_w = snap.windows.get("week").or_else(|| {
+        let cg = pick_higher_usage(
+            snap.windows.get("Claude week"),
+            snap.windows.get("Gemini week"),
+        );
+        pick_higher_usage(cg, snap.windows.get("Argon week"))
+    });
     let weekly = bar_slot_for(weekly_w, "week", now);
     (session, weekly)
 }
