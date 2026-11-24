@@ -69,19 +69,28 @@ pub fn read_snapshots() -> Result<Option<SnapshotsFile>> {
 /// History so far:
 /// - 2026-05-12: Anthropic `week (Sonnet)` → `Sonnet`,
 ///   `week (Opus)` → `Opus`.
+/// - 2026-11-24: Antigravity retired `Argon 5h` and `Argon week`
+///   buckets (folded into `Gemini Models`).
 fn migrate_legacy_labels(file: &mut SnapshotsFile) {
     for snap in file.snapshots.values_mut() {
-        if !matches!(snap.provider, ProviderId::Anthropic) {
-            continue;
-        }
-        for (legacy, current) in [("week (Sonnet)", "Sonnet"), ("week (Opus)", "Opus")] {
-            if let Some(w) = snap.windows.remove(legacy) {
-                // `or_insert` rather than overwrite — a successful
-                // post-rename poll may have already populated the
-                // new key with fresher data; don't clobber it with
-                // a cached legacy row.
-                snap.windows.entry(current.to_string()).or_insert(w);
+        match snap.provider {
+            ProviderId::Anthropic => {
+                for (legacy, current) in [("week (Sonnet)", "Sonnet"), ("week (Opus)", "Opus")] {
+                    if let Some(w) = snap.windows.remove(legacy) {
+                        // `or_insert` rather than overwrite — a successful
+                        // post-rename poll may have already populated the
+                        // new key with fresher data; don't clobber it with
+                        // a cached legacy row.
+                        snap.windows.entry(current.to_string()).or_insert(w);
+                    }
+                }
             }
+            ProviderId::Antigravity => {
+                for retired in ["Argon 5h", "Argon week"] {
+                    snap.windows.remove(retired);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -429,6 +438,34 @@ mod tests {
             .unwrap()
             .windows
             .contains_key("week (Sonnet)"));
+    }
+
+    #[test]
+    fn migrate_legacy_labels_drops_removed_antigravity_argon_windows() {
+        let mut snap = UsageSnapshot {
+            provider: ProviderId::Antigravity,
+            timestamp: chrono::Utc::now(),
+            status: ProviderStatus::Ok,
+            error: None,
+            windows: BTreeMap::new(),
+            headline: None,
+            plan_label: None,
+        };
+        snap.windows
+            .insert("Argon 5h".into(), WindowUsage::default());
+        snap.windows
+            .insert("Argon week".into(), WindowUsage::default());
+        snap.windows
+            .insert("Gemini 5h".into(), WindowUsage::default());
+        let mut snaps = BTreeMap::new();
+        snaps.insert(ProviderId::Antigravity, snap);
+        let mut file = SnapshotsFile::new(snaps);
+        migrate_legacy_labels(&mut file);
+
+        let agy = file.snapshots.get(&ProviderId::Antigravity).unwrap();
+        assert!(!agy.windows.contains_key("Argon 5h"));
+        assert!(!agy.windows.contains_key("Argon week"));
+        assert!(agy.windows.contains_key("Gemini 5h"));
     }
 
     #[test]
